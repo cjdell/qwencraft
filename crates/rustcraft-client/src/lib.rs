@@ -55,8 +55,9 @@ struct TerrainChunk {
     water: Option<(Vec<f32>, Vec<u32>)>,
 }
 
+/// One agent's sphere buffers. Keyed by agent id in `Renderer::agents`
+/// (the id is the map key, not a field).
 struct AgentMesh {
-    id: u32,
     vertex: Buffer,
     index: Buffer,
     count: u32,
@@ -91,7 +92,9 @@ pub struct Renderer {
     lost: Vec<ChunkPos>,
     /// Rate-limits the "pool full" console warning.
     pool_full_warns: u32,
-    agents: Vec<AgentMesh>,
+    /// Agent spheres by id (HashMap: the NPC load test can push thousands
+    /// of agents, and the per-frame update must stay O(n) not O(n^2)).
+    agents: std::collections::HashMap<u32, AgentMesh>,
     /// Chunk updates waiting to be meshed (budgeted per frame).
     backlog: Vec<WorldUpdate>,
     width: u32,
@@ -292,7 +295,7 @@ impl Renderer {
             terrain: Vec::new(),
             lost: Vec::new(),
             pool_full_warns: 0,
-            agents: Vec::new(),
+            agents: std::collections::HashMap::new(),
             backlog: Vec::new(),
             width,
             height,
@@ -541,13 +544,13 @@ impl Renderer {
     pub fn set_agents(&mut self, states: Vec<AgentState>) {
         // Remove stale.
         let ids: std::collections::HashSet<u32> = states.iter().map(|s| s.id).collect();
-        self.agents.retain(|a| ids.contains(&a.id));
+        self.agents.retain(|id, _| ids.contains(id));
         for s in &states {
             if s.is_player {
                 continue; // first person: the player is the camera
             }
             let (verts, indices) = rustcraft_server::sphere_mesh(s);
-            let existing = self.agents.iter_mut().find(|a| a.id == s.id);
+            let existing = self.agents.get_mut(&s.id);
             match existing {
                 Some(m) => {
                     if (m.vertex.size() as usize) < verts.len() * 4 {
@@ -586,8 +589,7 @@ impl Renderer {
                     });
                     self.queue.write_buffer(&vertex, 0, f32_bytes(&verts));
                     self.queue.write_buffer(&index, 0, u32_bytes(&indices));
-                    self.agents.push(AgentMesh {
-                        id: s.id,
+                    self.agents.insert(s.id, AgentMesh {
                         vertex,
                         index,
                         count: indices.len() as u32,
@@ -710,8 +712,9 @@ impl Renderer {
                 );
             }
         }
-        // Agents: few, small, per-agent buffers.
-        for m in &self.agents {
+        // Agents: small, per-agent buffers (the NPC load test can push the
+        // count into the thousands — expect the draw calls to dominate).
+        for m in self.agents.values() {
             pass.set_index_buffer(m.index.slice(..), wgpu::IndexFormat::Uint32);
             pass.set_vertex_buffer(0, m.vertex.slice(..));
             pass.draw_indexed(0..m.count, 0, 0..1);

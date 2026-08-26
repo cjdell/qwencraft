@@ -7,12 +7,13 @@
 //! Key properties:
 //! - Infinite world, chunks generated lazily from a seed (never all at once).
 //! - World edits are stored as deltas and applied to chunks when they exist.
-//! - Each agent keeps a small 3D cache of nearby *surface* blocks so physics
-//!   does not need to hold full chunk buffers.
+//! - Each agent keeps a dense local block window (a small 3D volume of the
+//!   entire world around it) so steady-state physics lookups are served from
+//!   the window and never touch the full chunk buffers.
 
 pub mod agent;
+pub mod local_block_cache;
 pub mod sphere;
-pub mod surface_cache;
 pub mod world;
 
 mod input;
@@ -20,9 +21,9 @@ mod input;
 pub use agent::{
     Agent, AgentKind, AgentState, FLY_BASE_SPEED, FLY_MAX_SPEED, FLY_MIN_SPEED, FLY_STEP,
 };
+pub use local_block_cache::{CacheStats, LocalBlockCache};
 pub use sphere::sphere_mesh;
 pub use input::{Action, Input, Key, KeySet};
-pub use surface_cache::SurfaceCache;
 pub use world::{World, WorldUpdate};
 
 use crate::world::Edit;
@@ -34,6 +35,17 @@ const TICK_DT: f64 = 1.0 / 60.0;
 
 /// XZ streaming radius in chunks.
 pub const VIEW_RADIUS: i32 = 7;
+
+/// NPC load-test limits (NpcCountUp/Down clamp into these ranges).
+pub const NPC_COUNT_MIN: u32 = 1;
+pub const NPC_COUNT_MAX: u32 = 2048;
+pub const NPC_SPACING_MIN: f32 = 4.0;
+pub const NPC_SPACING_MAX: f32 = 128.0;
+/// Default NPC load: count and spacing (blocks between spiral arms).
+pub const NPC_COUNT_DEFAULT: u32 = 64;
+pub const NPC_SPACING_DEFAULT: f32 = 16.0;
+/// Golden angle (radians): successive phyllotaxis points are ~spacing apart.
+const GOLDEN_ANGLE: f32 = 2.3999632;
 /// Max region payloads emitted per tick.
 const STREAM_PER_TICK: usize = 4;
 /// Max chunks generated per tick by the streamer.
@@ -58,6 +70,10 @@ pub struct Server {
     /// The block under the player's crosshair (recomputed every tick);
     /// the client draws a wireframe highlight around it.
     target: Option<BlockPos>,
+    /// Configured NPC load (applied by Action::NpcLoad): how many NPCs to
+    /// spawn and how far apart the spiral arms sit. Load-test facility.
+    npc_count: u32,
+    npc_spacing: f32,
 }
 
 impl Server {
@@ -94,6 +110,8 @@ impl Server {
             updates: Vec::new(),
             _pending_edits: Vec::new(),
             target: None,
+            npc_count: NPC_COUNT_DEFAULT,
+            npc_spacing: NPC_SPACING_DEFAULT,
         }
     }
 
@@ -171,6 +189,12 @@ impl Server {
                 Action::ToggleFly => self.agents[0].toggle_fly(),
                 Action::FlyFaster => self.agents[0].adjust_fly_speed(FLY_STEP),
                 Action::FlySlower => self.agents[0].adjust_fly_speed(1.0 / FLY_STEP),
+                Action::NpcLoad => self.spawn_npcs(),
+                Action::NpcClear => self.clear_npcs(),
+                Action::NpcCountUp => self.adjust_npc_count(true),
+                Action::NpcCountDown => self.adjust_npc_count(false),
+                Action::NpcSpacingUp => self.adjust_npc_spacing(true),
+                Action::NpcSpacingDown => self.adjust_npc_spacing(false),
                 Action::Break { .. } | Action::Place { .. } => {
                     self.apply_player_action(action)
                 }
@@ -214,6 +238,7 @@ impl Server {
                     if hit.y > 0 {
                         // World edits go through the delta layer.
                         let dirty = self.world.set_block(hit, Block::Air);
+                        self.invalidate_caches_at(hit);
                         self.queue_resends(&dirty);
                     }
                 }
@@ -230,6 +255,7 @@ impl Server {
                     });
                     if prev.y >= 0 && prev.y < WORLD_HEIGHT && !blocked {
                         let dirty = self.world.set_block(prev, Block::Stone);
+                        self.invalidate_caches_at(prev);
                         self.queue_resends(&dirty);
                     }
                 }
@@ -362,6 +388,90 @@ impl Server {
         }
     }
 
+    /// The configured NPC load (count, spacing in blocks).
+    pub fn npc_load_config(&self) -> (u32, f32) {
+        (self.npc_count, self.npc_spacing)
+    }
+
+    /// Set the configured NPC load (clamped to the load-test limits).
+    pub fn set_npc_load(&mut self, count: u32, spacing: f32) {
+        self.npc_count = count.clamp(NPC_COUNT_MIN, NPC_COUNT_MAX);
+        self.npc_spacing = spacing.clamp(NPC_SPACING_MIN, NPC_SPACING_MAX);
+    }
+
+    /// Double/halve the configured NPC count (clamped).
+    pub fn adjust_npc_count(&mut self, up: bool) {
+        self.npc_count = if up {
+            (self.npc_count * 2).min(NPC_COUNT_MAX)
+        } else {
+            (self.npc_count / 2).max(NPC_COUNT_MIN)
+        };
+    }
+
+    /// Double/halve the configured NPC spacing (clamped).
+    pub fn adjust_npc_spacing(&mut self, up: bool) {
+        self.npc_spacing = if up {
+            (self.npc_spacing * 2.0).min(NPC_SPACING_MAX)
+        } else {
+            (self.npc_spacing / 2.0).max(NPC_SPACING_MIN)
+        };
+    }
+
+    /// Spawn the configured NPC load around the player, replacing the
+    /// existing NPCs so the count is exact.
+    ///
+    /// Layout: a phyllotaxis (sunflower) spiral centred on the player —
+    /// point *i* sits at radius `spacing * sqrt(i+1)` and angle
+    /// `i * golden_angle`, so neighbours are ~`spacing` blocks apart and
+    /// the cloud grows outward evenly (outer radius ≈ `spacing * sqrt(count)`).
+    /// Each target snaps to the nearest dry, tree-free column (small halo),
+    /// and every NPC gets a fresh local block window. Spawning is one-shot
+    /// (a brief frame hitch at high counts: each window's first build
+    /// materialises its chunks on demand).
+    pub fn spawn_npcs(&mut self) {
+        let (count, spacing) = self.npc_load_config();
+        let p = self.agents[0].pos;
+        self.agents.truncate(1); // keep the player; replace the NPC set
+        for i in 0..count {
+            let angle = (i as f32) * GOLDEN_ANGLE;
+            let radius = spacing * (i as f32 + 1.0).sqrt();
+            let tx = (p.x + radius * angle.sin()) as i32;
+            let tz = (p.z + radius * angle.cos()) as i32;
+            let (x, z) = Self::find_spawn(&self.world, tx, tz, 2);
+            let h = self.world.height_at(x, z);
+            self.agents.push(Agent::npc(
+                1 + i as u32,
+                Vec3::new(x as f32 + 0.5, (h + 1) as f32, z as f32 + 0.5),
+            ));
+        }
+        self.reset_cache_stats();
+    }
+
+    /// Remove all NPCs (the player remains).
+    pub fn clear_npcs(&mut self) {
+        self.agents.truncate(1);
+        self.reset_cache_stats();
+    }
+
+    /// Zero the cache statistics of every agent (called when the load
+    /// changes so the HUD shows the rate for the *current* load).
+    pub fn reset_cache_stats(&mut self) {
+        for a in &mut self.agents {
+            a.cache.reset_stats();
+        }
+    }
+
+    /// Invalidate every agent's local block window that covers `pos`
+    /// (a world edit landed inside it; without this the window would serve
+    /// the pre-edit block until the agent moved to a new centre cell).
+    fn invalidate_caches_at(&mut self, pos: BlockPos) {
+        for a in &mut self.agents {
+            if a.cache.contains(pos) {
+                a.cache.mark_dirty();
+            }
+        }
+    }
+
     /// Snapshot of all agent states (player first).
     pub fn agents(&self) -> Vec<AgentState> {
         self.agents.iter().map(|a| a.state()).collect()
@@ -374,13 +484,20 @@ impl Server {
         s
     }
 
-    /// Simple stats for the HUD / debugging.
+    /// Simple stats for the HUD / debugging (cache counters aggregated over
+    /// all agents; they reset when the NPC load changes).
     pub fn stats(&self) -> ServerStats {
+        let mut cache = CacheStats::default();
+        for a in &self.agents {
+            cache.add(a.cache.stats());
+        }
         ServerStats {
             chunks_generated: self.world.chunks_generated(),
             chunks_sent: self.sent.len(),
             deltas: self.world.delta_count(),
             agents: self.agents.len(),
+            npcs: self.agents.len().saturating_sub(1),
+            cache,
         }
     }
 }
@@ -392,6 +509,11 @@ pub struct ServerStats {
     pub chunks_sent: usize,
     pub deltas: usize,
     pub agents: usize,
+    /// NPC count (agents minus the player).
+    pub npcs: usize,
+    /// Local-block-window statistics, summed over all agents since the last
+    /// `reset_cache_stats` (i.e. for the current NPC load).
+    pub cache: CacheStats,
 }
 
 #[cfg(test)]
@@ -832,17 +954,181 @@ mod tests {
     }
 
     #[test]
-    fn surface_cache_small_and_consistent() {
+    fn local_block_window_serves_player_physics() {
         let mut s = Server::new(5);
         tick_n(&mut s, 120);
         let cache = &s.agents[0].cache;
-        // 17^3 volume; surface-only cache should be well below the full count.
-        assert!(cache.len() < 4913, "cache holds {} blocks", cache.len());
-        assert!(!cache.is_empty());
+        // The ground under the player is inside the window.
         let c = cache.center();
-        // The block the player stands on should be cached.
-        let feet = BlockPos::new(c.x, (s.player_state().pos.y) as i32 - 1, c.z);
-        let _ = feet;
+        let ground = BlockPos::new(c.x, s.player_state().pos.y as i32 - 1, c.z);
+        assert!(cache.contains(ground), "ground under the player must be in the window");
+        // Steady-state physics is served from the window: only the very
+        // first tick (before the first build) could fall back to the world.
+        let st = cache.stats();
+        assert!(st.lookups > 100, "expected plenty of physics lookups");
+        assert!(
+            st.hits as f64 > st.lookups as f64 * 0.98,
+            "window should serve nearly all lookups, got {st:?}"
+        );
+    }
+
+    #[test]
+    fn npc_load_spawns_exact_count() {
+        let mut s = Server::new(1337);
+        tick_n(&mut s, 60); // let the streamer settle
+        s.set_npc_load(50, 12.0);
+        s.push_action(Action::NpcLoad);
+        tick_n(&mut s, 2);
+        assert_eq!(s.agents().len(), 51, "player + 50 NPCs");
+        assert_eq!(s.stats().npcs, 50);
+        // Re-spawning replaces the load: the count stays exact.
+        s.set_npc_load(10, 8.0);
+        s.push_action(Action::NpcLoad);
+        tick_n(&mut s, 2);
+        assert_eq!(s.agents().len(), 11, "re-load must replace, not append");
+        // Clear removes everything.
+        s.push_action(Action::NpcClear);
+        tick_n(&mut s, 2);
+        assert_eq!(s.agents().len(), 1, "only the player remains");
+        assert_eq!(s.stats().npcs, 0);
+    }
+
+    #[test]
+    fn npc_load_phyllotaxis_layout() {
+        let mut s = Server::new(1337);
+        tick_n(&mut s, 60);
+        let spacing = 12.0f32;
+        let count = 40u32;
+        s.set_npc_load(count, spacing);
+        s.push_action(Action::NpcLoad);
+        tick_n(&mut s, 2);
+        let p = s.player_state().pos;
+        let agents = s.agents();
+        // Each NPC i sits at radius ~ spacing*sqrt(i+1) around the player
+        // (the find_spawn halo + column rounding allow a few blocks of slack).
+        for (i, a) in agents.iter().skip(1).enumerate() {
+            let expected = spacing * (i as f32 + 1.0).sqrt();
+            let dist = ((a.pos.x - p.x).powi(2) + (a.pos.z - p.z).powi(2)).sqrt();
+            assert!(
+                (dist - expected).abs() < 6.0 + spacing * 0.2,
+                "NPC {i} at {dist:.1} blocks from player, expected ~{expected:.1}"
+            );
+        }
+        // The cloud spans the expected radius overall.
+        let max_r = agents
+            .iter()
+            .skip(1)
+            .map(|a| ((a.pos.x - p.x).powi(2) + (a.pos.z - p.z).powi(2)).sqrt())
+            .fold(0.0f32, f32::max);
+        let full = spacing * (count as f32).sqrt();
+        assert!(
+            (max_r - full).abs() < full * 0.3 + 8.0,
+            "outermost NPC at {max_r:.1}, expected ~{full:.1}"
+        );
+        // No two NPCs sit unreasonably close together.
+        let npcs: Vec<Vec3> = agents.iter().skip(1).map(|a| a.pos).collect();
+        let mut min_pair = f32::MAX;
+        for i in 0..npcs.len() {
+            for j in (i + 1)..npcs.len() {
+                let d = ((npcs[i].x - npcs[j].x).powi(2)
+                    + (npcs[i].z - npcs[j].z).powi(2))
+                    .sqrt();
+                min_pair = min_pair.min(d);
+            }
+        }
+        assert!(
+            min_pair >= spacing * 0.3,
+            "two NPCs only {min_pair:.1} blocks apart (spacing {spacing})"
+        );
+    }
+
+    /// The load test's core property: with many NPCs, steady-state collision
+    /// physics is answered by the per-agent local block window, not by the
+    /// world's chunk buffers.
+    #[test]
+    fn npc_load_physics_served_from_local_window() {
+        let mut s = Server::new(1337);
+        tick_n(&mut s, 60);
+        s.set_npc_load(64, 16.0);
+        s.push_action(Action::NpcLoad);
+        tick_n(&mut s, 121); // spawn tick + 2s of landing/window building
+        s.reset_cache_stats(); // measure steady state only
+        tick_n(&mut s, 600); // 10s of wandering
+        let c = s.stats().cache;
+        assert!(c.lookups > 100_000, "expected >100k lookups, got {}", c.lookups);
+        let hit_rate = c.hits as f64 / c.lookups as f64;
+        assert!(
+            hit_rate > 0.995,
+            "window hit rate {hit_rate:.4} — physics must run on the cache"
+        );
+        // Solid data in particular never comes from the chunk buffers in
+        // steady state (only transient pre-build ticks could).
+        assert!(
+            (c.solid_misses as f64) < c.lookups as f64 * 0.0005,
+            "solid fallbacks {} of {} lookups",
+            c.solid_misses,
+            c.lookups
+        );
+        // NPCs move, so their windows keep rebuilding (and the rebuilds are
+        // what amortise the chunk-buffer access).
+        assert!(c.rebuilds > 100, "expected steady rebuilds, got {}", c.rebuilds);
+    }
+
+    #[test]
+    fn npc_load_dials_clamp_to_limits() {
+        let mut s = Server::new(1337);
+        for _ in 0..32 {
+            s.push_action(Action::NpcCountUp);
+            tick_n(&mut s, 1);
+        }
+        assert_eq!(s.npc_load_config().0, NPC_COUNT_MAX);
+        for _ in 0..32 {
+            s.push_action(Action::NpcCountDown);
+            tick_n(&mut s, 1);
+        }
+        assert_eq!(s.npc_load_config().0, NPC_COUNT_MIN);
+        for _ in 0..32 {
+            s.push_action(Action::NpcSpacingUp);
+            tick_n(&mut s, 1);
+        }
+        assert!((s.npc_load_config().1 - NPC_SPACING_MAX).abs() < 1e-4);
+        for _ in 0..32 {
+            s.push_action(Action::NpcSpacingDown);
+            tick_n(&mut s, 1);
+        }
+        assert!((s.npc_load_config().1 - NPC_SPACING_MIN).abs() < 1e-4);
+        // set_npc_load clamps the same ranges.
+        s.set_npc_load(0, 1.0);
+        assert_eq!(s.npc_load_config(), (NPC_COUNT_MIN, NPC_SPACING_MIN));
+        s.set_npc_load(999_999, 9999.0);
+        assert_eq!(s.npc_load_config(), (NPC_COUNT_MAX, NPC_SPACING_MAX));
+    }
+
+    /// Breaking the block under the player's feet must be seen by physics
+    /// (the local window is invalidated on edits) — otherwise the cached
+    /// solid would hold the player up.
+    #[test]
+    fn breaking_under_feet_invalidates_window() {
+        let mut s = Server::new(1337);
+        tick_n(&mut s, 180); // settle on ground
+        let p0 = s.player_state();
+        assert!(p0.on_ground, "player should be standing");
+        // Aim straight down and break the block the player stands on.
+        let yaw = p0.yaw;
+        s.push_action(Action::Break { yaw, pitch: -1.55 });
+        tick_n(&mut s, 2);
+        let feet = BlockPos::new(p0.pos.x as i32, p0.pos.y as i32 - 1, p0.pos.z as i32);
+        assert_eq!(s.world.block_at(feet), Block::Air, "block under feet must break");
+        // The player falls one block and stands on the next layer down.
+        tick_n(&mut s, 120);
+        let p1 = s.player_state();
+        assert!(p1.on_ground, "player should land in the hole");
+        assert!(
+            (p1.pos.y - (p0.pos.y - 1.0)).abs() < 0.05,
+            "player should stand 1 block lower (y={} expected ~{})",
+            p1.pos.y,
+            p0.pos.y - 1.0
+        );
     }
 
     #[test]

@@ -92,15 +92,22 @@ struct App {
 }
 
 impl App {
-    fn new(
+        fn new(
         seed: u64,
         hud: HtmlDivElement,
         overlay: HtmlDivElement,
         verify_mode: bool,
         walk_mode: bool,
+        npcs: Option<(u32, f32)>,
     ) -> Self {
-        let server = Server::new(seed);
+        let mut server = Server::new(seed);
         let spawn = server.player_state().pos;
+        let mut actions = Vec::new();
+        if let Some((count, spacing)) = npcs {
+            server.set_npc_load(count, spacing);
+            // Applied on the first tick: spawn the load-test cloud.
+            actions.push(Action::NpcLoad);
+        }
         App {
             server,
             walk_mode,
@@ -117,7 +124,7 @@ impl App {
             keys: KeySet::default(),
             mouse_dx: 0.0,
             mouse_dy: 0.0,
-            actions: Vec::new(),
+            actions,
             aim_yaw: 0.0,
             aim_pitch: 0.0,
             locked: false,
@@ -367,8 +374,24 @@ impl App {
             } else {
                 String::new()
             };
+            let (load_count, load_spacing) = self.server.npc_load_config();
+            // NPC load-test line: the configured load, the live count, and
+            // the local-block-window stats (reset when the load changes):
+            // hit % = lookups served by the per-agent window instead of the
+            // world's chunk buffers; solid-fb = solid reads that still fell
+            // back to the buffers (should stay ~0 in steady state).
+            let cache = stats.cache;
+            let hit_pct = if cache.lookups > 0 {
+                100.0 * cache.hits as f64 / cache.lookups as f64
+            } else {
+                100.0
+            };
+            let npc_line = format!(
+                "\nnpc {load_count}/{load_spacing:.0}m [N load · C clear · I/U count · [ ] spacing] (live {}) | window {hit_pct:.1}% · solid-fb {} · rebuilds {}",
+                stats.npcs, cache.solid_misses, cache.rebuilds
+            );
             self.hud.set_inner_html(&format!(
-                "fps {:.0} | perf tick={:.1} mesh={:.1} draw={:.1} ms/f | pos {:.0} {:.0} {:.0} | chunks {} sent / {} gen | edits {} | agents {}{}",
+                "fps {:.0} | perf tick={:.1} mesh={:.1} draw={:.1} ms/f | pos {:.0} {:.0} {:.0} | chunks {} sent / {} gen | edits {} | agents {}{}{}",
                 self.fps,
                 pt,
                 pm,
@@ -380,7 +403,8 @@ impl App {
                 stats.chunks_generated,
                 stats.deltas,
                 stats.agents,
-                fly
+                fly,
+                npc_line
             ));
             if self.hud_updates % 20 == 0 {
                 let nf = n as u32;
@@ -405,14 +429,23 @@ fn key_from_code(code: &str) -> Option<Key> {
         "KeyF" => Some(Key::F),
         "KeyE" => Some(Key::E),
         "KeyQ" => Some(Key::Q),
+        "KeyN" => Some(Key::KeyN),
+        "KeyC" => Some(Key::KeyC),
+        "KeyI" => Some(Key::KeyI),
+        "KeyU" => Some(Key::KeyU),
+        "BracketLeft" => Some(Key::BracketLeft),
+        "BracketRight" => Some(Key::BracketRight),
         _ => None,
     }
 }
 
-fn params_from_url() -> (u64, bool, bool) {
+fn params_from_url() -> (u64, bool, bool, Option<(u32, f32)>) {
     let mut seed = 1337u64;
     let mut verify = false;
     let mut walk = false;
+    // `npcs=COUNT[:SPACING]` starts the app with an NPC load already
+    // spawned (headless load testing without a keyboard).
+    let mut npcs: Option<(u32, f32)> = None;
     if let Some(win) = web_sys::window() {
         let search = win.location().search().unwrap_or_default();
         for part in search.split('?').flat_map(|s| s.split('&')) {
@@ -424,10 +457,26 @@ fn params_from_url() -> (u64, bool, bool) {
                 verify = true;
             } else if part.strip_prefix("walk=").is_some_and(|v| v != "0") {
                 walk = true;
+            } else if let Some(v) = part.strip_prefix("npcs=") {
+                if !v.is_empty() && v != "0" {
+                    let (cs, ss) = match v.split_once(':') {
+                        Some((c, s)) => (c, s),
+                        None => (v, ""),
+                    };
+                    let count = cs.parse::<u32>().ok();
+                    let spacing = if ss.is_empty() {
+                        None
+                    } else {
+                        ss.parse::<f32>().ok()
+                    };
+                    if let (Some(c), s) = (count, spacing) {
+                        npcs = Some((c, s.unwrap_or(rustcraft_server::NPC_SPACING_DEFAULT)));
+                    }
+                }
             }
         }
     }
-    (seed, verify, walk)
+    (seed, verify, walk, npcs)
 }
 
 #[wasm_bindgen(start)]
@@ -448,7 +497,7 @@ pub fn start() -> Result<(), JsValue> {
         .and_then(|e| e.dyn_into::<HtmlDivElement>().ok())
         .expect("missing #overlay");
 
-    let (seed, verify_mode, walk_mode) = params_from_url();
+    let (seed, verify_mode, walk_mode, npcs) = params_from_url();
     log(&format!("RustCraft: app started (seed {seed})"));
 
     // In verify mode the headless test never gets pointer lock, so hide the
@@ -469,7 +518,11 @@ pub fn start() -> Result<(), JsValue> {
         overlay.clone(),
         verify_mode,
         walk_mode,
+        npcs,
     )));
+    if let Some((c, s)) = npcs {
+        log(&format!("RustCraft: NPC load test armed: {c} agents @ {s:.0} m spacing"));
+    }
 
     // ---- Input events ----------------------------------------------------
     // Each closure captures its own clone of `app`; the outer Rc is never
@@ -492,6 +545,32 @@ pub fn start() -> Result<(), JsValue> {
                     Some(Key::Q) => {
                         e.prevent_default();
                         app.borrow_mut().actions.push(Action::FlySlower);
+                    }
+                    // NPC load test: N/C are one-shot (ignore auto-repeat);
+                    // I/U and [ ] may repeat so holding them ramps the dial.
+                    Some(Key::KeyN) if !e.repeat() => {
+                        e.prevent_default();
+                        app.borrow_mut().actions.push(Action::NpcLoad);
+                    }
+                    Some(Key::KeyC) if !e.repeat() => {
+                        e.prevent_default();
+                        app.borrow_mut().actions.push(Action::NpcClear);
+                    }
+                    Some(Key::KeyI) => {
+                        e.prevent_default();
+                        app.borrow_mut().actions.push(Action::NpcCountUp);
+                    }
+                    Some(Key::KeyU) => {
+                        e.prevent_default();
+                        app.borrow_mut().actions.push(Action::NpcCountDown);
+                    }
+                    Some(Key::BracketLeft) => {
+                        e.prevent_default();
+                        app.borrow_mut().actions.push(Action::NpcSpacingDown);
+                    }
+                    Some(Key::BracketRight) => {
+                        e.prevent_default();
+                        app.borrow_mut().actions.push(Action::NpcSpacingUp);
                     }
                     Some(k) => {
                         e.prevent_default();

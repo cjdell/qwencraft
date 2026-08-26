@@ -18,6 +18,18 @@ pub enum Key {
     E,
     /// Fly speed down (one-shot, see Action::FlySlower).
     Q,
+    /// Spawn the configured NPC load (one-shot, see Action::NpcLoad).
+    KeyN,
+    /// Clear all NPCs (one-shot, see Action::NpcClear).
+    KeyC,
+    /// NPC load count up (one-shot, see Action::NpcCountUp).
+    KeyI,
+    /// NPC load count down (one-shot, see Action::NpcCountDown).
+    KeyU,
+    /// NPC load spacing down (one-shot, see Action::NpcSpacingDown).
+    BracketLeft,
+    /// NPC load spacing up (one-shot, see Action::NpcSpacingUp).
+    BracketRight,
 }
 
 /// One-shot actions (block editing, fly mode), queued by the client on key/mouse events.
@@ -37,6 +49,20 @@ pub enum Action {
     FlyFaster,
     /// Decrease the fly speed (/ FLY_STEP, clamped).
     FlySlower,
+    /// Spawn the configured NPC load (count + spacing from the server's
+    /// `npc_count` / `npc_spacing`, adjusted by the Npc* dials). Replaces
+    /// the existing NPC set so the count is exact — a load-test facility.
+    NpcLoad,
+    /// Remove all NPCs (the player remains).
+    NpcClear,
+    /// Double the configured NPC count (clamped).
+    NpcCountUp,
+    /// Halve the configured NPC count (clamped).
+    NpcCountDown,
+    /// Double the configured NPC spacing (clamped).
+    NpcSpacingUp,
+    /// Halve the configured NPC spacing (clamped).
+    NpcSpacingDown,
 }
 
 /// Current input snapshot (level-triggered keys + accumulated look deltas).
@@ -68,6 +94,12 @@ impl KeySet {
             Key::F => 7,
             Key::E => 8,
             Key::Q => 9,
+            Key::KeyN => 10,
+            Key::KeyC => 11,
+            Key::KeyI => 12,
+            Key::KeyU => 13,
+            Key::BracketLeft => 14,
+            Key::BracketRight => 15,
         })
     }
 

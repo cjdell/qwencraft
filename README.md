@@ -33,6 +33,7 @@ nix develop
 ./scripts/serve.sh --https  # HTTPS (self-signed cert) — needed off-localhost
 ./scripts/verify.sh    # headless-chromium smoke test + pixel checks
 ./scripts/walk_test.sh # headless walk stress test (terrain pool / streaming)
+./scripts/npc_test.sh  # headless NPC load test (physics on cached surfaces)
 ./scripts/secure_context_test.sh  # secure-context / HTTPS regression test
 cargo test             # host unit tests (worldgen, physics, streaming, …)
 ```
@@ -56,6 +57,21 @@ cargo test             # host unit tests (worldgen, physics, streaming, …)
 | `Space` (in water) | swim up (falling in water is slowed; hold to surface) |
 | `F` | toggle **fly mode** (no gravity, no collision) |
 | `Q` / `E` | fly speed down / up (×1.5 steps, 5 → 500 blocks/s; hold to ramp) |
+| `N` | spawn the **NPC load test** cloud (replaces existing NPCs) |
+| `C` | clear all NPCs |
+| `I` / `U` | NPC load count up / down (×2 ÷2, 1 → 2048; hold to ramp) |
+| `[` / `]` | NPC spacing down / up (÷2 ×2, 4 → 128 blocks; hold to ramp) |
+
+**NPC load test.** `N` spawns the configured number of wandering NPCs in a
+phyllotaxis spiral around you — neighbours sit ~`spacing` blocks apart and
+the cloud grows to a radius of ~`spacing × √count`. It exists to load-test
+the engine: with hundreds or thousands of agents, the HUD shows the
+per-agent **local block window** stats, proving collision physics is served
+by the tiny per-agent cache (a 7³ block volume, `window 100%`) instead of
+the world's chunk buffers (`solid-fb` stays ~0 — only the spawn tick falls
+back). `?npcs=COUNT[:SPACING]` arms the same load on boot for headless
+runs (`./scripts/npc_test.sh`); for raw per-tick CPU cost use the host
+benchmark `cargo run -p rustcraft-server --release --example bench_tick`.
 
 While flying the HUD shows the current speed (`FLY 120 b/s`). At high
 speeds the world streams in around you (terrain is generated on the fly),
@@ -73,11 +89,31 @@ against — even while you're turning fast.
 | crate / dir         | what it is                                                              |
 | ------------------- | ----------------------------------------------------------------------- |
 | `rustcraft-world`   | Block types, seeded noise/terrain, 16³ chunks with 26³ region payloads, chunk meshing (voxel lighting + AO), shared WGSL shader + view-projection math |
-| `rustcraft-server`  | The game server: infinite lazy world (chunks generated on demand), agent simulation (player + NPCs) with a 3D surface cache, fixed-tick physics, delta-based world updates. Runs in-process in the browser; standalone later |
+| `rustcraft-server`  | The game server: infinite lazy world (chunks generated on demand), agent simulation (player + NPCs) with a per-agent local block window, fixed-tick physics, delta-based world updates, NPC load test. Runs in-process in the browser; standalone later |
 | `rustcraft-client`  | WebGPU (wgpu 27) renderer: shared terrain-mesh buffer pool, sphere agents, fog, first-person camera |
 | `rustcraft-web`     | wasm glue: input (keyboard/pointer lock), HUD, main loop, embedded server |
 | `web/`              | `index.html` page hosting the wasm app                                  |
-| `scripts/`          | build / serve / verify / walk-stress test                               |
+| `scripts/`          | build / serve / verify / walk-stress / NPC-load tests                   |
+
+## NPC load test
+
+The in-game NPC load test (keys above, or `?npcs=COUNT[:SPACING]` / `N` in
+the HUD) is a standing stress test for agent physics. Each agent keeps a
+dense 7³ **local block window** (343 bytes) around its feet: physics
+lookups are answered from the window and only fall back to the world's
+chunk buffers for cells outside it. Steady-state probes always stay inside
+the window, so the HUD's `window` hit rate should read ~100% and `solid-fb`
+(solid reads that still hit the chunk buffers) should stay near 0 —
+`npc_test.sh` asserts both, and the host `bench_tick` example reports
+per-tick cost per load (player-only ≈ 30µs, 64 NPCs ≈ 80µs,
+256 ≈ 200µs, 1024 ≈ 1.4ms on a desktop core — well under the 16.6 ms
+60 Hz budget even in wasm; the browser's per-agent sphere rendering is
+what eventually saturates first).
+
+`./scripts/npc_test.sh [COUNT] [SPACING] [BUDGET_MS]` (default 500 24) arms
+the load in headless Chromium and checks: boot + no JS errors, the live NPC
+count in the HUD, `window` hit rate ≥ 99%, and that solid fallbacks stay at
+spawn-tick scale (each NPC's first tick, before its window's first build).
 
 ## How verification works
 

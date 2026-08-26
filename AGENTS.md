@@ -53,6 +53,7 @@ writes temp files):
 | `./scripts/serve.sh --https` | Same over TLS with a self-signed cert (`.certs/`, generated once via openssl). **Required for LAN play** — WebGPU needs a secure context. |
 | `./scripts/verify.sh` | Headless Chromium smoke test: app start, pointer lock, WebGL2 shadow-render **pixel readback** of the 3D scene, PNG export. This is the main end-to-end check. |
 | `./scripts/walk_test.sh` | ~60s scripted walk+fly in headless Chromium; asserts the terrain pool never loses or duplicates blocks (26k+ blocks, compaction safety). |
+| `./scripts/npc_test.sh [COUNT] [SPACING]` | Headless NPC load test (`?npcs=COUNT:SPACING`); asserts boot with the load, live count in the HUD, and that steady-state physics runs on the per-agent local block window (hit rate ≥ 99%, solid fallbacks at spawn-tick scale). |
 | `./scripts/secure_context_test.sh` | LAN-HTTP (graceful "WebGPU unavailable" message, no panic) + HTTPS startup on localhost and LAN IP. |
 
 `cargo test` is fast (~7s); `build.sh` + `verify.sh` is the slow path
@@ -69,8 +70,10 @@ crates/
                       Host-testable — put geometry/logic tests here.
   rustcraft-server/   Authoritative game state. Server { world, agents,
                       actions }, fixed 60Hz tick, physics (walk/jump/fly/
-                      swim), per-agent SurfaceCache (3D surface-only block
-                      cache so memory stays bounded in an infinite world),
+                      swim), per-agent LocalBlockCache (dense 7³ local
+                      block window — steady-state physics lookups never
+                      touch the chunk buffers; edits invalidate it),
+                      NPC load test (Action::Npc*, phyllotaxis spawn),
                       world deltas, block highlight target, spawn scan.
   rustcraft-client/   WebGPU renderer. Terrain buffer POOL (one 2M-vertex
                       vbo/ibo, chunks own index ranges, compaction when
@@ -106,6 +109,13 @@ highlight).
   click-time yaw/pitch, and the server raycasts block edits with *that*
   aim, not the agent's current one. If you add a new action that raycasts,
   do the same.
+- **World edits invalidate agent caches**: `apply_player_action` calls
+  `invalidate_caches_at` after every `set_block` — without it an agent
+  standing on a broken block would float on the stale cached solid until it
+  moved to a new centre cell (the dense window caches air too, unlike the
+  old surface-only cache which fell air through to the world). Any new
+  world-write path needs the same invalidation. (One-tick staleness after
+  an edit is by design: the dirty window rebuilds on the next `update`.)
 - **WGSL uniform layout is vec4-only** (112 bytes, no hidden padding).
   Keep it that way or the render silently goes wrong.
 - **Water faces are emitted only against air** and rendered in a separate

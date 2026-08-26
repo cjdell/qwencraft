@@ -1,12 +1,13 @@
 //! Agents: the player and NPCs, with simple AABB physics against the world.
 //!
-//! Physics queries go through each agent's [`SurfaceCache`] first (a small 3D
-//! cache of nearby surface blocks), falling back to the world — so agents only
-//! ever need a handful of chunks around themselves.
+//! Physics queries go through each agent's [`LocalBlockCache`] first (a dense
+//! local block window around the agent — steady-state lookups never touch the
+//! world's chunk buffers), falling back to the world for cells outside the
+//! window.
 
 use rustcraft_world::BlockPos;
 
-use crate::surface_cache::SurfaceCache;
+use crate::local_block_cache::LocalBlockCache;
 use crate::world::World;
 use crate::{Input, Vec3};
 
@@ -89,8 +90,8 @@ pub struct Agent {
     pub fly: bool,
     /// Fly speed in blocks/s (player only).
     pub fly_speed: f32,
-    /// 3D cache of nearby surface blocks.
-    pub cache: SurfaceCache,
+    /// Dense local block window around the agent (physics source).
+    pub cache: LocalBlockCache,
     // NPC wander state
     npc_dir: f32,
     npc_timer: f64,
@@ -110,7 +111,7 @@ impl Agent {
             on_ground: false,
             fly: false,
             fly_speed: FLY_BASE_SPEED,
-            cache: SurfaceCache::new(),
+            cache: LocalBlockCache::new(),
             npc_dir: 0.0,
             npc_timer: 0.0,
             rng: 0x9E37_79B9u64 ^ (id as u64 * 0x1000_0000_01B3),
@@ -129,7 +130,7 @@ impl Agent {
             on_ground: false,
             fly: false,
             fly_speed: FLY_BASE_SPEED,
-            cache: SurfaceCache::new(),
+            cache: LocalBlockCache::new(),
             npc_dir: (id as f32) * 1.7,
             npc_timer: 0.5 + (id as f64) * 0.3,
             rng: 0xC0FFEEu64 ^ (id as u64 * 0x9E37_79B9),
@@ -243,7 +244,7 @@ impl Agent {
     }
 
     /// True when the agent's body centre is in water.
-    pub fn in_water(&self, world: &mut World) -> bool {
+    pub fn in_water(&mut self, world: &mut World) -> bool {
         let body = BlockPos::new(
             self.pos.x.floor() as i32,
             (self.pos.y + 0.5).floor() as i32,
@@ -338,7 +339,7 @@ impl Agent {
     }
 
     /// True when the agent AABB at `pos` intersects any solid block.
-    fn collides_at(&self, world: &mut World, pos: Vec3) -> bool {
+    fn collides_at(&mut self, world: &mut World, pos: Vec3) -> bool {
         let (x0, y0, z0) = (pos.x - HALF_W, pos.y, pos.z - HALF_W);
         let (x1, y1, z1) = (pos.x + HALF_W, pos.y + HEIGHT, pos.z + HALF_W);
 
@@ -362,7 +363,7 @@ impl Agent {
     }
 
     /// Push `pos` back out of collision along `axis`.
-    fn clamp_axis(&self, world: &mut World, pos: &mut Vec3, axis: u8, d: f32) {
+    fn clamp_axis(&mut self, world: &mut World, pos: &mut Vec3, axis: u8, d: f32) {
         let (x0, y0, z0) = (pos.x - HALF_W, pos.y, pos.z - HALF_W);
         let (x1, y1, z1) = (pos.x + HALF_W, pos.y + HEIGHT, pos.z + HALF_W);
         let bx0 = x0.floor() as i32;
