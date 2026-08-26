@@ -1,0 +1,335 @@
+//! Mesh building: turn a 26^3 chunk region into renderable geometry.
+//!
+//! Per chunk we compute:
+//! - voxel sky light (BFS flood fill from the sky, attenuating by 1 per step)
+//! - per-vertex ambient occlusion from the three corner neighbour blocks
+//! - face culling (only faces adjacent to air are emitted)
+//!
+//! Vertex colours are fully baked on the CPU: block base colour * face
+//! shading * light * AO. The GPU shader only applies distance fog.
+
+use crate::{Block, REGION};
+
+const R: usize = REGION as usize; // 26
+const MARGIN: i32 = 5;
+
+/// A built chunk mesh (positions + baked colours, u32 indices).
+pub struct MeshData {
+    /// Interleaved [x, y, z, r, g, b] in world space.
+    pub vertices: Vec<f32>,
+    pub indices: Vec<u32>,
+}
+
+impl MeshData {
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    #[allow(clippy::len_without_is_empty)]
+    pub fn index_count(&self) -> u32 {
+        self.indices.len() as u32
+    }
+}
+
+#[inline]
+fn idx(x: i32, y: i32, z: i32) -> usize {
+    ((y as usize) * R + (z as usize)) * R + x as usize
+}
+
+/// Build the mesh for the chunk whose origin is `origin`, from its 26^3
+/// region payload (`data`, region-local coordinates).
+pub fn build_chunk_mesh(origin: (i32, i32, i32), data: &[u8]) -> MeshData {
+    debug_assert_eq!(data.len(), R * R * R);
+
+    let solid = |x: i32, y: i32, z: i32| -> bool {
+        if x < 0 || y < 0 || z < 0 || x >= R as i32 || y >= R as i32 || z >= R as i32 {
+            return false;
+        }
+        Block::from_u8(data[idx(x, y, z)]).is_solid()
+    };
+
+    // ---- Voxel sky light -------------------------------------------------
+    let mut light = vec![0u8; R * R * R];
+    // Direct sky: air columns open to the top of the region.
+    for x in 0..R as i32 {
+        for z in 0..R as i32 {
+            let mut top_solid = -1i32;
+            let mut y = R as i32 - 1;
+            while y >= 0 {
+                if solid(x, y, z) {
+                    top_solid = y;
+                    break;
+                }
+                y -= 1;
+            }
+            y = top_solid + 1;
+            while y < R as i32 {
+                if !solid(x, y, z) {
+                    light[idx(x, y, z)] = 15;
+                }
+                y += 1;
+            }
+        }
+    }
+    // Propagation (BFS; sky light attenuates by 1 per block).
+    let mut queue: std::vec::Vec<usize> = Vec::new();
+    for i in 0..(R * R * R) {
+        if light[i] == 15 {
+            queue.push(i);
+        }
+    }
+    let mut head = 0usize;
+    while head < queue.len() {
+        let i = queue[head];
+        head += 1;
+        let l = light[i] as i32;
+        if l <= 1 {
+            continue;
+        }
+        let x = (i % R) as i32;
+        let z = ((i / R) % R) as i32;
+        let y = (i / (R * R)) as i32;
+        for n in [
+            (x + 1, y, z),
+            (x - 1, y, z),
+            (x, y + 1, z),
+            (x, y - 1, z),
+            (x, y, z + 1),
+            (x, y, z - 1),
+        ] {
+            if n.0 < 0 || n.1 < 0 || n.2 < 0 || n.0 >= R as i32 || n.1 >= R as i32 || n.2 >= R as i32 {
+                continue;
+            }
+            if solid(n.0, n.1, n.2) {
+                continue;
+            }
+            let ni = idx(n.0, n.1, n.2);
+            let cand = (l - 1) as u8;
+            if light[ni] < cand {
+                light[ni] = cand;
+                queue.push(ni);
+            }
+        }
+    }
+
+    // ---- Geometry ---------------------------------------------------------
+    let mut vertices: Vec<f32> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    // Core 16^3 (inset by the margin).
+    for cy in 0..16i32 {
+        for cz in 0..16i32 {
+            for cx in 0..16i32 {
+                let rx = MARGIN + cx;
+                let ry = MARGIN + cy;
+                let rz = MARGIN + cz;
+                let b = Block::from_u8(data[idx(rx, ry, rz)]);
+                if !b.is_solid() {
+                    continue;
+                }
+
+                for face in 0..6 {
+                    // face: 0:+Y 1:-Y 2:+X 3:-X 4:+Z 5:-Z
+                    let (nx, ny, nz) = match face {
+                        0 => (0i32, 1i32, 0i32),
+                        1 => (0, -1, 0),
+                        2 => (1, 0, 0),
+                        3 => (-1, 0, 0),
+                        4 => (0, 0, 1),
+                        _ => (0, 0, -1),
+                    };
+                    let fx = rx + nx;
+                    let fy = ry + ny;
+                    let fz = rz + nz;
+                    if solid(fx, fy, fz) {
+                        continue; // hidden face
+                    }
+
+                    let base_color = match face {
+                        0 => b.color_top(),
+                        1 => b.color_bottom(),
+                        _ => b.color_side(),
+                    };
+                    let face_shade = match face {
+                        0 => 1.0,
+                        1 => 0.55,
+                        2 | 3 => 0.82,
+                        _ => 0.7,
+                    };
+                    let l = light[idx(fx, fy, fz)] as f32 / 15.0;
+                    let light_f = 0.38 + 0.62 * l;
+
+                                    let corners: [(i32, i32, i32); 4] = match face {
+                        0 => [(0, 1, 0), (0, 1, 1), (1, 1, 1), (1, 1, 0)],
+                        1 => [(0, 0, 1), (0, 0, 0), (1, 0, 0), (1, 0, 1)],
+                        2 => [(1, 0, 1), (1, 0, 0), (1, 1, 0), (1, 1, 1)],
+                        3 => [(0, 0, 0), (0, 0, 1), (0, 1, 1), (0, 1, 0)],
+                        4 => [(0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)],
+                        _ => [(0, 1, 0), (1, 1, 0), (1, 0, 0), (0, 0, 0)],
+                    };
+
+                    let start = vertices.len() as u32 / 6;
+                    for corner in corners {
+                        // Ambient occlusion: the 3 blocks around this corner
+                        // in the face plane. Corner direction along each
+                        // tangent axis: +1 if the corner is on the + side.
+                        let signs = (corner.0 * 2 - 1, corner.1 * 2 - 1, corner.2 * 2 - 1);
+                        let (s1, s2, sc) = ao_corners(fx, fy, fz, signs, face, &solid);
+                        let ao = if s1 && s2 { 0 } else { 3 - s1 as u8 - s2 as u8 - sc as u8 };
+                        let ao_f = [0.45f32, 0.62, 0.82, 1.0][ao as usize];
+
+                        let mut br = light_f * face_shade * ao_f;
+                        br = br.min(1.0);
+                        // rx/ry/rz are region-local (core starts at MARGIN);
+                        // convert to chunk-local before adding the origin.
+                        let wx = origin.0 + rx - MARGIN + corner.0;
+                        let wy = origin.1 + ry - MARGIN + corner.1;
+                        let wz = origin.2 + rz - MARGIN + corner.2;
+                        vertices.extend_from_slice(&[
+                            wx as f32,
+                            wy as f32,
+                            wz as f32,
+                            (base_color[0] * br).min(1.0),
+                            (base_color[1] * br).min(1.0),
+                            (base_color[2] * br).min(1.0),
+                        ]);
+                    }
+                    indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+                }
+            }
+        }
+    }
+
+    MeshData { vertices, indices }
+}
+
+/// For a face corner, evaluate the two side blocks and the corner block in
+/// the face plane. `signs` are the corner directions along the two tangent
+/// axes (each -1 or +1).
+/// For a face corner, evaluate the two side blocks and the corner block in
+/// the face plane. `signs` are the corner directions along the two tangent
+/// axes (per world axis, each -1 or +1; 0 on the normal axis).
+fn ao_corners(
+    fx: i32,
+    fy: i32,
+    fz: i32,
+    signs: (i32, i32, i32),
+    face: u32,
+    solid: &dyn Fn(i32, i32, i32) -> bool,
+) -> (bool, bool, bool) {
+    let (t1, t2) = match face {
+        0 | 1 => ((1i32, 0, 0), (0, 0, 1)),
+        2 | 3 => ((0, 1, 0), (0, 0, 1)),
+        _ => ((1, 0, 0), (0, 1, 0)),
+    };
+    let axis_sign = |axis: (i32, i32, i32)| -> i32 {
+        if axis.0 != 0 {
+            signs.0
+        } else if axis.1 != 0 {
+            signs.1
+        } else {
+            signs.2
+        }
+    };
+    let s1 = axis_sign(t1);
+    let s2 = axis_sign(t2);
+    let p1 = (fx + t1.0 * s1, fy + t1.1 * s1, fz + t1.2 * s1);
+    let p2 = (fx + t2.0 * s2, fy + t2.1 * s2, fz + t2.2 * s2);
+    let pc = (
+        fx + t1.0 * s1 + t2.0 * s2,
+        fy + t1.1 * s1 + t2.1 * s2,
+        fz + t1.2 * s1 + t2.2 * s2,
+    );
+    (solid(p1.0, p1.1, p1.2), solid(p2.0, p2.1, p2.2), solid(pc.0, pc.1, pc.2))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CHUNK, CHUNK_BLOCKS, WorldGen};
+
+    fn region_for(gen: &WorldGen, cx: i32, cy: i32, cz: i32) -> Vec<u8> {
+        // Assemble a 26^3 region from the generator (3x3x3 chunk neighbourhood).
+        let mut out = vec![0u8; R * R * R];
+        let ox = cx * CHUNK - MARGIN;
+        let oy = cy * CHUNK - MARGIN;
+        let oz = cz * CHUNK - MARGIN;
+        for y in 0..R as i32 {
+            for z in 0..R as i32 {
+                for x in 0..R as i32 {
+                    let b = gen.block_at(ox + x, oy + y, oz + z);
+                    out[idx(x, y, z)] = b.as_u8();
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn mesh_has_geometry_and_valid_indices() {
+        let gen = WorldGen::new(1337);
+        let (cx, cy, cz) = (0, 0, 0);
+        let region = region_for(&gen, cx, cy, cz);
+        let mesh = build_chunk_mesh((0, 0, 0), &region);
+        assert!(!mesh.is_empty(), "terrain chunk should produce faces");
+        assert_eq!(mesh.vertices.len() % 6, 0);
+        let vcount = mesh.vertices.len() as u32 / 6;
+        assert!((mesh.indices.iter().copied().max().unwrap() as usize) < vcount as usize);
+        // Vertex colours (last 3 components) should be in [0,1].
+        for v in mesh.vertices.chunks(6) {
+            for c in &v[3..6] {
+                assert!((*c) >= 0.0 && (*c) <= 1.0, "colour out of range: {c}");
+            }
+        }
+        let _ = CHUNK_BLOCKS;
+    }
+
+    #[test]
+    fn light_reaches_under_overhangs_partially() {
+        // Synthetic region: stone floor at y=8 (inside the meshable 16^3 core,
+        // which is local 5..21) and a ceiling at y=12 covering half the core.
+        // Faces must be emitted for the floor and the underside of the
+        // ceiling; the mesh must not be empty.
+        let mut region = vec![0u8; R * R * R];
+        for x in 0..R as i32 {
+            for z in 0..R as i32 {
+                region[idx(x, 8, z)] = 3; // stone floor
+            }
+        }
+        for x in 5..21i32 {
+            for z in 5..21i32 {
+                region[idx(x, 12, z)] = 3; // ceiling
+            }
+        }
+        let mesh = build_chunk_mesh((0, 0, 0), &region);
+        assert!(!mesh.is_empty());
+    }
+
+    #[test]
+    fn surface_top_faces_are_bright_green_at_full_light() {
+        // Regression test: chunk vertices must be placed at
+        // `origin + chunk-local`, not offset by the region margin. A +MARGIN
+        // offset shifts every chunk's geometry and leaves players inside
+        // misaligned walls.
+        let gen = WorldGen::new(1337);
+        let h = gen.height(8, 8);
+        let cy = ((h - 1) / 16).clamp(0, 3);
+        let region = region_for(&gen, 0, cy, 0);
+        let mesh = build_chunk_mesh((0, cy * 16, 0), &region);
+        // The top face of the surface block at (8, h, 8) has corners at
+        // y = h + 1, x in 8..10, z in 8..10.
+        let mut found = 0u32;
+        for v in mesh.vertices.chunks(6) {
+            if v[1] == (h + 1) as f32 && (8.0..10.0).contains(&v[0]) && (8.0..10.0).contains(&v[2]) {
+                found += 1;
+                // Full sky light + top face + no AO => exactly the grass top
+                // colour (0.36, 0.65, 0.28).
+                assert!((v[3] - 0.36).abs() < 0.01, "r={} at {v:?}", v[3]);
+                assert!((v[4] - 0.65).abs() < 0.01, "g={} at {v:?}", v[4]);
+                assert!((v[5] - 0.28).abs() < 0.01, "b={} at {v:?}", v[5]);
+            }
+        }
+        assert!(found >= 4, "expected the grass top face at spawn, found {found} corners");
+    }
+
+}

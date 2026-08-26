@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustcraft-world",
+    "crates/rustcraft-server",
+    "crates/rustcraft-client",
+    "crates/rustcraft-web",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+# wasm builds benefit from optimization; keep debug info off for size.
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"

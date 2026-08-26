@@ -1,0 +1,670 @@
+//! WebGPU (wgpu) renderer for RustCraft.
+//!
+//! Chunks are meshed on the CPU (voxel lighting + AO baked into vertex
+//! colours, see `rustcraft_world::mesh`) and uploaded as static buffers;
+//! agents are spheres re-uploaded each frame. One shared pipeline renders
+//! everything (pos+colour vertices, distance fog in the fragment stage).
+//!
+//! This crate only compiles for wasm32 (WebGPU in the browser).
+
+#![cfg(target_arch = "wasm32")]
+
+use wgpu::{
+    Buffer, BufferUsages, Device, DeviceDescriptor, Instance, InstanceDescriptor, Queue,
+    RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions, ShaderModuleDescriptor,
+    ShaderSource, Surface, SurfaceConfiguration, SurfaceTarget, TextureFormat,
+    TextureViewDescriptor, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode,
+};
+
+use rustcraft_server::{AgentState, WorldUpdate};
+use rustcraft_world::camera::{
+    uniform_bytes, view_projection, FOG_END, FOG_START, SHADER, SKY, UNIFORM_SIZE,
+};
+use rustcraft_world::{ChunkPos, REGION_BLOCKS};
+
+
+/// Terrain mesh pool capacity. Chunks append into one pre-allocated
+/// vertex/index buffer pair, so a frame costs one set_index_buffer +
+/// one set_vertex_buffer plus a single draw_indexed per chunk (instead
+/// of three state changes per chunk). When the pool fills up, chunks far
+/// from the player are dropped and the survivors are compacted to the
+/// front (CPU-side copies are kept so this needs no GPU readback).
+///
+/// Capacity is sized with headroom over the measured worst case: a
+/// radius-7 streaming sphere of rough (cave + mountain) terrain needs
+/// ~1.0-1.5M vertices (see rustcraft-server's `pool_measure` example).
+const VERT_CAP: u32 = 2_000_000;
+const IDX_CAP: u32 = 3_000_000;
+/// Chunks at 3D Chebyshev chunk-cell distance >= this are fully inside
+/// the fog: their nearest corner is (d-1)*16 > FOG_END blocks from the
+/// camera, so they are invisible and can be dropped without a re-send.
+/// (FOG_END = 108 blocks -> d >= 8.)
+const FOG_CHUNK_DIST: i32 = FOG_END as i32 / 16 + 2;
+
+struct TerrainChunk {
+    pos: ChunkPos,
+    verts: Vec<f32>,
+    idxs: Vec<u32>,
+    base_v: u32,
+    base_i: u32,
+}
+
+struct AgentMesh {
+    id: u32,
+    vertex: Buffer,
+    index: Buffer,
+    count: u32,
+}
+
+/// The renderer.
+pub struct Renderer {
+    device: Device,
+    queue: Queue,
+    surface: Surface<'static>,
+    surface_format: TextureFormat,
+    pipeline: RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    uniform_buf: Buffer,
+    terrain_vbo: Buffer,
+    terrain_ibo: Buffer,
+    terrain_v_used: u32,
+    terrain_i_used: u32,
+    /// Meshed terrain chunks (CPU-side copies + pool offsets).
+    terrain: Vec<TerrainChunk>,
+    /// Chunks lost to pool pressure while still inside the fog range;
+    /// the app asks the server to re-send them (see `take_lost`).
+    lost: Vec<ChunkPos>,
+    /// Rate-limits the "pool full" console warning.
+    pool_full_warns: u32,
+    agents: Vec<AgentMesh>,
+    /// Chunk updates waiting to be meshed (budgeted per frame).
+    backlog: Vec<WorldUpdate>,
+    width: u32,
+    height: u32,
+    camera: [f32; 3],
+    yaw: f32,
+    pitch: f32,
+    first_frame: bool,
+}
+
+impl Renderer {
+    /// Create the renderer (async: adapter/device requests).
+    pub async fn new(canvas: &web_sys::HtmlCanvasElement) -> Result<Renderer, String> {
+        let instance = Instance::new(&InstanceDescriptor::default());
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("RustCraft: creating surface"));
+        let surface = instance
+            .create_surface(SurfaceTarget::Canvas(canvas.clone()))
+            .map_err(|e| format!("surface creation failed: {e:?}"))?;
+
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("RustCraft: requesting adapter"));
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions::default())
+            .await
+            .map_err(|e| format!("no WebGPU adapter available: {e:?}"))?;
+        log_or_panic_adapter(&adapter);
+
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("RustCraft: requesting device"));
+        let (device, queue) = adapter
+            .request_device(&DeviceDescriptor {
+                label: Some("rustcraft-device"),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| format!("device request failed: {e:?}"))?;
+
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("RustCraft: configuring surface"));
+        let caps = surface.get_capabilities(&adapter);
+        let surface_format = *caps
+            .formats
+            .first()
+            .ok_or_else(|| "surface has no formats".to_string())?;
+
+        let (width, height) = canvas_size(canvas);
+        configure_surface(&surface, &device, surface_format, width, height);
+
+        // Pipeline: pos(3f) + color(3f) vertices, one uniform buffer.
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("rustcraft-shader"),
+            source: ShaderSource::Wgsl(SHADER.into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rustcraft-bg-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rustcraft-layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("rustcraft-pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[VertexBufferLayout {
+                    array_stride: 24,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &[
+                        VertexAttribute {
+                            offset: 0,
+                            format: VertexFormat::Float32x3,
+                            shader_location: 0,
+                        },
+                        VertexAttribute {
+                            offset: 12,
+                            format: VertexFormat::Float32x3,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rustcraft-uniforms"),
+            size: UNIFORM_SIZE,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let terrain_vbo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terrain-vertices"),
+            size: (VERT_CAP * 24) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let terrain_ibo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terrain-indices"),
+            size: (IDX_CAP * 4) as u64,
+            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Ok(Renderer {
+            device,
+            queue,
+            surface,
+            surface_format,
+            pipeline,
+            bind_group_layout,
+            uniform_buf,
+            terrain_vbo,
+            terrain_ibo,
+            terrain_v_used: 0,
+            terrain_i_used: 0,
+            terrain: Vec::new(),
+            lost: Vec::new(),
+            pool_full_warns: 0,
+            agents: Vec::new(),
+            backlog: Vec::new(),
+            width,
+            height,
+            camera: [0.0, 40.0, 0.0],
+            yaw: 0.7,
+            pitch: -0.15,
+            first_frame: true,
+        })
+    }
+
+    pub fn chunk_count(&self) -> usize {
+        self.terrain.len()
+    }
+
+    /// First frame has been presented (for startup logging).
+    pub fn take_first_frame(&mut self) -> bool {
+        let f = self.first_frame;
+        self.first_frame = false;
+        f
+    }
+
+    /// Resize the viewport.
+    pub fn resize(&mut self, canvas: &web_sys::HtmlCanvasElement) {
+        let (w, h) = canvas_size(canvas);
+        if w == self.width && h == self.height {
+            return;
+        }
+        self.width = w;
+        self.height = h;
+        configure_surface(&self.surface, &self.device, self.surface_format, w, h);
+    }
+
+    /// Ingest world updates; meshing is budgeted (a few chunks per frame).
+    pub fn apply_updates(&mut self, updates: Vec<WorldUpdate>) {
+        self.backlog.extend(updates);
+        let budget = 4;
+        for _ in 0..budget {
+            if self.backlog.is_empty() {
+                break;
+            }
+            match self.backlog.remove(0) {
+                WorldUpdate::Chunk { pos, data } => self.build_chunk(pos, data),
+            }
+        }
+    }
+
+    fn build_chunk(&mut self, pos: ChunkPos, data: Vec<u8>) {
+        if data.len() != REGION_BLOCKS {
+            return;
+        }
+        let mesh = rustcraft_world::mesh::build_chunk_mesh((pos.x * 16, pos.y * 16, pos.z * 16), &data);
+        if mesh.is_empty() {
+            // A re-sent fully-air chunk (e.g. everything broken) drops the
+            // old mesh.
+            if let Some(idx) = self.terrain.iter().position(|t| t.pos == pos) {
+                self.terrain.remove(idx);
+            }
+            return;
+        }
+        let nv = mesh.vertices.len() as u32 / 6;
+        let ni = mesh.indices.len() as u32;
+        // A re-sent chunk (an edit changed it) replaces the old mesh. The
+        // old entry's pool space is orphaned (append-only pool); the next
+        // compaction reclaims it.
+        if let Some(idx) = self.terrain.iter().position(|t| t.pos == pos) {
+            self.terrain.remove(idx);
+        }
+        if self.terrain_v_used + nv > VERT_CAP || self.terrain_i_used + ni > IDX_CAP {
+            self.compact_pool(nv, ni);
+        }
+        if self.terrain_v_used + nv > VERT_CAP || self.terrain_i_used + ni > IDX_CAP {
+            // The whole pool is in-view chunks (pathological terrain):
+            // report this chunk as lost so the app can ask the server for
+            // a re-send, and warn (rate-limited).
+            self.lost.push(pos);
+            self.pool_full_warns += 1;
+            if self.pool_full_warns == 1 || self.pool_full_warns % 120 == 0 {
+                web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(
+                    "RustCraft: terrain pool full — chunk lost, requesting re-send",
+                ));
+            }
+            return;
+        }
+        let base_v = self.terrain_v_used;
+        let base_i = self.terrain_i_used;
+        // Indices stay chunk-local; draw_indexed adds base_vertex to each.
+        self.queue.write_buffer(&self.terrain_vbo, (base_v * 24) as u64, f32_bytes(&mesh.vertices));
+        self.queue.write_buffer(&self.terrain_ibo, (base_i * 4) as u64, u32_bytes(&mesh.indices));
+        self.terrain.push(TerrainChunk {
+            pos,
+            verts: mesh.vertices,
+            idxs: mesh.indices,
+            base_v,
+            base_i,
+        });
+        self.terrain_v_used += nv;
+        self.terrain_i_used += ni;
+    }
+
+    /// 3D Chebyshev distance in chunk cells between `pos` and the camera.
+    fn chunk_dist(&self, pos: ChunkPos) -> i32 {
+        let cx = (self.camera[0] / 16.0).floor() as i32;
+        let cy = (self.camera[1] / 16.0).floor() as i32;
+        let cz = (self.camera[2] / 16.0).floor() as i32;
+        (pos.x - cx).abs().max((pos.y - cy).abs()).max((pos.z - cz).abs())
+    }
+
+    /// Free pool space for `need_v` extra vertices / `need_i` indices.
+    ///
+    /// The drop decision is based on the *live* total (not the high-water
+    /// mark, which may include orphaned space from replaced chunks that a
+    /// plain rewrite reclaims). Chunks are dropped from the farthest (3D
+    /// Chebyshev) first: chunks fully inside the fog (`FOG_CHUNK_DIST`) are
+    /// dropped silently — they are invisible. Anything closer that still
+    /// has to go is reported via `lost` so the app can ask the server to
+    /// re-send it. Survivors are rewritten to the front of the pool.
+    fn compact_pool(&mut self, need_v: u32, need_i: u32) {
+        let before = self.terrain.len();
+        // (index, distance, vertex count, index count) per chunk.
+        let mut ranked: Vec<(usize, i32, u32, u32)> = self
+            .terrain
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                (
+                    i,
+                    self.chunk_dist(t.pos),
+                    t.verts.len() as u32 / 6,
+                    t.idxs.len() as u32,
+                )
+            })
+            .collect();
+        // Live totals (high-water minus orphans).
+        let live_v: u32 = ranked.iter().map(|r| r.2).sum();
+        let live_i: u32 = ranked.iter().map(|r| r.3).sum();
+        // Farthest first; on equal distance the biggest chunk (frees the
+        // most space per drop).
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+        let mut drop = vec![false; self.terrain.len()];
+        let mut used_v = live_v;
+        let mut used_i = live_i;
+        for &(i, d, vc, ic) in &ranked {
+            if used_v + need_v <= VERT_CAP && used_i + need_i <= IDX_CAP {
+                break;
+            }
+            drop[i] = true;
+            used_v -= vc;
+            used_i -= ic;
+            if d < FOG_CHUNK_DIST {
+                // Still potentially visible: report for re-send.
+                self.lost.push(self.terrain[i].pos);
+            }
+        }
+        let dropping = drop.iter().any(|&d| d);
+        let has_orphans = self.terrain_v_used > live_v || self.terrain_i_used > live_i;
+        if !dropping && !has_orphans {
+            return; // spurious call: there is room and nothing to reclaim
+        }
+        let mut nv = 0u32;
+        let mut ni = 0u32;
+        let mut idx = 0usize;
+        self.terrain.retain_mut(|t| {
+            let keep = !drop[idx];
+            idx += 1;
+            if keep {
+                t.base_v = nv;
+                t.base_i = ni;
+                self.queue
+                    .write_buffer(&self.terrain_vbo, (nv * 24) as u64, f32_bytes(&t.verts));
+                self.queue
+                    .write_buffer(&self.terrain_ibo, (ni * 4) as u64, u32_bytes(&t.idxs));
+                nv += t.verts.len() as u32 / 6;
+                ni += t.idxs.len() as u32;
+            }
+            keep
+        });
+        self.terrain_v_used = nv;
+        self.terrain_i_used = ni;
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "RustCraft: compacted terrain pool {} -> {} chunks ({} verts, {} dropped)",
+            before,
+            self.terrain.len(),
+            nv,
+            before - self.terrain.len()
+        )));
+    }
+
+    /// Chunks lost to pool pressure while still inside the fog range. The
+    /// app should ask the server to re-send them (budgeted, with a
+    /// per-chunk cooldown to avoid a ping-pong while the pool stays full).
+    pub fn take_lost(&mut self) -> Vec<ChunkPos> {
+        std::mem::take(&mut self.lost)
+    }
+
+    /// Re-queue a world update (e.g. a server re-send of a lost chunk).
+    pub fn requeue(&mut self, update: WorldUpdate) {
+        self.backlog.push(update);
+    }
+
+    /// Update agent spheres from the latest states.
+    pub fn set_agents(&mut self, states: Vec<AgentState>) {
+        // Remove stale.
+        let ids: std::collections::HashSet<u32> = states.iter().map(|s| s.id).collect();
+        self.agents.retain(|a| ids.contains(&a.id));
+        for s in &states {
+            if s.is_player {
+                continue; // first person: the player is the camera
+            }
+            let (verts, indices) = rustcraft_server::sphere_mesh(s);
+            let existing = self.agents.iter_mut().find(|a| a.id == s.id);
+            match existing {
+                Some(m) => {
+                    if (m.vertex.size() as usize) < verts.len() * 4 {
+                        // grow (shouldn't happen)
+                        let v = self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("agent-vertex"),
+                            size: (verts.len() * 4) as u64,
+                            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                        let i = self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("agent-index"),
+                            size: (indices.len() * 4) as u64,
+                            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                        m.vertex = v;
+                        m.index = i;
+                    }
+                    self.queue.write_buffer(&m.vertex, 0, f32_bytes(&verts));
+                    self.queue.write_buffer(&m.index, 0, u32_bytes(&indices));
+                    m.count = indices.len() as u32;
+                }
+                None => {
+                    let vertex = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("agent-vertex"),
+                        size: (verts.len() * 4) as u64,
+                        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    let index = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("agent-index"),
+                        size: (indices.len() * 4) as u64,
+                        usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    self.queue.write_buffer(&vertex, 0, f32_bytes(&verts));
+                    self.queue.write_buffer(&index, 0, u32_bytes(&indices));
+                    self.agents.push(AgentMesh {
+                        id: s.id,
+                        vertex,
+                        index,
+                        count: indices.len() as u32,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Render one frame from the first-person `camera` (eye position, yaw,
+    /// pitch in the server's convention).
+    pub fn render(&mut self, camera: [f32; 3], yaw: f32, pitch: f32) {
+        self.camera = camera;
+        self.yaw = yaw;
+        self.pitch = pitch;
+        let frame = match self.surface.get_current_texture() {
+            Ok(f) => f,
+            Err(_) => return, // e.g. surface temporarily unavailable
+        };
+        let view = frame
+            .texture
+            .create_view(&TextureViewDescriptor {
+                format: Some(self.surface_format),
+                ..Default::default()
+            });
+        let depth_view = self.create_depth(self.width, self.height);
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.render_pass_into(&mut encoder, &view, &depth_view, self.width, self.height);
+        self.queue.submit([encoder.finish()]);
+        frame.present();
+    }
+
+    fn create_depth(&self, w: u32, h: u32) -> wgpu::TextureView {
+        let depth = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        depth.create_view(&TextureViewDescriptor::default())
+    }
+
+    /// Encode the full scene (chunks + agents) into `encoder`, drawing into
+    /// `color_view` with `depth_view`. Shared by the main render and the
+    /// offscreen verify probe.
+    fn render_pass_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        color_view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
+        _w: u32,
+        _h: u32,
+    ) {
+        let camera = self.camera;
+        let aspect = (self.width as f32 / self.height as f32).max(0.1);
+        let vp = view_projection(camera, self.yaw, self.pitch, aspect, 1.15, 0.1, 300.0);
+        self.queue.write_buffer(
+            &self.uniform_buf,
+            0,
+            &uniform_bytes(&vp, camera, FOG_START, FOG_END, SKY),
+        );
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rustcraft-bg"),
+            layout: &self.bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.uniform_buf.as_entire_binding(),
+            }],
+        });
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("rustcraft-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: SKY[0] as f64,
+                        g: SKY[1] as f64,
+                        b: SKY[2] as f64,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        // Terrain: one shared buffer pair, one draw call per chunk.
+        if !self.terrain.is_empty() {
+            pass.set_index_buffer(self.terrain_ibo.slice(0..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, self.terrain_vbo.slice(..));
+            for t in &self.terrain {
+                pass.draw_indexed(
+                    t.base_i..t.base_i + t.idxs.len() as u32,
+                    t.base_v as i32,
+                    0..1,
+                );
+            }
+        }
+        // Agents: few, small, per-agent buffers.
+        for m in &self.agents {
+            pass.set_index_buffer(m.index.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, m.vertex.slice(..));
+            pass.draw_indexed(0..m.count, 0, 0..1);
+        }
+        drop(pass);
+    }
+
+}
+
+fn log_or_panic_adapter(adapter: &wgpu::Adapter) {
+    let info = adapter.get_info();
+    eprintln!("RustCraft: using adapter {:?}", info.name);
+}
+
+fn canvas_size(canvas: &web_sys::HtmlCanvasElement) -> (u32, u32) {
+    let dpr = web_sys::window()
+        .map(|w| w.device_pixel_ratio())
+        .unwrap_or(1.0)
+        .max(1.0) as f32;
+    let w = (canvas.client_width().max(1) as f32 * dpr) as u32;
+    let h = (canvas.client_height().max(1) as f32 * dpr) as u32;
+    canvas.set_width(w);
+    canvas.set_height(h);
+    (w, h)
+}
+
+fn configure_surface(
+    surface: &Surface<'_>,
+    device: &Device,
+    format: TextureFormat,
+    width: u32,
+    height: u32,
+) {
+    surface.configure(
+        device,
+        &SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            view_formats: vec![],
+            width,
+            height,
+            desired_maximum_frame_latency: 2,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+        },
+    );
+}
+
+/// f32 slice as raw bytes (safe: f32 is a plain 4-byte type).
+fn f32_bytes(v: &[f32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+}
+
+/// u32 slice as raw bytes (safe: u32 is a plain 4-byte type).
+fn u32_bytes(v: &[u32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+}
