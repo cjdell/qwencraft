@@ -15,14 +15,19 @@ const MARGIN: i32 = 5;
 
 /// A built chunk mesh (positions + baked colours, u32 indices).
 pub struct MeshData {
-    /// Interleaved [x, y, z, r, g, b] in world space.
+    /// Interleaved [x, y, z, r, g, b] in world space (opaque terrain +
+    /// flower decals).
     pub vertices: Vec<f32>,
     pub indices: Vec<u32>,
+    /// Water: separate geometry, drawn with a translucent pipeline after
+    /// all opaque geometry.
+    pub water_vertices: Vec<f32>,
+    pub water_indices: Vec<u32>,
 }
 
 impl MeshData {
     pub fn is_empty(&self) -> bool {
-        self.indices.is_empty()
+        self.indices.is_empty() && self.water_indices.is_empty()
     }
 
     #[allow(clippy::len_without_is_empty)]
@@ -115,6 +120,8 @@ pub fn build_chunk_mesh(origin: (i32, i32, i32), data: &[u8]) -> MeshData {
     // ---- Geometry ---------------------------------------------------------
     let mut vertices: Vec<f32> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
+    let mut water_vertices: Vec<f32> = Vec::new();
+    let mut water_indices: Vec<u32> = Vec::new();
 
     // Core 16^3 (inset by the margin).
     for cy in 0..16i32 {
@@ -124,6 +131,137 @@ pub fn build_chunk_mesh(origin: (i32, i32, i32), data: &[u8]) -> MeshData {
                 let ry = MARGIN + cy;
                 let rz = MARGIN + cz;
                 let b = Block::from_u8(data[idx(rx, ry, rz)]);
+
+                // Water: translucent, separate pass. Faces are only emitted
+                // against *air* (never against water or solid), and the top
+                // surface sits slightly below the cell top.
+                if b == Block::Water {
+                    let air = |x: i32, y: i32, z: i32| -> bool {
+                        (0..R as i32).contains(&x)
+                            && (0..R as i32).contains(&y)
+                            && (0..R as i32).contains(&z)
+                            && Block::from_u8(data[idx(x, y, z)]) == Block::Air
+                    };
+                    let wx = (origin.0 + rx - MARGIN) as f32;
+                    let wy = (origin.1 + ry - MARGIN) as f32;
+                    let wz = (origin.2 + rz - MARGIN) as f32;
+                    let top_h = if air(rx, ry + 1, rz) { 0.875 } else { 1.0 };
+                    let shaded = |li: usize, base: [f32; 3], shade: f32| -> [f32; 3] {
+                        let f = 0.38 + 0.62 * (light[li] as f32 / 15.0);
+                        [base[0] * f * shade, base[1] * f * shade, base[2] * f * shade]
+                    };
+                    // Top (only against air).
+                    if air(rx, ry + 1, rz) {
+                        let c = shaded(idx(rx, ry + 1, rz), b.color_top(), 1.0);
+                        push_quad(
+                            &mut water_vertices,
+                            &mut water_indices,
+                            &[
+                                (wx, wy + top_h, wz),
+                                (wx, wy + top_h, wz + 1.0),
+                                (wx + 1.0, wy + top_h, wz + 1.0),
+                                (wx + 1.0, wy + top_h, wz),
+                            ],
+                            c,
+                        );
+                    }
+                    // Bottom (a cave under the lake).
+                    if air(rx, ry - 1, rz) {
+                        let c = shaded(idx(rx, ry - 1, rz), b.color_bottom(), 0.55);
+                        push_quad(
+                            &mut water_vertices,
+                            &mut water_indices,
+                            &[
+                                (wx, wy, wz + 1.0),
+                                (wx, wy, wz),
+                                (wx + 1.0, wy, wz),
+                                (wx + 1.0, wy, wz + 1.0),
+                            ],
+                            c,
+                        );
+                    }
+                    // Sides (only against air; the top edge follows the
+                    // water surface).
+                    for (nx, nz, face) in [(1i32, 0i32, 2u32), (-1, 0, 3), (0, 1, 4), (0, -1, 5)] {
+                        if air(rx + nx, ry, rz + nz) {
+                            let c = shaded(
+                                idx(rx + nx, ry, rz + nz),
+                                b.color_side(),
+                                match face {
+                                    2 | 3 => 0.82,
+                                    _ => 0.7,
+                                },
+                            );
+                            let corners: [(f32, f32, f32); 4] = match face {
+                                2 => [
+                                    (wx + 1.0, wy, wz + 1.0),
+                                    (wx + 1.0, wy, wz),
+                                    (wx + 1.0, wy + top_h, wz),
+                                    (wx + 1.0, wy + top_h, wz + 1.0),
+                                ],
+                                3 => [
+                                    (wx, wy, wz),
+                                    (wx, wy, wz + 1.0),
+                                    (wx, wy + top_h, wz + 1.0),
+                                    (wx, wy + top_h, wz),
+                                ],
+                                4 => [
+                                    (wx, wy, wz + 1.0),
+                                    (wx + 1.0, wy, wz + 1.0),
+                                    (wx + 1.0, wy + top_h, wz + 1.0),
+                                    (wx, wy + top_h, wz + 1.0),
+                                ],
+                                _ => [
+                                    (wx, wy + top_h, wz),
+                                    (wx + 1.0, wy + top_h, wz),
+                                    (wx + 1.0, wy, wz),
+                                    (wx, wy, wz),
+                                ],
+                            };
+                            push_quad(
+                                &mut water_vertices,
+                                &mut water_indices,
+                                &corners,
+                                c,
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                // Flowers: opaque plus-shaped decals on top of the cell.
+                if b == Block::FlowerRed || b == Block::FlowerYellow {
+                    let wx = (origin.0 + rx - MARGIN) as f32;
+                    let wy = (origin.1 + ry - MARGIN) as f32 + 0.03;
+                    let wz = (origin.2 + rz - MARGIN) as f32;
+                    let f = 0.38 + 0.62 * (light[idx(rx, ry, rz)] as f32 / 15.0);
+                    let base = b.color_top();
+                    let c = [base[0] * f, base[1] * f, base[2] * f];
+                    push_quad(
+                        &mut vertices,
+                        &mut indices,
+                        &[
+                            (wx + 0.19, wy, wz + 0.56),
+                            (wx + 0.81, wy, wz + 0.56),
+                            (wx + 0.81, wy, wz + 0.44),
+                            (wx + 0.19, wy, wz + 0.44),
+                        ],
+                        c,
+                    );
+                    push_quad(
+                        &mut vertices,
+                        &mut indices,
+                        &[
+                            (wx + 0.44, wy, wz + 0.19),
+                            (wx + 0.44, wy, wz + 0.81),
+                            (wx + 0.56, wy, wz + 0.81),
+                            (wx + 0.56, wy, wz + 0.19),
+                        ],
+                        c,
+                    );
+                    continue;
+                }
+
                 if !b.is_solid() {
                     continue;
                 }
@@ -200,7 +338,33 @@ pub fn build_chunk_mesh(origin: (i32, i32, i32), data: &[u8]) -> MeshData {
         }
     }
 
-    MeshData { vertices, indices }
+    MeshData {
+        vertices,
+        indices,
+        water_vertices,
+        water_indices,
+    }
+}
+
+/// One convex quad (CCW as seen from outside) with a baked colour.
+fn push_quad(
+    verts: &mut Vec<f32>,
+    idxs: &mut Vec<u32>,
+    corners: &[(f32, f32, f32); 4],
+    c: [f32; 3],
+) {
+    let start = verts.len() as u32 / 6;
+    for (px, py, pz) in corners {
+        verts.extend_from_slice(&[
+            *px,
+            *py,
+            *pz,
+            c[0].min(1.0),
+            c[1].min(1.0),
+            c[2].min(1.0),
+        ]);
+    }
+    idxs.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
 }
 
 /// For a face corner, evaluate the two side blocks and the corner block in

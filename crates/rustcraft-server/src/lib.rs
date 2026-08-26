@@ -61,15 +61,16 @@ impl Server {
     /// Create a server for a world with the given seed.
     pub fn new(seed: u64) -> Self {
         let world = World::new(seed);
-        // Spawn at a stable-ish spot: near origin, on top of the terrain.
-        let surface = world.height_at(8, 8);
+        // Spawn near the origin on dry, tree-free grass (skip water, snow
+        // and tree columns so nobody starts underwater or in a trunk).
+        let (sx, sz) = Self::find_spawn(&world, 8, 8, 16);
+        let surface = world.height_at(sx, sz);
 
         let mut agents = Vec::new();
-        agents.push(Agent::player(0, Vec3::new(8.5, (surface + 2) as f32, 8.5)));
-        // A couple of wandering NPC agents.
+        agents.push(Agent::player(0, Vec3::new(sx as f32 + 0.5, (surface + 2) as f32, sz as f32 + 0.5)));
+        // A couple of wandering NPC agents (also on dry, tree-free ground).
         for (i, (dx, dz)) in [(3, -4), (-5, 3), (2, 6)].into_iter().enumerate() {
-            let x = 8 + dx;
-            let z = 8 + dz;
+            let (x, z) = Self::find_spawn(&world, 8 + dx, 8 + dz, 6);
             let h = world.height_at(x, z);
             agents.push(Agent::npc(
                 (i + 1) as u32,
@@ -94,6 +95,39 @@ impl Server {
 
     pub fn seed(&self) -> u64 {
         self.seed
+    }
+
+    /// True when an agent can stand on column (x, z): dry grass (no water,
+    /// no snow) with no tree trunk at the surface.
+    fn spawnable(world: &World, x: i32, z: i32) -> bool {
+        let h = world.height_at(x, z);
+        h >= rustcraft_world::SEA_LEVEL
+            && h < rustcraft_world::SNOW_LEVEL
+            && world.tree_at(x, z).is_none()
+    }
+
+    /// Find a spawnable column on concentric rings around (cx, cz).
+    fn find_spawn(world: &World, cx: i32, cz: i32, max_r: i32) -> (i32, i32) {
+        for r in 0..=max_r {
+            if r == 0 {
+                if Self::spawnable(world, cx, cz) {
+                    return (cx, cz);
+                }
+                continue;
+            }
+            for x in (cx - r)..=(cx + r) {
+                for z in (cz - r)..=(cz + r) {
+                    // Ring (Chebyshev) only — inner cells were checked already.
+                    if x.abs_diff(cx).max(z.abs_diff(cz)) != r as u32 {
+                        continue;
+                    }
+                    if Self::spawnable(world, x, z) {
+                        return (x, z);
+                    }
+                }
+            }
+        }
+        (cx, cz) // fallback (very unlikely: the map is mostly dry grass)
     }
 
     /// Queue a one-shot action (break/place) to be applied on the next tick.
@@ -389,7 +423,8 @@ mod tests {
     #[test]
     fn player_falls_to_ground() {
         let mut s = Server::new(1337);
-        let h = s.world.height_at(8, 8);
+        let (sx, sz) = Server::find_spawn(&s.world, 8, 8, 16);
+        let h = s.world.height_at(sx, sz);
         tick_n(&mut s, 180); // 3s of simulation
         let p = s.player_state();
         assert!(p.on_ground, "player should be standing on the ground");
@@ -399,6 +434,79 @@ mod tests {
         let y = p.pos.y;
         tick_n(&mut s, 30);
         assert!((s.player_state().pos.y - y).abs() < 1e-3);
+    }
+
+    #[test]
+    fn player_spawns_on_dry_grass() {
+        for seed in [1337u64, 42, 7, 999] {
+            let mut s = Server::new(seed);
+            tick_n(&mut s, 60);
+            let p = s.player_state();
+            let ground = BlockPos::new(
+                p.pos.x.floor() as i32,
+                p.pos.y as i32 - 1,
+                p.pos.z.floor() as i32,
+            );
+            assert_eq!(
+                s.world.block_at(ground),
+                Block::Grass,
+                "seed {seed}: spawn ground should be grass"
+            );
+            let body = BlockPos::new(
+                p.pos.x.floor() as i32,
+                (p.pos.y + 0.5).floor() as i32,
+                p.pos.z.floor() as i32,
+            );
+            assert!(
+                !s.world.block_at(body).is_water(),
+                "seed {seed}: spawn should not be underwater"
+            );
+        }
+    }
+
+    #[test]
+    fn swimming_sinks_slowly_and_rises_with_space() {
+        let mut s = Server::new(1337);
+        // Find a lake column (at least 3 blocks deep) near the origin.
+        let (lx, lz) = (0..4096)
+            .find_map(|i| {
+                let (x, z) = (i % 64 - 32, i / 64 - 32);
+                (s.world.height_at(x, z) < rustcraft_world::SEA_LEVEL - 2).then_some((x, z))
+            })
+            .expect("expected a lake near the origin");
+        let bed = s.world.height_at(lx, lz);
+        // Drop the player just above the water surface (feet at SEA+2).
+        let sea = rustcraft_world::SEA_LEVEL;
+        s.agents[0].pos = Vec3::new(lx as f32 + 0.5, (sea + 2) as f32, lz as f32 + 0.5);
+        s.agents[0].vel = Vec3::new(0.0, 0.0, 0.0);
+        tick_n(&mut s, 30); // 0.5s: enter the water and sink (capped fall)
+        let p = s.player_state();
+        assert!(
+            p.pos.y < (sea + 1) as f32,
+            "player should be below the surface (y={})",
+            p.pos.y
+        );
+        assert!(
+            p.pos.y > bed as f32 + 1.0,
+            "player should still be swimming, not on the lakebed (y={} bed={})",
+            p.pos.y,
+            bed
+        );
+        assert!(s.agents[0].in_water(&mut s.world));
+        // Hold Space: swim back up to the surface.
+        let mut input = Input::default();
+        input.keys.insert(Key::Space);
+        s.set_input(input);
+        let mut peak = f32::MIN;
+        for _ in 0..120 {
+            tick_n(&mut s, 1);
+            peak = peak.max(s.player_state().pos.y);
+        }
+        assert!(
+            peak > sea as f32 + 0.5,
+            "player should have swum up to the surface (peak {})",
+            peak
+        );
     }
 
     #[test]

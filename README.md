@@ -6,6 +6,10 @@ embedded server crate, and rendered with WebGPU: solid-colour blocks with
 per-vertex voxel lighting, ambient occlusion and distance fog, agents drawn
 as spheres, first-person keyboard + mouse controls.
 
+The landscape includes lakes and shorelines (translucent water you can
+swim through), procedural trees with trunks and canopies, sandy beaches,
+snow-capped peaks, caves, and flowers scattered on the grassland.
+
 ![scene](docs/screenshot.png)
 
 *Real rendered output, 256x144, read back from the GPU during
@@ -39,6 +43,7 @@ cargo test             # host unit tests (worldgen, physics, streaming, …)
 | `Space` / `Shift` | jump / sprint — **up / down while flying** |
 | `Mouse` | look (pointer-locked) |
 | `Left click` / `Right click` | break / place block |
+| `Space` (in water) | swim up (falling in water is slowed; hold to surface) |
 | `F` | toggle **fly mode** (no gravity, no collision) |
 | `Q` / `E` | fly speed down / up (×1.5 steps, 5 → 500 blocks/s; hold to ramp) |
 
@@ -96,10 +101,31 @@ anything closer that still has to go is reported and the embedded server
 re-sends it from its own copy (the server keeps every generated chunk).
 
 Capacity is sized with headroom over the measured worst case: a radius-7
-streaming sphere of rough (cave + mountain) terrain needs ~1.0-1.5M
-vertices (`rustcraft-server`'s `pool_measure` example); the pool holds
+streaming sphere of the current landscape (caves, mountains, lakes, trees,
+beaches, snow) needs ~1.0-1.2M vertices in typical walking and ~1.65M at
+spawn (`rustcraft-server`'s `pool_measure` example); the pool holds
 2M vertices / 3M indices. A walk test with the cap artificially shrunken
 to 300K exercises 100+ compactions per minute with zero lost chunks.
+
+## World generation
+
+Everything is a pure function of (seed, world coordinates), so chunks agree
+perfectly across boundaries — including tree canopies that overhang a chunk
+edge (each chunk stamps the 1-chunk halo around it; enforced by the
+`chunk_matches_block_at` and `tree_chunks_agree_across_boundaries` tests):
+
+- **Heightmap** — layered value noise (rolling hills + detail), clamped to
+  8..47 blocks; 3D-noise caves carved below the surface.
+- **Water** — columns below sea level (y=21) are filled to a flat surface;
+  lakebeds are sand, the surface is rendered translucent in a second
+  blending pass, and the player (and NPCs) swim: slowed movement, capped
+  fall, `Space` to rise.
+- **Trees** — one per ~80 flat grass columns: a 4-6 block trunk with a
+  5×5 + 3×3 leaf canopy (deterministic corner cutouts), never on beaches,
+  snow, or slopes steeper than 1 block.
+- **Biomes** — underwater/surface-level columns are sandy beaches, the
+  highest columns (y≥33) are snow-capped, the rest are grassland with
+  scattered red/yellow flowers (passable decals).
 
 ## Notes / environment quirks
 

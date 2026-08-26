@@ -50,6 +50,23 @@ void main() {
 }
 "#;
 
+/// Water variant: constant translucency (mirrors `fs_water` in the WGSL).
+const FS_W: &str = r#"#version 300 es
+precision highp float;
+in vec3 v_color;
+in vec3 v_world;
+uniform vec3 u_cam;
+uniform float u_fog_start;
+uniform float u_fog_end;
+uniform vec3 u_sky;
+out vec4 o;
+void main() {
+    float d = distance(u_cam, v_world);
+    float t = clamp((d - u_fog_start) / (u_fog_end - u_fog_start), 0.0, 1.0);
+    o = vec4(mix(v_color, u_sky, t), 0.62);
+}
+"#;
+
 const W: u32 = 256;
 const H: u32 = 144;
 
@@ -65,16 +82,36 @@ fn u32_slice(v: &[u32]) -> &[u8] {
 
 type Gl = web_sys::WebGl2RenderingContext;
 
-pub struct GlVerifier {
-    gl: Gl,
-    program: web_sys::WebGlProgram,
-    vbo: web_sys::WebGlBuffer,
-    ibo: web_sys::WebGlBuffer,
+/// Uniform locations for one program (opaque and water share names).
+struct Uni {
     u_vp: Option<web_sys::WebGlUniformLocation>,
     u_cam: Option<web_sys::WebGlUniformLocation>,
     u_fog_start: Option<web_sys::WebGlUniformLocation>,
     u_fog_end: Option<web_sys::WebGlUniformLocation>,
     u_sky: Option<web_sys::WebGlUniformLocation>,
+}
+
+fn locations(gl: &Gl, program: &web_sys::WebGlProgram) -> Uni {
+    Uni {
+        u_vp: gl.get_uniform_location(program, "u_vp"),
+        u_cam: gl.get_uniform_location(program, "u_cam"),
+        u_fog_start: gl.get_uniform_location(program, "u_fog_start"),
+        u_fog_end: gl.get_uniform_location(program, "u_fog_end"),
+        u_sky: gl.get_uniform_location(program, "u_sky"),
+    }
+}
+
+pub struct GlVerifier {
+    gl: Gl,
+    program: web_sys::WebGlProgram,
+    /// Translucent water program (src-alpha blend, no depth writes).
+    program_w: web_sys::WebGlProgram,
+    uni: Uni,
+    uni_w: Uni,
+    vbo: web_sys::WebGlBuffer,
+    ibo: web_sys::WebGlBuffer,
+    w_vbo: web_sys::WebGlBuffer,
+    w_ibo: web_sys::WebGlBuffer,
 }
 
 impl GlVerifier {
@@ -104,6 +141,7 @@ impl GlVerifier {
         };
         let vs = compile(Gl::VERTEX_SHADER, VS)?;
         let fs = compile(Gl::FRAGMENT_SHADER, FS)?;
+        let fs_w = compile(Gl::FRAGMENT_SHADER, FS_W)?;
         let program = gl.create_program()?;
         gl.attach_shader(&program, &vs);
         gl.attach_shader(&program, &fs);
@@ -115,16 +153,29 @@ impl GlVerifier {
             )));
             return None;
         }
+        // Water program reuses the vertex shader object (GL allows sharing
+        // compiled shaders between programs).
+        let program_w = gl.create_program()?;
+        gl.attach_shader(&program_w, &vs);
+        gl.attach_shader(&program_w, &fs_w);
+        gl.link_program(&program_w);
+        if !gl.get_program_parameter(&program_w, Gl::LINK_STATUS) {
+            let log = gl.get_program_info_log(&program_w).unwrap_or_default();
+            web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "GLSL link error (water): {log}"
+            )));
+            return None;
+        }
 
         Some(GlVerifier {
-            u_vp: gl.get_uniform_location(&program, "u_vp"),
-            u_cam: gl.get_uniform_location(&program, "u_cam"),
-            u_fog_start: gl.get_uniform_location(&program, "u_fog_start"),
-            u_fog_end: gl.get_uniform_location(&program, "u_fog_end"),
-            u_sky: gl.get_uniform_location(&program, "u_sky"),
+            uni: locations(&gl, &program),
+            uni_w: locations(&gl, &program_w),
             vbo: gl.create_buffer()?,
             ibo: gl.create_buffer()?,
+            w_vbo: gl.create_buffer()?,
+            w_ibo: gl.create_buffer()?,
             program,
+            program_w,
             gl,
         })
     }
@@ -142,10 +193,15 @@ impl GlVerifier {
         yaw: f32,
         pitch: f32,
     ) -> Option<String> {
-        // Rebuild the combined mesh on the CPU from the streamed payloads.
+        // Rebuild the combined mesh on the CPU from the streamed payloads
+        // (opaque + water, mirroring the WebGPU pool layout: water is
+        // appended after the opaque part per chunk).
         let mut verts: Vec<f32> = Vec::new();
         let mut idxs: Vec<u32> = Vec::new();
+        let mut w_verts: Vec<f32> = Vec::new();
+        let mut w_idxs: Vec<u32> = Vec::new();
         let mut base: u32 = 0;
+        let mut base_w: u32 = 0;
         for (pos, data) in regions {
             if data.len() != REGION_BLOCKS {
                 continue;
@@ -157,10 +213,17 @@ impl GlVerifier {
             for i in m.indices {
                 idxs.push(i + base);
             }
+            // Water indices are chunk-local; offset by the combined water
+            // vertex base accumulated from earlier chunks.
+            for i in m.water_indices {
+                w_idxs.push(i + base_w);
+            }
             base += m.vertices.len() as u32 / 6;
+            base_w += m.water_vertices.len() as u32 / 6;
             verts.extend(m.vertices);
+            w_verts.extend(m.water_vertices);
         }
-        if verts.is_empty() {
+        if verts.is_empty() && w_verts.is_empty() {
             return Some("(no geometry)".to_string());
         }
 
@@ -169,14 +232,19 @@ impl GlVerifier {
         gl.buffer_data_with_u8_array(Gl::ARRAY_BUFFER, f32_slice(&verts), Gl::STATIC_DRAW);
         gl.bind_buffer(Gl::ELEMENT_ARRAY_BUFFER, Some(&self.ibo));
         gl.buffer_data_with_u8_array(Gl::ELEMENT_ARRAY_BUFFER, u32_slice(&idxs), Gl::STATIC_DRAW);
+        gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.w_vbo));
+        gl.buffer_data_with_u8_array(Gl::ARRAY_BUFFER, f32_slice(&w_verts), Gl::STATIC_DRAW);
+        gl.bind_buffer(Gl::ELEMENT_ARRAY_BUFFER, Some(&self.w_ibo));
+        gl.buffer_data_with_u8_array(Gl::ELEMENT_ARRAY_BUFFER, u32_slice(&w_idxs), Gl::STATIC_DRAW);
 
         let vp = view_projection(cam, yaw, pitch, W as f32 / H as f32, 1.15, 0.1, 300.0);
-        gl.use_program(Some(&self.program));
-        gl.uniform_matrix4fv_with_f32_array(self.u_vp.as_ref(), false, &vp);
-        gl.uniform3f(self.u_cam.as_ref(), cam[0], cam[1], cam[2]);
-        gl.uniform1f(self.u_fog_start.as_ref(), FOG_START);
-        gl.uniform1f(self.u_fog_end.as_ref(), FOG_END);
-        gl.uniform3f(self.u_sky.as_ref(), SKY[0], SKY[1], SKY[2]);
+        let set_unis = |u: &Uni| {
+            gl.uniform_matrix4fv_with_f32_array(u.u_vp.as_ref(), false, &vp);
+            gl.uniform3f(u.u_cam.as_ref(), cam[0], cam[1], cam[2]);
+            gl.uniform1f(u.u_fog_start.as_ref(), FOG_START);
+            gl.uniform1f(u.u_fog_end.as_ref(), FOG_END);
+            gl.uniform3f(u.u_sky.as_ref(), SKY[0], SKY[1], SKY[2]);
+        };
 
         gl.enable(Gl::DEPTH_TEST);
         gl.depth_func(Gl::LESS);
@@ -184,6 +252,9 @@ impl GlVerifier {
         gl.clear_color(SKY[0], SKY[1], SKY[2], 1.0);
         gl.clear(Gl::COLOR_BUFFER_BIT | Gl::DEPTH_BUFFER_BIT);
 
+        // Opaque pass (terrain + flowers).
+        gl.use_program(Some(&self.program));
+        set_unis(&self.uni);
         gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.vbo));
         gl.vertex_attrib_pointer_with_i32(0, 3, Gl::FLOAT, false, 24, 0);
         gl.vertex_attrib_pointer_with_i32(1, 3, Gl::FLOAT, false, 24, 12);
@@ -191,6 +262,23 @@ impl GlVerifier {
         gl.enable_vertex_attrib_array(1);
         gl.bind_buffer(Gl::ELEMENT_ARRAY_BUFFER, Some(&self.ibo));
         gl.draw_elements_with_i32(Gl::TRIANGLES, idxs.len() as i32, Gl::UNSIGNED_INT, 0);
+
+        // Water pass (src-alpha blend, no depth writes) — mirrors the
+        // WebGPU water pipeline.
+        if !w_idxs.is_empty() {
+            gl.use_program(Some(&self.program_w));
+            set_unis(&self.uni_w);
+            gl.enable(Gl::BLEND);
+            gl.blend_func(Gl::SRC_ALPHA, Gl::ONE_MINUS_SRC_ALPHA);
+            gl.depth_mask(false);
+            gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.w_vbo));
+            gl.vertex_attrib_pointer_with_i32(0, 3, Gl::FLOAT, false, 24, 0);
+            gl.vertex_attrib_pointer_with_i32(1, 3, Gl::FLOAT, false, 24, 12);
+            gl.bind_buffer(Gl::ELEMENT_ARRAY_BUFFER, Some(&self.w_ibo));
+            gl.draw_elements_with_i32(Gl::TRIANGLES, w_idxs.len() as i32, Gl::UNSIGNED_INT, 0);
+            gl.depth_mask(true);
+            gl.disable(Gl::BLEND);
+        }
 
         let mut px = vec![0u8; (W * H * 4) as usize];
         gl.read_pixels_with_opt_u8_array(

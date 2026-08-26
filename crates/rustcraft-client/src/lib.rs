@@ -10,10 +10,11 @@
 #![cfg(target_arch = "wasm32")]
 
 use wgpu::{
-    Buffer, BufferUsages, Device, DeviceDescriptor, Instance, InstanceDescriptor, Queue,
-    RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions, ShaderModuleDescriptor,
-    ShaderSource, Surface, SurfaceConfiguration, SurfaceTarget, TextureFormat,
-    TextureViewDescriptor, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode,
+    Buffer, BufferUsages, Device, DeviceDescriptor, Instance, InstanceDescriptor, PipelineLayout,
+    Queue, RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions, ShaderModule,
+    ShaderModuleDescriptor, ShaderSource, Surface, SurfaceConfiguration, SurfaceTarget,
+    TextureFormat, TextureViewDescriptor, VertexAttribute, VertexBufferLayout, VertexFormat,
+    VertexStepMode,
 };
 
 use rustcraft_server::{AgentState, WorldUpdate};
@@ -31,8 +32,9 @@ use rustcraft_world::{ChunkPos, REGION_BLOCKS};
 /// front (CPU-side copies are kept so this needs no GPU readback).
 ///
 /// Capacity is sized with headroom over the measured worst case: a
-/// radius-7 streaming sphere of rough (cave + mountain) terrain needs
-/// ~1.0-1.5M vertices (see rustcraft-server's `pool_measure` example).
+/// radius-7 streaming sphere of the current landscape (caves, mountains,
+/// lakes, trees, beaches, snow) needs ~1.0-1.2M vertices while walking and
+/// ~1.65M at spawn (see rustcraft-server's `pool_measure` example).
 const VERT_CAP: u32 = 2_000_000;
 const IDX_CAP: u32 = 3_000_000;
 /// Chunks at 3D Chebyshev chunk-cell distance >= this are fully inside
@@ -47,6 +49,10 @@ struct TerrainChunk {
     idxs: Vec<u32>,
     base_v: u32,
     base_i: u32,
+    /// Water sub-mesh, appended after the opaque part in the same pool.
+    /// Its draw offsets are derived: base_i + opaque index count, and
+    /// base_vertex = base_v + opaque vertex count.
+    water: Option<(Vec<f32>, Vec<u32>)>,
 }
 
 struct AgentMesh {
@@ -63,6 +69,9 @@ pub struct Renderer {
     surface: Surface<'static>,
     surface_format: TextureFormat,
     pipeline: RenderPipeline,
+    /// Translucent water pipeline (src-alpha blend, no depth writes);
+    /// drawn after all opaque geometry.
+    water_pipeline: RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     uniform_buf: Buffer,
     terrain_vbo: Buffer,
@@ -147,60 +156,9 @@ impl Renderer {
             push_constant_ranges: &[],
         });
 
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("rustcraft-pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[VertexBufferLayout {
-                    array_stride: 24,
-                    step_mode: VertexStepMode::Vertex,
-                    attributes: &[
-                        VertexAttribute {
-                            offset: 0,
-                            format: VertexFormat::Float32x3,
-                            shader_location: 0,
-                        },
-                        VertexAttribute {
-                            offset: 12,
-                            format: VertexFormat::Float32x3,
-                            shader_location: 1,
-                        },
-                    ],
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        let pipeline = make_pipeline(&device, &shader, &layout, surface_format, "fs_main", false);
+        let water_pipeline =
+            make_pipeline(&device, &shader, &layout, surface_format, "fs_water", true);
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rustcraft-uniforms"),
@@ -227,6 +185,7 @@ impl Renderer {
             surface,
             surface_format,
             pipeline,
+            water_pipeline,
             bind_group_layout,
             uniform_buf,
             terrain_vbo,
@@ -296,8 +255,8 @@ impl Renderer {
             }
             return;
         }
-        let nv = mesh.vertices.len() as u32 / 6;
-        let ni = mesh.indices.len() as u32;
+        let nv = (mesh.vertices.len() + mesh.water_vertices.len()) as u32 / 6;
+        let ni = (mesh.indices.len() + mesh.water_indices.len()) as u32;
         // A re-sent chunk (an edit changed it) replaces the old mesh. The
         // old entry's pool space is orphaned (append-only pool); the next
         // compaction reclaims it.
@@ -323,14 +282,33 @@ impl Renderer {
         let base_v = self.terrain_v_used;
         let base_i = self.terrain_i_used;
         // Indices stay chunk-local; draw_indexed adds base_vertex to each.
+        // Water is appended after the opaque part (its draw offsets the
+        // base_vertex by the opaque vertex count).
+        let ov = mesh.vertices.len() as u32 / 6;
         self.queue.write_buffer(&self.terrain_vbo, (base_v * 24) as u64, f32_bytes(&mesh.vertices));
+        if !mesh.water_vertices.is_empty() {
+            self.queue.write_buffer(
+                &self.terrain_vbo,
+                ((base_v + ov) * 24) as u64,
+                f32_bytes(&mesh.water_vertices),
+            );
+        }
         self.queue.write_buffer(&self.terrain_ibo, (base_i * 4) as u64, u32_bytes(&mesh.indices));
+        if !mesh.water_indices.is_empty() {
+            self.queue.write_buffer(
+                &self.terrain_ibo,
+                ((base_i + mesh.indices.len() as u32) * 4) as u64,
+                u32_bytes(&mesh.water_indices),
+            );
+        }
         self.terrain.push(TerrainChunk {
             pos,
             verts: mesh.vertices,
             idxs: mesh.indices,
             base_v,
             base_i,
+            water: (!mesh.water_vertices.is_empty())
+                .then_some((mesh.water_vertices, mesh.water_indices)),
         });
         self.terrain_v_used += nv;
         self.terrain_i_used += ni;
@@ -355,17 +333,20 @@ impl Renderer {
     /// re-send it. Survivors are rewritten to the front of the pool.
     fn compact_pool(&mut self, need_v: u32, need_i: u32) {
         let before = self.terrain.len();
-        // (index, distance, vertex count, index count) per chunk.
+        // (index, distance, vertex count, index count) per chunk — water
+        // counts against the same pool.
         let mut ranked: Vec<(usize, i32, u32, u32)> = self
             .terrain
             .iter()
             .enumerate()
             .map(|(i, t)| {
+                let wv = t.water.as_ref().map(|(w, _)| w.len() as u32 / 6).unwrap_or(0);
+                let wi = t.water.as_ref().map(|(_, w)| w.len() as u32).unwrap_or(0);
                 (
                     i,
                     self.chunk_dist(t.pos),
-                    t.verts.len() as u32 / 6,
-                    t.idxs.len() as u32,
+                    t.verts.len() as u32 / 6 + wv,
+                    t.idxs.len() as u32 + wi,
                 )
             })
             .collect();
@@ -402,14 +383,24 @@ impl Renderer {
             let keep = !drop[idx];
             idx += 1;
             if keep {
+                let ov = t.verts.len() as u32 / 6;
+                let oi = t.idxs.len() as u32;
                 t.base_v = nv;
                 t.base_i = ni;
                 self.queue
                     .write_buffer(&self.terrain_vbo, (nv * 24) as u64, f32_bytes(&t.verts));
                 self.queue
                     .write_buffer(&self.terrain_ibo, (ni * 4) as u64, u32_bytes(&t.idxs));
-                nv += t.verts.len() as u32 / 6;
-                ni += t.idxs.len() as u32;
+                if let Some((wv, wi)) = &t.water {
+                    self.queue
+                        .write_buffer(&self.terrain_vbo, ((nv + ov) * 24) as u64, f32_bytes(wv));
+                    self.queue
+                        .write_buffer(&self.terrain_ibo, ((ni + oi) * 4) as u64, u32_bytes(wi));
+                    nv += wv.len() as u32 / 6;
+                    ni += wi.len() as u32;
+                }
+                nv += ov;
+                ni += oi;
             }
             keep
         });
@@ -615,9 +606,101 @@ impl Renderer {
             pass.set_vertex_buffer(0, m.vertex.slice(..));
             pass.draw_indexed(0..m.count, 0, 0..1);
         }
+        // Water: translucent pass after all opaque geometry (src-alpha
+        // blend, no depth writes). Same pool buffers, different offsets.
+        if self.terrain.iter().any(|t| t.water.is_some()) {
+            pass.set_pipeline(&self.water_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.set_index_buffer(self.terrain_ibo.slice(0..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, self.terrain_vbo.slice(..));
+            for t in &self.terrain {
+                if let Some((wv, wi)) = &t.water {
+                    let ov = t.verts.len() as u32 / 6;
+                    let oi = t.idxs.len() as u32;
+                    pass.draw_indexed(
+                        t.base_i + oi..t.base_i + oi + wi.len() as u32,
+                        (t.base_v + ov) as i32,
+                        0..1,
+                    );
+                    let _ = wv; // length implied by wi (6 indices per 4 verts)
+                }
+            }
+        }
         drop(pass);
     }
 
+}
+
+/// Build a terrain pipeline. `fs_entry` selects the opaque (`fs_main`)
+/// or water (`fs_water`) fragment entry; water blends with src-alpha and
+/// skips depth writes so it composites over opaque geometry.
+fn make_pipeline(
+    device: &Device,
+    shader: &ShaderModule,
+    layout: &PipelineLayout,
+    surface_format: TextureFormat,
+    fs_entry: &str,
+    water: bool,
+) -> RenderPipeline {
+    device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some(if water { "rustcraft-water" } else { "rustcraft-pipeline" }),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[VertexBufferLayout {
+                array_stride: 24,
+                step_mode: VertexStepMode::Vertex,
+                attributes: &[
+                    VertexAttribute {
+                        offset: 0,
+                        format: VertexFormat::Float32x3,
+                        shader_location: 0,
+                    },
+                    VertexAttribute {
+                        offset: 12,
+                        format: VertexFormat::Float32x3,
+                        shader_location: 1,
+                    },
+                ],
+            }],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(fs_entry),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                // Standard (non-premultiplied) src-alpha blending.
+                blend: if water {
+                    Some(wgpu::BlendState::ALPHA_BLENDING)
+                } else {
+                    None
+                },
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back),
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: !water,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
 }
 
 fn log_or_panic_adapter(adapter: &wgpu::Adapter) {

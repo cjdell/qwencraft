@@ -13,7 +13,7 @@ pub mod terrain;
 
 pub use block::Block;
 pub use noise::Noise;
-pub use terrain::WorldGen;
+pub use terrain::{SEA_LEVEL, SNOW_LEVEL, Tree, WorldGen};
 
 /// Edge length of a chunk in blocks.
 pub const CHUNK: i32 = 16;

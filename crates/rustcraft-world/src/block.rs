@@ -9,11 +9,15 @@ pub enum Block {
     Dirt = 2,
     Stone = 3,
     Sand = 4,
+    Water = 5,
+    Log = 6,
+    Leaves = 7,
+    SnowGrass = 8,
+    FlowerRed = 9,
+    FlowerYellow = 10,
 }
 
 impl Block {
-    pub const ALL: [Block; 5] = [Block::Air, Block::Grass, Block::Dirt, Block::Stone, Block::Sand];
-
     #[inline]
     pub fn from_u8(v: u8) -> Block {
         match v {
@@ -21,6 +25,12 @@ impl Block {
             2 => Block::Dirt,
             3 => Block::Stone,
             4 => Block::Sand,
+            5 => Block::Water,
+            6 => Block::Log,
+            7 => Block::Leaves,
+            8 => Block::SnowGrass,
+            9 => Block::FlowerRed,
+            10 => Block::FlowerYellow,
             _ => Block::Air,
         }
     }
@@ -31,9 +41,25 @@ impl Block {
     }
 
     /// Solid blocks participate in collision, lighting occlusion and AO.
+    /// Water and flowers are passable (water is rendered translucent).
     #[inline]
     pub fn is_solid(self) -> bool {
-        self != Block::Air
+        matches!(
+            self,
+            Block::Grass
+                | Block::Dirt
+                | Block::Stone
+                | Block::Sand
+                | Block::Log
+                | Block::Leaves
+                | Block::SnowGrass
+        )
+    }
+
+    /// Water (passable, translucent, swim physics).
+    #[inline]
+    pub fn is_water(self) -> bool {
+        self == Block::Water
     }
 
     /// Base colour of the top face (linear-ish RGB, 0..1).
@@ -43,6 +69,12 @@ impl Block {
             Block::Dirt => [0.55, 0.39, 0.26],
             Block::Stone => [0.52, 0.53, 0.55],
             Block::Sand => [0.87, 0.82, 0.60],
+            Block::Water => [0.24, 0.45, 0.85],
+            Block::Log => [0.58, 0.45, 0.28],
+            Block::Leaves => [0.27, 0.52, 0.20],
+            Block::SnowGrass => [0.92, 0.94, 0.97],
+            Block::FlowerRed => [0.84, 0.20, 0.18],
+            Block::FlowerYellow => [0.92, 0.78, 0.22],
             Block::Air => [1.0, 1.0, 1.0],
         }
     }
@@ -54,6 +86,12 @@ impl Block {
             Block::Dirt => [0.55, 0.39, 0.26],
             Block::Stone => [0.50, 0.51, 0.53],
             Block::Sand => [0.85, 0.80, 0.58],
+            Block::Water => [0.21, 0.41, 0.81],
+            Block::Log => [0.42, 0.30, 0.17],
+            Block::Leaves => [0.20, 0.44, 0.16],
+            Block::SnowGrass => [0.62, 0.53, 0.40],
+            Block::FlowerRed => [0.78, 0.16, 0.14],
+            Block::FlowerYellow => [0.88, 0.72, 0.18],
             Block::Air => [1.0, 1.0, 1.0],
         }
     }
@@ -65,6 +103,12 @@ impl Block {
             Block::Dirt => [0.48, 0.34, 0.22],
             Block::Stone => [0.44, 0.45, 0.47],
             Block::Sand => [0.78, 0.73, 0.53],
+            Block::Water => [0.19, 0.37, 0.76],
+            Block::Log => [0.58, 0.45, 0.28],
+            Block::Leaves => [0.16, 0.38, 0.13],
+            Block::SnowGrass => [0.48, 0.34, 0.22],
+            Block::FlowerRed => [0.72, 0.14, 0.12],
+            Block::FlowerYellow => [0.82, 0.66, 0.15],
             Block::Air => [1.0, 1.0, 1.0],
         }
     }

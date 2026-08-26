@@ -177,14 +177,17 @@ import sys
 raw = sys.argv[1].strip().strip('"').rstrip(";").strip()
 regs = [tuple(map(int, p.split(","))) for p in raw.split(";") if p.strip().replace(",", "").isdigit()]
 assert len(regs) == 12, f"expected 12 regions, got {len(regs)}"
-# Top row: sky. Blue should dominate red and it should be reasonably bright.
+# Top row: mostly sky (blue dominates red, reasonably bright). A region or
+# two may be terrain/trees on the horizon.
 top = regs[0:4]
-for (r, g, b) in top:
-    assert b > r + 10 and r > 60, f"top region {r},{g},{b} does not look like sky"
-# Bottom row: terrain. Should be greenish (grass) or at least non-grey & not sky.
+sky = sum(1 for (r, g, b) in top if b > r + 10 and r > 60)
+assert sky >= 2, f"top row should be mostly sky: {top}"
+# Bottom row: terrain. Greenish (grass) or bluish (water); the pure sky
+# clear colour is exactly (135,199,235), so real water is distinguishable.
 bottom = regs[8:12]
 green = sum(1 for (r, g, b) in bottom if g >= r and g > b + 5)
-assert green >= 2, f"no greenish terrain regions in bottom row: {bottom}"
+water = sum(1 for (r, g, b) in bottom if b > g > r and r < 125 and b > 100)
+assert green + water >= 2, f"no terrain (grass or water) regions in bottom row: {bottom}"
 # Not a flat screen: distinct region colours.
 distinct = len(set(regs))
 assert distinct >= 4, f"scene looks flat, only {distinct} distinct region colours"

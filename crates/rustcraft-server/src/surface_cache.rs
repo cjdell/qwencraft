@@ -112,6 +112,9 @@ impl SurfaceCache {
             }
         }
         self.initialized = true;
+        // `count` is only read by the debug sanity check below.
+        #[cfg(not(debug_assertions))]
+        let _ = count;
         // Sanity: if the agent is standing on / inside solid terrain, the
         // volume must have cached at least one surface block. Being airborne
         // (e.g. after fly mode, or mid-fall) can legitimately yield an empty

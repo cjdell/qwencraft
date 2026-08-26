@@ -28,6 +28,11 @@ pub const FLY_BASE_SPEED: f32 = 20.0;
 pub const FLY_MIN_SPEED: f32 = 5.0;
 pub const FLY_MAX_SPEED: f32 = 500.0;
 pub const FLY_STEP: f32 = 1.5;
+/// Swim: horizontal speed factor vs walking, fall cap, and the vertical
+/// speed while holding Space to rise.
+pub const SWIM_SPEED_FACTOR: f32 = 0.6;
+pub const SWIM_MAX_FALL: f32 = -3.5;
+pub const SWIM_UP_SPEED: f32 = 4.2;
 pub const HALF_W: f32 = 0.3;
 pub const HEIGHT: f32 = 1.8;
 pub const EYE_HEIGHT: f32 = 1.62;
@@ -212,8 +217,35 @@ impl Agent {
             WALK_SPEED
         };
         let dir = move_dir.scale(speed);
-        self.physics_step(dt, world, dir, jump);
+        if self.in_water(world) {
+            // Swimming: slow horizontal movement, reduced gravity, capped
+            // fall (a splash, not a plunge), hold Space to rise.
+            let dir = dir.scale(SWIM_SPEED_FACTOR);
+            self.vel.x = dir.x;
+            self.vel.z = dir.z;
+            self.vel.y += GRAVITY * 0.3 * dt;
+            self.vel.y = self.vel.y.max(SWIM_MAX_FALL);
+            if input.keys.contains(crate::Key::Space) {
+                self.vel.y = SWIM_UP_SPEED;
+            }
+            self.move_axis(world, 0, dt);
+            self.move_axis(world, 2, dt);
+            self.on_ground = false;
+            self.move_axis(world, 1, dt);
+        } else {
+            self.physics_step(dt, world, dir, jump);
+        }
         self.cache.update(world, self.pos);
+    }
+
+    /// True when the agent's body centre is in water.
+    pub fn in_water(&self, world: &mut World) -> bool {
+        let body = BlockPos::new(
+            self.pos.x.floor() as i32,
+            (self.pos.y + 0.5).floor() as i32,
+            self.pos.z.floor() as i32,
+        );
+        self.cache.lookup(body, world).is_water()
     }
 
     /// NPC wandering: pick directions, walk, occasionally pause.
@@ -239,7 +271,19 @@ impl Agent {
         } else {
             self.npc_dir
         };
-        self.physics_step(dt, world, dir, false);
+        if self.in_water(world) {
+            // NPCs swim to the surface and keep moving.
+            let dir = dir.scale(SWIM_SPEED_FACTOR);
+            self.vel.x = dir.x;
+            self.vel.z = dir.z;
+            self.vel.y = SWIM_UP_SPEED * 0.7;
+            self.move_axis(world, 0, dt);
+            self.move_axis(world, 2, dt);
+            self.on_ground = false;
+            self.move_axis(world, 1, dt);
+        } else {
+            self.physics_step(dt, world, dir, false);
+        }
         self.cache.update(world, self.pos);
     }
 

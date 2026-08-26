@@ -47,6 +47,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let c = mix(in.color, u.sky.xyz, t);
     return vec4<f32>(c, 1.0);
 }
+
+// Water: same fog, constant translucency. Drawn after all opaque geometry
+// with src-alpha blending and depth writes disabled.
+@fragment
+fn fs_water(in: VsOut) -> @location(0) vec4<f32> {
+    let d = distance(u.cam.xyz, in.world);
+    let t = clamp((d - u.fog_start) / (u.fog_end - u.fog_start), 0.0, 1.0);
+    let c = mix(in.color, u.sky.xyz, t);
+    return vec4<f32>(c, 0.62);
+}
 "#;
 
 /// Sky / fog colour.

@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use rustcraft_world::{
-    Block, BlockPos, ChunkPos, CHUNK, CHUNK_BLOCKS, REGION, REGION_BLOCKS, REGION_MARGIN,
+    Block, BlockPos, ChunkPos, Tree, CHUNK, CHUNK_BLOCKS, REGION, REGION_BLOCKS, REGION_MARGIN,
     WORLD_HEIGHT, chunk_index, region_index,
 };
 
@@ -37,6 +37,11 @@ pub struct World {
     /// edit history (used to keep resends correct after edits).
     deltas: HashMap<ChunkPos, HashMap<BlockPos, Block>>,
     edits: Vec<Edit>,
+    /// Column-height cache: tree placement scans a 1-chunk halo around each
+    /// chunk, and neighbouring chunks share most of those heights. Caching
+    /// them makes steady-state generation nearly as cheap as the plain
+    /// heightmap fill (heights are immutable — terrain never moves).
+    heights: HashMap<(i32, i32), i32>,
 }
 
 impl World {
@@ -46,7 +51,13 @@ impl World {
             chunks: HashMap::new(),
             deltas: HashMap::new(),
             edits: Vec::new(),
+            heights: HashMap::new(),
         }
+    }
+
+    /// The tree rooted at column (x, z), if any (for spawn placement).
+    pub fn tree_at(&self, x: i32, z: i32) -> Option<Tree> {
+        self.gen.tree_at(x, z)
     }
 
     /// Terrain surface height (topmost solid Y) for a column.
@@ -80,7 +91,7 @@ impl World {
             self.chunks.insert(c, vec![0u8; CHUNK_BLOCKS]);
             return;
         }
-        let mut data = self.gen.generate_chunk(c.x, c.y, c.z).to_vec();
+        let mut data = self.gen.generate_chunk_cached(c.x, c.y, c.z, &mut self.heights).to_vec();
         // Apply pending deltas for this chunk.
         if let Some(d) = self.deltas.get(&c) {
             for (local, block) in d {
