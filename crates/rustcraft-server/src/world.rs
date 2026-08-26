@@ -272,10 +272,15 @@ impl World {
             return None;
         }
 
+        // Floor the eye into its containing cell. Note: NOT `as i32`, which
+        // truncates toward zero — for negative coordinates that lands the start
+        // cell one too far toward zero, so a ray looking along +/-Z (d.x ~ 0,
+        // where X never steps) would report a hit one block +X off. That was the
+        // intermittent crosshair offset.
         let mut pos = BlockPos::new(
-            origin.x as i32,
-            origin.y as i32,
-            origin.z as i32,
+            origin.x.floor() as i32,
+            origin.y.floor() as i32,
+            origin.z.floor() as i32,
         );
         // If we start inside a solid block, that is the hit (no prev).
         if self.block_at(pos).is_solid() {
@@ -352,7 +357,39 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustcraft_world::Block;
+    use rustcraft_world::{Block, BlockPos, ChunkPos};
+
+    /// The crosshair raycast must floor the eye into its containing cell,
+    /// not truncate toward zero. For a negative eye coordinate this used to
+    /// start the DDA one cell too far toward zero, so a ray looking along
+    /// +/-Z (d.x ~ 0, so X never steps) reported the hit one block +X off.
+    /// Regression test: eye at x=-2.5 looking -Z at a wall in the XZ plane
+    /// must hit x=-3 (floor), never x=-2 (truncate).
+    #[test]
+    fn raycast_floors_eye_cell_not_truncates() {
+        let mut w = World::new(1337);
+        // Build the scenario entirely with edits; block_at generates each
+        // chunk on demand and applies pending deltas, so no explicit generate
+        // is needed.
+        // A wall in the XZ plane at z=-6 (solid), in front of the eye.
+        for x in -8..=2 {
+            for y in 0..=15 {
+                w.set_block(BlockPos::new(x, y, -6), Block::Stone);
+            }
+        }
+        // Air along the eye row (y=10, z=-5..-1) so the ray only stops at the
+        // wall, leaving the z=-6 wall intact.
+        for x in -8..=2 {
+            for z in -5..=-1 {
+                w.set_block(BlockPos::new(x, 10, z), Block::Air);
+            }
+        }
+        // Eye in air at negative x, looking -Z (yaw=0 => dir (0,0,-1)).
+        let eye = Vec3::new(-2.5, 10.0, -1.0);
+        let dir = Vec3::new(0.0, 0.0, -1.0);
+        let (hit, _prev) = w.raycast(&eye, &dir, 6.0).expect("should hit the wall");
+        assert_eq!((hit.x, hit.y, hit.z), (-3, 10, -6), "eye cell must be floored, not truncated");
+    }
 
     /// Reference implementation: per-cell sampling (what `region` used to do).
     fn region_reference(world: &World, c: ChunkPos) -> Vec<u8> {
