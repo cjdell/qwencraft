@@ -11,4 +11,4 @@ rustcraft-server = { path = "../rustcraft-server" }
 wgpu = "27.0.1"
 wasm-bindgen = "=0.2.100"
 js-sys = "=0.3.77"
-web-sys = { version = "=0.3.77", features = ["HtmlCanvasElement", "Window"] }
+web-sys = { version = "=0.3.77", features = ["HtmlCanvasElement", "Navigator", "Window"] }

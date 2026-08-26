@@ -33,8 +33,10 @@
             pkgs.chromium
             pkgs.mesa
             pkgs.vulkan-loader
-            # Static file server for the built web app.
+            # Static file server for the built web app (+ HTTPS mode,
+            # which WebGPU requires for anything other than localhost).
             pkgs.python3
+            pkgs.openssl
             # Linker for host builds/tests, misc helpers for scripts.
             pkgs.gcc
             pkgs.jq
@@ -48,6 +50,7 @@
             echo "Commands:"
             echo "  ./scripts/build.sh    build the wasm web app into web/dist"
             echo "  ./scripts/serve.sh    serve web/dist on http://localhost:8080"
+            echo "  ./scripts/serve.sh --https  HTTPS (self-signed cert; needed off-localhost)"
             echo "  ./scripts/verify.sh   headless chromium smoke test + screenshot"
             echo "  cargo test            server/worldgen unit tests (host)"
           '';

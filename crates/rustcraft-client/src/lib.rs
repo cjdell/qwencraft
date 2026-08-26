@@ -99,6 +99,31 @@ pub struct Renderer {
 impl Renderer {
     /// Create the renderer (async: adapter/device requests).
     pub async fn new(canvas: &web_sys::HtmlCanvasElement) -> Result<Renderer, String> {
+        // WebGPU is only exposed in *secure contexts* (https:// or
+        // localhost). On any other origin `navigator.gpu` is undefined and
+        // wgpu's `Instance::new` panics with a misleading message — check
+        // first and fail with an actionable error instead.
+        let Some(window) = web_sys::window() else {
+            return Err("no window available".to_string());
+        };
+        // `navigator.gpu` is undefined outside secure contexts (check via
+        // Reflect: web-sys's typed `Navigator::gpu` needs an unstable cfg).
+        let has_gpu = js_sys::Reflect::get(
+            &window.navigator().into(),
+            &wasm_bindgen::JsValue::from_str("gpu"),
+        )
+        .map(|v| !v.is_undefined() && !v.is_null())
+        .unwrap_or(false);
+        if !has_gpu {
+            return Err(
+                "WebGPU is unavailable: browsers only expose it in secure contexts \
+                 (https:// or http://localhost). Open http://localhost:8080 on the \
+                 machine running the server, or from another device use \
+                 `./scripts/serve.sh --https` (self-signed cert — accept the \
+                 browser's security warning)."
+                    .to_string(),
+            );
+        }
         let instance = Instance::new(&InstanceDescriptor::default());
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("RustCraft: creating surface"));
         let surface = instance

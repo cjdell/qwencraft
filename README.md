@@ -30,10 +30,20 @@ or, interactively:
 nix develop
 ./scripts/build.sh     # wasm build -> web/dist
 ./scripts/serve.sh     # serve on http://localhost:8080
+./scripts/serve.sh --https  # HTTPS (self-signed cert) — needed off-localhost
 ./scripts/verify.sh    # headless-chromium smoke test + pixel checks
 ./scripts/walk_test.sh # headless walk stress test (terrain pool / streaming)
+./scripts/secure_context_test.sh  # secure-context / HTTPS regression test
 cargo test             # host unit tests (worldgen, physics, streaming, …)
 ```
+
+> **Playing from another device on your network:** browsers only enable
+> WebGPU in *secure contexts* (`https://` or `localhost`), so
+> `http://192.168.x.x:8080` won't work. Run `./scripts/serve.sh --https`
+> (generates a self-signed cert in `.certs/` once) and open
+> `https://<machine-LAN-IP>:8080` on the other device, accepting the
+> browser's certificate warning. The app detects the missing WebGPU on
+> plain HTTP and shows an explanatory message instead of crashing.
 
 ## Controls
 
@@ -126,6 +136,16 @@ edge (each chunk stamps the 1-chunk halo around it; enforced by the
 - **Biomes** — underwater/surface-level columns are sandy beaches, the
   highest columns (y≥33) are snow-capped, the rest are grassland with
   scattered red/yellow flowers (passable decals).
+
+## WebGPU and secure contexts
+
+WebGPU is only exposed by browsers in secure contexts (`https://` or
+`localhost`). The renderer checks `navigator.gpu` before touching wgpu (a
+missing GPU would otherwise panic deep inside wgpu with a misleading
+message) and shows an actionable overlay error instead. `./scripts/serve.sh
+--https` serves the app with a self-signed certificate for LAN play; the
+headless regression test `./scripts/secure_context_test.sh` covers all three
+modes (plain-HTTP-LAN graceful failure, HTTPS localhost, HTTPS LAN).
 
 ## Notes / environment quirks
 
