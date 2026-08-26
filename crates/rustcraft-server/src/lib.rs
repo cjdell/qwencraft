@@ -55,6 +55,9 @@ pub struct Server {
     updates: Vec<WorldUpdate>,
     /// Edits pending delivery to the client (delivered via region resends).
     _pending_edits: Vec<Edit>,
+    /// The block under the player's crosshair (recomputed every tick);
+    /// the client draws a wireframe highlight around it.
+    target: Option<BlockPos>,
 }
 
 impl Server {
@@ -90,6 +93,7 @@ impl Server {
             sent: std::collections::HashSet::new(),
             updates: Vec::new(),
             _pending_edits: Vec::new(),
+            target: None,
         }
     }
 
@@ -167,9 +171,19 @@ impl Server {
                 Action::ToggleFly => self.agents[0].toggle_fly(),
                 Action::FlyFaster => self.agents[0].adjust_fly_speed(FLY_STEP),
                 Action::FlySlower => self.agents[0].adjust_fly_speed(1.0 / FLY_STEP),
-                Action::Break | Action::Place => self.apply_player_action(action),
+                Action::Break { .. } | Action::Place { .. } => {
+                    self.apply_player_action(action)
+                }
             }
         }
+
+        // Recompute the crosshair target for the client's block highlight
+        // (same raycast + range as break/place, from the post-step aim —
+        // the same aim the client is about to render).
+        self.target = {
+            let p = &self.agents[0];
+            self.world.raycast(&p.eye(), &p.look_direction(), 6.0).map(|(hit, _)| hit)
+        };
 
         // NPCs.
         for npc in self.agents.iter_mut().skip(1) {
@@ -183,20 +197,27 @@ impl Server {
     }
 
     fn apply_player_action(&mut self, action: Action) {
-        let (eye, dir) = {
-            let p = &self.agents[0];
-            (p.eye(), p.look_direction())
+        // Raycast with the aim stamped into the action (the camera at click
+        // time), so post-click mouse movement can't move the target.
+        let (eye, yaw, pitch) = match action {
+            Action::Break { yaw, pitch } | Action::Place { yaw, pitch } => {
+                let p = &self.agents[0];
+                (p.eye(), yaw, pitch)
+            }
+            _ => unreachable!("only Break/Place reach apply_player_action"),
         };
+        let d = rustcraft_world::camera::look_direction(yaw, pitch);
+        let dir = Vec3::new(d[0], d[1], d[2]);
         match self.world.raycast(&eye, &dir, 6.0) {
             Some((hit, prev)) => match action {
-                Action::Break => {
+                Action::Break { .. } => {
                     if hit.y > 0 {
                         // World edits go through the delta layer.
                         let dirty = self.world.set_block(hit, Block::Air);
                         self.queue_resends(&dirty);
                     }
                 }
-                Action::Place => {
+                Action::Place { .. } => {
                     // Don't place inside an agent.
                     let blocked = self.agents.iter().any(|a| {
                         let p = a.pos;
@@ -348,7 +369,9 @@ impl Server {
 
     /// Player state (camera source of truth).
     pub fn player_state(&self) -> AgentState {
-        self.agents[0].state()
+        let mut s = self.agents[0].state();
+        s.target = self.target;
+        s
     }
 
     /// Simple stats for the HUD / debugging.
@@ -706,19 +729,106 @@ mod tests {
         assert_eq!(s.world.block_at(target), Block::Air);
     }
 
+    /// Look slightly down-forward: the ground is dense in that direction,
+    /// so a target always exists (and something is behind the hole after
+    /// a break).
+    const TEST_PITCH: f32 = -0.7;
+
     #[test]
     fn break_and_place_update_world() {
         let mut s = Server::new(99);
         tick_n(&mut s, 120); // settle on ground
-        let p = s.player_state();
-        // Look straight down.
-        // (pitch clamps at -1.55, close enough to down for a short ray)
-        s.push_action(Action::Break);
+        let yaw = s.player_state().yaw;
+        let d = rustcraft_world::camera::look_direction(yaw, TEST_PITCH);
+        let dir = Vec3::new(d[0], d[1], d[2]);
+        let (target, _) = s
+            .world
+            .raycast(&s.agents[0].eye(), &dir, 6.0)
+            .expect("ground should be in view");
+        assert!(target.y > 0);
+        // Break exactly the aimed block.
+        s.push_action(Action::Break { yaw, pitch: TEST_PITCH });
         tick_n(&mut s, 2);
-        let stats = s.stats();
-        // The block under the player's feet may or may not be in range of the
-        // 6-block ray depending on the view; at least the edit path ran.
-        let _ = (p, stats);
+        assert_eq!(s.world.block_at(target), Block::Air, "targeted block must break");
+        // Place against the face the ray now hits (the block behind the
+        // hole); the new block goes in the cell in front of it.
+        let (_, prev) = s
+            .world
+            .raycast(&s.agents[0].eye(), &dir, 6.0)
+            .expect("ground behind the hole should be in view");
+        s.push_action(Action::Place { yaw, pitch: TEST_PITCH });
+        tick_n(&mut s, 2);
+        // Placement is skipped when the cell would intersect an agent.
+        let blocked = s.agents().iter().any(|a| {
+            let p = a.pos;
+            (prev.x as f32) < p.x + 0.3
+                && (prev.x as f32) + 1.0 >= p.x - 0.3
+                && (prev.y as f32) < p.y + 1.8
+                && (prev.y as f32) + 1.0 >= p.y
+                && (prev.z as f32) < p.z + 0.3
+                && (prev.z as f32) + 1.0 >= p.z - 0.3
+        });
+        assert!(
+            blocked || s.world.block_at(prev) == Block::Stone,
+            "block must be placed against the face"
+        );
+    }
+
+    #[test]
+    fn break_uses_click_time_aim_not_current_aim() {
+        // Regression: mouse deltas that arrive after a click used to rotate
+        // the server's aim before the queued break was raycast, so the wrong
+        // block (off to the side) got broken while moving. Actions now carry
+        // the aim from the moment of the click.
+        let mut s = Server::new(1337);
+        tick_n(&mut s, 180); // settle on ground
+        let p = s.player_state();
+        let (yaw0, pitch0) = (p.yaw, TEST_PITCH);
+        let d0 = rustcraft_world::camera::look_direction(yaw0, pitch0);
+        let dir0 = Vec3::new(d0[0], d0[1], d0[2]);
+        let (hit0, _) = s
+            .world
+            .raycast(&s.agents[0].eye(), &dir0, 6.0)
+            .expect("ground should be in view");
+        // Simulate the mouse moving after the click: find a rotated aim with
+        // a DIFFERENT target, then deliver a break stamped with the OLD aim.
+        let mut found = None;
+        for k in 1..=8 {
+            let yaw1 = yaw0 + k as f32 * 0.8;
+            let d1 = rustcraft_world::camera::look_direction(yaw1, pitch0);
+            let dir1 = Vec3::new(d1[0], d1[1], d1[2]);
+            if let Some((h1, _)) = s.world.raycast(&s.agents[0].eye(), &dir1, 6.0) {
+                if h1 != hit0 {
+                    found = Some((yaw1, h1));
+                    break;
+                }
+            }
+        }
+        let (yaw1, hit1) = found.expect("need a second target to prove aim correctness");
+        s.agents[0].yaw = yaw1;
+        s.push_action(Action::Break { yaw: yaw0, pitch: pitch0 });
+        tick_n(&mut s, 2);
+        assert_eq!(s.world.block_at(hit0), Block::Air, "block at click-time aim must break");
+        assert_ne!(
+            s.world.block_at(hit1),
+            Block::Air,
+            "block at post-click aim must NOT break"
+        );
+    }
+
+    #[test]
+    fn player_state_reports_crosshair_target() {
+        let mut s = Server::new(1337);
+        tick_n(&mut s, 180); // settle on ground
+        let p = s.player_state();
+        // The reported target must match a fresh raycast from the same aim
+        // (the player is idle, so the aim is unchanged).
+        let dir = s.agents[0].look_direction();
+        let expected = s
+            .world
+            .raycast(&s.agents[0].eye(), &dir, 6.0)
+            .map(|(h, _)| h);
+        assert_eq!(p.target, expected);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use wasm_bindgen::JsCast;
 
 use rustcraft_world::camera::{view_projection, FOG_END, FOG_START, SKY};
-use rustcraft_world::mesh::build_chunk_mesh;
+use rustcraft_world::mesh::{build_chunk_mesh, highlight_vertices};
 use rustcraft_world::{ChunkPos, REGION_BLOCKS};
 
 const VS: &str = r#"#version 300 es
@@ -183,6 +183,8 @@ impl GlVerifier {
     /// Re-render the scene from `regions` (26^3 payloads) with the
     /// first-person camera and return a 4x3 grid of region colour averages
     /// as `r,g,b; ` (12 entries, left-to-right, top of screen first).
+    /// `highlight` is the block under the crosshair (wireframe box, as in
+    /// the WebGPU path).
     ///
     /// WebGL's framebuffer origin is bottom-left, so display row `i` is
     /// sampled from GL rows `(2 - i) * 48 .. (2 - i) * 48 + 48`.
@@ -192,6 +194,7 @@ impl GlVerifier {
         cam: [f32; 3],
         yaw: f32,
         pitch: f32,
+        highlight: Option<(i32, i32, i32)>,
     ) -> Option<String> {
         // Rebuild the combined mesh on the CPU from the streamed payloads
         // (opaque + water, mirroring the WebGPU pool layout: water is
@@ -278,6 +281,19 @@ impl GlVerifier {
             gl.draw_elements_with_i32(Gl::TRIANGLES, w_idxs.len() as i32, Gl::UNSIGNED_INT, 0);
             gl.depth_mask(true);
             gl.disable(Gl::BLEND);
+        }
+
+        // Block highlight (wireframe) — mirrors the WebGPU line pass. The
+        // water vbo is free now, so the 24 line vertices go in there.
+        if let Some(t) = highlight {
+            let v = highlight_vertices(t);
+            gl.use_program(Some(&self.program));
+            set_unis(&self.uni);
+            gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.w_vbo));
+            gl.buffer_data_with_u8_array(Gl::ARRAY_BUFFER, f32_slice(&v), Gl::STATIC_DRAW);
+            gl.vertex_attrib_pointer_with_i32(0, 3, Gl::FLOAT, false, 24, 0);
+            gl.vertex_attrib_pointer_with_i32(1, 3, Gl::FLOAT, false, 24, 12);
+            gl.draw_arrays(Gl::LINES, 0, 24);
         }
 
         let mut px = vec![0u8; (W * H * 4) as usize];

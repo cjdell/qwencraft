@@ -52,7 +52,7 @@ cargo test             # host unit tests (worldgen, physics, streaming, …)
 | `W A S D` | move / fly horizontally |
 | `Space` / `Shift` | jump / sprint — **up / down while flying** |
 | `Mouse` | look (pointer-locked) |
-| `Left click` / `Right click` | break / place block |
+| `Left click` / `Right click` | break / place the highlighted block |
 | `Space` (in water) | swim up (falling in water is slowed; hold to surface) |
 | `F` | toggle **fly mode** (no gravity, no collision) |
 | `Q` / `E` | fly speed down / up (×1.5 steps, 5 → 500 blocks/s; hold to ramp) |
@@ -60,6 +60,13 @@ cargo test             # host unit tests (worldgen, physics, streaming, …)
 While flying the HUD shows the current speed (`FLY 120 b/s`). At high
 speeds the world streams in around you (terrain is generated on the fly),
 so expect the landscape to pop in a few chunks behind the horizon.
+
+**Block highlight.** The block under the crosshair is outlined with a
+black wireframe. The server re-computes that target every tick and sends
+it with the player state; left/right clicks are applied with the exact
+aim from the moment you clicked (the aim is stamped onto the action), so
+the highlighted block is always the one that gets broken or built
+against — even while you're turning fast.
 
 ## Layout
 

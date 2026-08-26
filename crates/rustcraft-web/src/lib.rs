@@ -35,6 +35,12 @@ struct App {
     mouse_dx: f32,
     mouse_dy: f32,
     actions: Vec<Action>,
+    /// Camera aim (yaw/pitch) of the last rendered frame. Click actions are
+    /// stamped with this so the server raycasts with the aim the player
+    /// actually saw — mouse deltas that land after a click must not move
+    /// the targeted block.
+    aim_yaw: f32,
+    aim_pitch: f32,
     locked: bool,
     last_time: f64,
     frames: u32,
@@ -112,6 +118,8 @@ impl App {
             mouse_dx: 0.0,
             mouse_dy: 0.0,
             actions: Vec::new(),
+            aim_yaw: 0.0,
+            aim_pitch: 0.0,
             locked: false,
             last_time: 0.0,
             frames: 0,
@@ -148,7 +156,8 @@ impl App {
             log("VERIFY_PIXELS gl context unavailable");
             return;
         };
-        match gl.readback(&self.verify_regions, cam, p.yaw, p.pitch) {
+        let highlight = p.target.map(|t| (t.x, t.y, t.z));
+        match gl.readback(&self.verify_regions, cam, p.yaw, p.pitch, highlight) {
             Some(grid) => log(&format!("VERIFY_PIXELS {grid}")),
             None => log("VERIFY_PIXELS readback failed"),
         }
@@ -233,6 +242,10 @@ impl App {
         }
         let agents = self.server.agents();
         let player = self.server.player_state();
+        // The rendered camera uses exactly this state; stamp it for click
+        // actions (see the `aim_*` field docs).
+        self.aim_yaw = player.yaw;
+        self.aim_pitch = player.pitch;
         if self.walk_mode {
             // At t=30s switch to the fly phase (max-speed straight flight).
             if self.frames_total == 1800 && !self.walk_fly {
@@ -304,6 +317,7 @@ impl App {
             }
             let t_render = js_sys::Date::now();
             r.set_agents(agents);
+            r.set_highlight(player.target.map(|t| [t.x, t.y, t.z]));
             let cam = [
                 player.pos.x,
                 player.pos.y + rustcraft_server::agent::EYE_HEIGHT,
@@ -516,9 +530,10 @@ pub fn start() -> Result<(), JsValue> {
                 if !a.locked {
                     return;
                 }
+                let (yaw, pitch) = (a.aim_yaw, a.aim_pitch);
                 match e.button() {
-                    0 => a.actions.push(Action::Break),
-                    2 => a.actions.push(Action::Place),
+                    0 => a.actions.push(Action::Break { yaw, pitch }),
+                    2 => a.actions.push(Action::Place { yaw, pitch }),
                     _ => {}
                 }
             }

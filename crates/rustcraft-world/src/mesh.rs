@@ -346,6 +346,37 @@ pub fn build_chunk_mesh(origin: (i32, i32, i32), data: &[u8]) -> MeshData {
     }
 }
 
+/// Wireframe cube (24 vertices, 12 line segments) around block `t`,
+/// inflated by 0.001 so the lines sit just outside the solid faces (no
+/// z-fighting). Vertex layout: [x, y, z, r, g, b] (same as chunk meshes).
+/// Drawn with a line-list pipeline (client) / `gl.LINES` (shadow renderer).
+pub fn highlight_vertices(t: (i32, i32, i32)) -> Vec<f32> {
+    const C: [f32; 3] = [0.03, 0.03, 0.03];
+    let (x, y, z) = (t.0 as f32 + 0.5, t.1 as f32 + 0.5, t.2 as f32 + 0.5);
+    let h = 0.501f32;
+    let mut out = Vec::with_capacity(24 * 6);
+    let c = |dx: f32, dy: f32, dz: f32| (x + dx, y + dy, z + dz);
+    let seg = |out: &mut Vec<f32>, a: (f32, f32, f32), b: (f32, f32, f32)| {
+        out.extend_from_slice(&[a.0, a.1, a.2, C[0], C[1], C[2], b.0, b.1, b.2, C[0], C[1], C[2]]);
+    };
+    // Bottom square.
+    seg(&mut out, c(-h, -h, -h), c(h, -h, -h));
+    seg(&mut out, c(h, -h, -h), c(h, -h, h));
+    seg(&mut out, c(h, -h, h), c(-h, -h, h));
+    seg(&mut out, c(-h, -h, h), c(-h, -h, -h));
+    // Top square.
+    seg(&mut out, c(-h, h, -h), c(h, h, -h));
+    seg(&mut out, c(h, h, -h), c(h, h, h));
+    seg(&mut out, c(h, h, h), c(-h, h, h));
+    seg(&mut out, c(-h, h, h), c(-h, h, -h));
+    // Verticals.
+    seg(&mut out, c(-h, -h, -h), c(-h, h, -h));
+    seg(&mut out, c(h, -h, -h), c(h, h, -h));
+    seg(&mut out, c(h, -h, h), c(h, h, h));
+    seg(&mut out, c(-h, -h, h), c(-h, h, h));
+    out
+}
+
 /// One convex quad (CCW as seen from outside) with a baked colour.
 fn push_quad(
     verts: &mut Vec<f32>,
@@ -446,6 +477,21 @@ mod tests {
             }
         }
         let _ = CHUNK_BLOCKS;
+    }
+
+    #[test]
+    fn highlight_is_a_24_vertex_cube_around_the_block() {
+        let v = highlight_vertices((3, 4, 5));
+        assert_eq!(v.len(), 24 * 6);
+        // Every corner must hug the block (3..6) from just outside.
+        for c in v.chunks(6) {
+            assert!((2.99..6.01).contains(&c[0]), "x {} out of range", c[0]);
+            assert!((2.99..6.01).contains(&c[1]), "y {} out of range", c[1]);
+            assert!((2.99..6.01).contains(&c[2]), "z {} out of range", c[2]);
+            for col in &c[3..6] {
+                assert!((0.0..=1.0).contains(col));
+            }
+        }
     }
 
     #[test]

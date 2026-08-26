@@ -72,6 +72,12 @@ pub struct Renderer {
     /// Translucent water pipeline (src-alpha blend, no depth writes);
     /// drawn after all opaque geometry.
     water_pipeline: RenderPipeline,
+    /// Wireframe pipeline for the block highlight (line list, no cull).
+    line_pipeline: RenderPipeline,
+    /// 24-vertex wireframe cube, re-uploaded when the target changes.
+    highlight_vbo: Buffer,
+    /// The block under the crosshair (server-computed); None = no target.
+    highlight: Option<[i32; 3]>,
     bind_group_layout: wgpu::BindGroupLayout,
     uniform_buf: Buffer,
     terrain_vbo: Buffer,
@@ -185,6 +191,69 @@ impl Renderer {
         let water_pipeline =
             make_pipeline(&device, &shader, &layout, surface_format, "fs_water", true);
 
+        // Highlight: same vertices/shader as terrain, but line list with no
+        // culling (lines are visible from both sides).
+        let line_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("rustcraft-highlight"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[VertexBufferLayout {
+                    array_stride: 24,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &[
+                        VertexAttribute {
+                            offset: 0,
+                            format: VertexFormat::Float32x3,
+                            shader_location: 0,
+                        },
+                        VertexAttribute {
+                            offset: 12,
+                            format: VertexFormat::Float32x3,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let highlight_vbo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("highlight-vertices"),
+            size: (24 * 24) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rustcraft-uniforms"),
             size: UNIFORM_SIZE,
@@ -211,6 +280,9 @@ impl Renderer {
             surface_format,
             pipeline,
             water_pipeline,
+            line_pipeline,
+            highlight_vbo,
+            highlight: None,
             bind_group_layout,
             uniform_buf,
             terrain_vbo,
@@ -452,6 +524,19 @@ impl Renderer {
         self.backlog.push(update);
     }
 
+    /// Set the wireframe highlight target (the block under the
+    /// crosshair, computed by the server). No-op when unchanged.
+    pub fn set_highlight(&mut self, target: Option<[i32; 3]>) {
+        if target == self.highlight {
+            return;
+        }
+        self.highlight = target;
+        if let Some(t) = target {
+            let v = rustcraft_world::mesh::highlight_vertices((t[0], t[1], t[2]));
+            self.queue.write_buffer(&self.highlight_vbo, 0, f32_bytes(&v));
+        }
+    }
+
     /// Update agent spheres from the latest states.
     pub fn set_agents(&mut self, states: Vec<AgentState>) {
         // Remove stale.
@@ -630,6 +715,13 @@ impl Renderer {
             pass.set_index_buffer(m.index.slice(..), wgpu::IndexFormat::Uint32);
             pass.set_vertex_buffer(0, m.vertex.slice(..));
             pass.draw_indexed(0..m.count, 0, 0..1);
+        }
+        // Block highlight: wireframe around the targeted block.
+        if self.highlight.is_some() {
+            pass.set_pipeline(&self.line_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.set_vertex_buffer(0, self.highlight_vbo.slice(..));
+            pass.draw(0..24, 0..1);
         }
         // Water: translucent pass after all opaque geometry (src-alpha
         // blend, no depth writes). Same pool buffers, different offsets.

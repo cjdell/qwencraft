@@ -58,6 +58,9 @@ pub struct AgentState {
     pub color: [u8; 3],
     /// Sphere centre = pos + (0, radius, 0); radius below.
     pub radius: f32,
+    /// The block under the player's crosshair (client draws a wireframe
+    /// highlight around it); None when nothing is within break range.
+    pub target: Option<BlockPos>,
 }
 
 const NPC_COLORS: [[u8; 3]; 8] = [
@@ -156,6 +159,7 @@ impl Agent {
             fly_speed: self.fly_speed,
             color: self.color,
             radius: 0.42,
+            target: None,
         }
     }
 

@@ -21,12 +21,16 @@ pub enum Key {
 }
 
 /// One-shot actions (block editing, fly mode), queued by the client on key/mouse events.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Action {
-    /// Break the targeted block.
-    Break,
-    /// Place a stone block against the targeted face.
-    Place,
+    /// Break the targeted block. `yaw`/`pitch` are the camera aim *at the
+    /// moment of the click*; the server raycasts with exactly that aim (not
+    /// its current one, which may already include mouse deltas that arrived
+    /// after the click — that lag is what made edits land off-target while
+    /// moving).
+    Break { yaw: f32, pitch: f32 },
+    /// Place a stone block against the targeted face (same aim semantics).
+    Place { yaw: f32, pitch: f32 },
     /// Toggle the player's fly mode.
     ToggleFly,
     /// Increase the fly speed (x FLY_STEP, clamped).
