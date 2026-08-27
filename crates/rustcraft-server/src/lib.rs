@@ -27,7 +27,6 @@ pub use sphere::sphere_mesh;
 pub use input::{Action, Input, Key, KeySet};
 pub use world::{World, WorldUpdate};
 
-use crate::world::Edit;
 use rustcraft_world::{Block, BlockPos, ChunkPos, WORLD_HEIGHT};
 
 /// Fixed physics tick rate.
@@ -52,25 +51,32 @@ const STREAM_PER_TICK: usize = 4;
 /// Max chunks generated per tick by the streamer.
 const GEN_PER_TICK: usize = 6;
 
-/// The game server. One instance per player (single-player for now).
+/// The game server. Owns the world and every agent (any number of players
+/// plus NPCs). Per-player state (input snapshot, queued actions, crosshair
+/// target) is keyed by agent id, and per-viewer chunk streaming lives in a
+/// [`Streamer`], so one `Server` can be the shared world behind any number
+/// of clients.
 pub struct Server {
     seed: u64,
     world: World,
     agents: Vec<Agent>,
-    input: Input,
-    prev_input: Input,
-    actions: Vec<Action>,
+    /// Current input snapshot per player agent (level-triggered: the latest
+    /// snapshot is applied every tick until replaced).
+    inputs: std::collections::HashMap<u32, Input>,
+    /// Previous input snapshot per player agent (jump edge detection).
+    prev_inputs: std::collections::HashMap<u32, Input>,
+    /// One-shot actions queued per player agent (applied on the next tick).
+    actions: std::collections::HashMap<u32, Vec<Action>>,
+    /// The block under each player's crosshair (recomputed every tick);
+    /// the client draws a wireframe highlight around it.
+    targets: std::collections::HashMap<u32, Option<BlockPos>>,
+    /// Chunks dirtied by edits since the last `drain_dirty`; each viewer
+    /// that already holds the chunk gets a region resend for it.
+    dirty: Vec<ChunkPos>,
+    /// Next agent id to allocate (players and NPCs share the id space).
+    next_id: u32,
     acc: f64,
     time: f64,
-    /// Chunks whose region has already been sent to the client.
-    sent: std::collections::HashSet<ChunkPos>,
-    /// Chunks queued for (re)sending, nearest first.
-    updates: Vec<WorldUpdate>,
-    /// Edits pending delivery to the client (delivered via region resends).
-    _pending_edits: Vec<Edit>,
-    /// The block under the player's crosshair (recomputed every tick);
-    /// the client draws a wireframe highlight around it.
-    target: Option<BlockPos>,
     /// Configured NPC load (applied by Action::NpcLoad): how many NPCs to
     /// spawn and how far apart the spiral arms sit. Load-test facility.
     npc_count: u32,
@@ -78,46 +84,123 @@ pub struct Server {
 }
 
 impl Server {
-    /// Create a server for a world with the given seed.
-    pub fn new(seed: u64) -> Self {
-        let world = World::new(seed);
-        // Spawn near the origin on dry, tree-free grass (skip water, snow
-        // and tree columns so nobody starts underwater or in a trunk).
-        let (sx, sz) = Self::find_spawn(&world, 8, 8, 16);
-        let surface = world.height_at(sx, sz);
-
-        let mut agents = Vec::new();
-        agents.push(Agent::player(0, Vec3::new(sx as f32 + 0.5, (surface + 2) as f32, sz as f32 + 0.5)));
-        // A couple of wandering NPC agents (also on dry, tree-free ground).
-        for (i, (dx, dz)) in [(3, -4), (-5, 3), (2, 6)].into_iter().enumerate() {
-            let (x, z) = Self::find_spawn(&world, 8 + dx, 8 + dz, 6);
-            let h = world.height_at(x, z);
-            agents.push(Agent::npc(
-                (i + 1) as u32,
-                Vec3::new(x as f32 + 0.5, (h + 1) as f32, z as f32 + 0.5),
-            ));
-        }
-
+    /// Create a world with the given seed and no agents. Network servers use
+    /// this and add one player per connection ([`Self::add_player`]).
+    pub fn new_world(seed: u64) -> Self {
         Server {
             seed,
-            world,
-            agents,
-            input: Input::default(),
-            prev_input: Input::default(),
-            actions: Vec::new(),
+            world: World::new(seed),
+            agents: Vec::new(),
+            inputs: std::collections::HashMap::new(),
+            prev_inputs: std::collections::HashMap::new(),
+            actions: std::collections::HashMap::new(),
+            targets: std::collections::HashMap::new(),
+            dirty: Vec::new(),
+            next_id: 0,
             acc: 0.0,
             time: 0.0,
-            sent: std::collections::HashSet::new(),
-            updates: Vec::new(),
-            _pending_edits: Vec::new(),
-            target: None,
             npc_count: NPC_COUNT_DEFAULT,
             npc_spacing: NPC_SPACING_DEFAULT,
         }
     }
 
+    /// Create a single-player world: one player plus a few ambient NPCs.
+    pub fn new(seed: u64) -> Self {
+        let mut s = Self::new_world(seed);
+        s.add_player();
+        // A couple of wandering NPC agents (also on dry, tree-free ground).
+        for (dx, dz) in [(3, -4), (-5, 3), (2, 6)] {
+            let (x, z) = Self::find_spawn(&s.world, 8 + dx, 8 + dz, 6);
+            let h = s.world.height_at(x, z);
+            let id = s.next_id;
+            s.next_id += 1;
+            s.agents.push(Agent::npc(
+                id,
+                Vec3::new(x as f32 + 0.5, (h + 1) as f32, z as f32 + 0.5),
+            ));
+        }
+        s
+    }
+
     pub fn seed(&self) -> u64 {
         self.seed
+    }
+
+    /// Borrow the world (read-only).
+    pub fn world(&self) -> &World {
+        &self.world
+    }
+
+    /// Borrow the world (mutable).
+    pub fn world_mut(&mut self) -> &mut World {
+        &mut self.world
+    }
+
+    /// Add a player agent at the spawn point and return its id. Successive
+    /// players are nudged apart so they don't spawn in the same cell.
+    pub fn add_player(&mut self) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        // Spawn near the origin on dry, tree-free grass (skip water, snow
+        // and tree columns so nobody starts underwater or in a trunk).
+        let (sx, sz) = Self::find_spawn(&self.world, 8, 8, 16);
+        let surface = self.world.height_at(sx, sz);
+        let k = self.agents.iter().filter(|a| a.kind == AgentKind::Player).count() as f32;
+        let off = k * 1.6;
+        let pos = Vec3::new(sx as f32 + 0.5 + off, (surface + 2) as f32, sz as f32 + 0.5);
+        self.agents.push(Agent::player(id, pos));
+        self.inputs.insert(id, Input::default());
+        self.prev_inputs.insert(id, Input::default());
+        id
+    }
+
+    /// Remove a player agent (and its per-player state). NPCs are kept.
+    pub fn remove_player(&mut self, id: u32) {
+        if let Some(idx) = self.agents.iter().position(|a| a.id == id) {
+            self.agents.remove(idx);
+        }
+        self.inputs.remove(&id);
+        self.prev_inputs.remove(&id);
+        self.actions.remove(&id);
+        self.targets.remove(&id);
+    }
+
+    /// The ids of all live player agents, ascending.
+    pub fn player_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self
+            .agents
+            .iter()
+            .filter(|a| a.kind == AgentKind::Player)
+            .map(|a| a.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Replace player `id`'s current input snapshot.
+    pub fn set_agent_input(&mut self, id: u32, input: Input) {
+        self.inputs.insert(id, input);
+    }
+
+    /// Queue a one-shot action for player `id` (applied on the next tick).
+    pub fn push_agent_action(&mut self, id: u32, a: Action) {
+        self.actions.entry(id).or_default().push(a);
+    }
+
+    /// Snapshot of player `id` (crosshair target included).
+    pub fn agent_state(&self, id: u32) -> AgentState {
+        let idx = self.agent_index(id);
+        let mut s = self.agents[idx].state();
+        s.target = self.targets.get(&id).copied().flatten();
+        s
+    }
+
+    /// Index of the agent with `id` (panics if absent — a caller bug).
+    fn agent_index(&self, id: u32) -> usize {
+        self.agents
+            .iter()
+            .position(|a| a.id == id)
+            .expect("agent id must exist")
     }
 
     /// True when an agent can stand on column (x, z): dry grass (no water,
@@ -153,83 +236,113 @@ impl Server {
         (cx, cz) // fallback (very unlikely: the map is mostly dry grass)
     }
 
-    /// Queue a one-shot action (break/place) to be applied on the next tick.
+    /// Queue a one-shot action (break/place) for the primary player (id 0).
     pub fn push_action(&mut self, a: Action) {
-        self.actions.push(a);
+        self.push_agent_action(0, a);
     }
 
-    /// Replace the current input state (keys + accumulated mouse deltas).
+    /// Replace the current input state (keys + accumulated mouse deltas) for
+    /// the primary player (id 0).
     pub fn set_input(&mut self, input: Input) {
-        self.input = input;
+        self.set_agent_input(0, input);
     }
 
-    /// Advance simulation by real time `dt` seconds (clamped) using fixed steps.
+    /// Advance simulation by real time `dt` seconds (clamped) using fixed
+    /// steps. Chunk streaming is not done here: each viewer's [`Streamer`]
+    /// drives it around its own player (see `Streamer::tick`).
     pub fn tick(&mut self, dt: f64) {
         self.acc += dt.min(0.25);
         while self.acc >= TICK_DT {
             self.acc -= TICK_DT;
             self.step(TICK_DT as f32);
         }
-        self.stream();
     }
 
     fn step(&mut self, dt: f32) {
-        // Jump edge detection.
-        let jump = self.input.keys.contains(Key::Space) && !self.prev_input.keys.contains(Key::Space);
-
-        // Player.
-        {
-            let player = &mut self.agents[0];
-            let move_dir = self.input.move_direction(player.yaw);
-            player.step(dt, &mut self.world, move_dir, jump, &self.input);
-        }
-        // Consume queued actions (fly mode, break/place) against the world.
-        let actions = std::mem::take(&mut self.actions);
-        for action in actions {
-            match action {
-                Action::ToggleFly => self.agents[0].toggle_fly(),
-                Action::FlyFaster => self.agents[0].adjust_fly_speed(FLY_STEP),
-                Action::FlySlower => self.agents[0].adjust_fly_speed(1.0 / FLY_STEP),
-                Action::NpcLoad => self.spawn_npcs(),
-                Action::NpcClear => self.clear_npcs(),
-                Action::NpcCountUp => self.adjust_npc_count(true),
-                Action::NpcCountDown => self.adjust_npc_count(false),
-                Action::NpcSpacingUp => self.adjust_npc_spacing(true),
-                Action::NpcSpacingDown => self.adjust_npc_spacing(false),
-                Action::Break { .. } | Action::Place { .. } => {
-                    self.apply_player_action(action)
+        // Players (stable ascending-id order).
+        let ids = self.player_ids();
+        for &id in &ids {
+            let input = self.inputs.get(&id).cloned().unwrap_or_default();
+            let prev = self.prev_inputs.get(&id).cloned().unwrap_or_default();
+            // Jump edge detection.
+            let jump = input.keys.contains(Key::Space) && !prev.keys.contains(Key::Space);
+            let idx = self.agent_index(id);
+            let move_dir = input.move_direction(self.agents[idx].yaw);
+            self.agents[idx].step(dt, &mut self.world, move_dir, jump, &input);
+            // Consume this player's queued actions against the world.
+            if let Some(actions) = self.actions.remove(&id) {
+                for action in actions {
+                    self.apply_action(id, action);
                 }
+            }
+            // Record this tick's input for the next tick's jump edge, and
+            // consume the look deltas (they are applied exactly once).
+            self.prev_inputs.insert(id, input);
+            if let Some(inp) = self.inputs.get_mut(&id) {
+                inp.mouse_dx = 0.0;
+                inp.mouse_dy = 0.0;
             }
         }
 
-        // Recompute the crosshair target for the client's block highlight
-        // (same raycast + range as break/place, from the post-step aim —
-        // the same aim the client is about to render).
-        self.target = {
-            let p = &self.agents[0];
-            self.world.raycast(&p.eye(), &p.look_direction(), 6.0).map(|(hit, _)| hit)
-        };
+        // Recompute the crosshair target for each player (same raycast +
+        // range as break/place, from the post-step aim — the same aim the
+        // client is about to render).
+        for &id in &ids {
+            let idx = self.agent_index(id);
+            self.targets.insert(
+                id,
+                self.world
+                    .raycast(&self.agents[idx].eye(), &self.agents[idx].look_direction(), 6.0)
+                    .map(|(hit, _)| hit),
+            );
+        }
 
         // NPCs.
-        for npc in self.agents.iter_mut().skip(1) {
+        for npc in self.agents.iter_mut().filter(|a| a.kind == AgentKind::Npc) {
             npc.step_npc(dt, &mut self.world, self.time);
         }
 
-        self.prev_input = self.input;
-        self.input.mouse_dx = 0.0;
-        self.input.mouse_dy = 0.0;
         self.time += TICK_DT;
     }
 
-    fn apply_player_action(&mut self, action: Action) {
-        // Raycast with the aim stamped into the action (the camera at click
-        // time), so post-click mouse movement can't move the target.
+    /// Apply a one-shot action for player `id`.
+    fn apply_action(&mut self, id: u32, action: Action) {
+        match action {
+            Action::ToggleFly => {
+                let idx = self.agent_index(id);
+                self.agents[idx].toggle_fly();
+            }
+            Action::FlyFaster => {
+                let idx = self.agent_index(id);
+                self.agents[idx].adjust_fly_speed(FLY_STEP);
+            }
+            Action::FlySlower => {
+                let idx = self.agent_index(id);
+                self.agents[idx].adjust_fly_speed(1.0 / FLY_STEP);
+            }
+            Action::NpcLoad => self.spawn_npcs(id),
+            Action::NpcClear => self.clear_npcs(),
+            Action::NpcCountUp => self.adjust_npc_count(true),
+            Action::NpcCountDown => self.adjust_npc_count(false),
+            Action::NpcSpacingUp => self.adjust_npc_spacing(true),
+            Action::NpcSpacingDown => self.adjust_npc_spacing(false),
+            Action::Break { .. } | Action::Place { .. } => {
+                self.apply_world_edit(id, action)
+            }
+        }
+    }
+
+    /// Break/place: raycast from the acting player with the aim stamped into
+    /// the action (the camera at click time), so post-click mouse movement
+    /// can't move the target.
+    fn apply_world_edit(&mut self, id: u32, action: Action) {
         let (eye, yaw, pitch) = match action {
             Action::Break { yaw, pitch } | Action::Place { yaw, pitch } => {
-                let p = &self.agents[0];
+                let idx = self.agent_index(id);
+                let p = &self.agents[idx];
                 (p.eye(), yaw, pitch)
             }
-            _ => unreachable!("only Break/Place reach apply_player_action"),
+            _ => unreachable!("only Break/Place reach apply_world_edit"),
         };
         let d = rustcraft_world::camera::look_direction(yaw, pitch);
         let dir = Vec3::new(d[0], d[1], d[2]);
@@ -240,7 +353,7 @@ impl Server {
                         // World edits go through the delta layer.
                         let dirty = self.world.set_block(hit, Block::Air);
                         self.invalidate_caches_at(hit);
-                        self.queue_resends(&dirty);
+                        self.dirty.extend(dirty);
                     }
                 }
                 Action::Place { .. } => {
@@ -257,136 +370,22 @@ impl Server {
                     if prev.y >= 0 && prev.y < WORLD_HEIGHT && !blocked {
                         let dirty = self.world.set_block(prev, Block::Stone);
                         self.invalidate_caches_at(prev);
-                        self.queue_resends(&dirty);
+                        self.dirty.extend(dirty);
                     }
                 }
-                // Fly actions never reach here (handled in step()).
-                _ => unreachable!("only Break/Place reach apply_player_action"),
+                // Fly/NPC actions never reach here (handled in apply_action).
+                _ => unreachable!("only Break/Place reach apply_world_edit"),
             },
             None => {}
         }
     }
 
-    /// Stream chunk regions to the client.
-    ///
-    /// 1) Proactively generate chunks within VIEW_RADIUS+1 (nearest first) so
-    ///    that streaming context (a chunk's region spans its 3x3x3 chunk
-    ///    neighbourhood) is available without waiting for sends.
-    /// 2) Emit region payloads for the nearest chunks that are ready and
-    ///    have not been sent yet.
-    fn stream(&mut self) {
-        let p = self.agents[0].pos;
-        let pc = ChunkPos::of(BlockPos::new(p.x as i32, 0, p.z as i32));
-
-        // 1) Generation pass: ungenerated terrain chunks, nearest first.
-        let mut todo: Vec<(i64, ChunkPos)> = Vec::new();
-        for dx in -(VIEW_RADIUS + 1)..=VIEW_RADIUS + 1 {
-            for dz in -(VIEW_RADIUS + 1)..=VIEW_RADIUS + 1 {
-                if dx * dx + dz * dz > (VIEW_RADIUS + 1) * (VIEW_RADIUS + 1) {
-                    continue;
-                }
-                for cy in 0..(WORLD_HEIGHT / rustcraft_world::CHUNK) {
-                    let c = ChunkPos::new(pc.x + dx, cy, pc.z + dz);
-                    if c.guaranteed_air() || self.world.contains(&c) {
-                        continue;
-                    }
-                    let d2 = (dx * dx + dz * dz) as i64 + (cy as i64).abs() * 4;
-                    todo.push((d2, c));
-                }
-            }
-        }
-        todo.sort_by_key(|(d, _)| *d);
-        todo.truncate(GEN_PER_TICK);
-        for (_d, c) in todo {
-            self.world.generate(c);
-        }
-
-        // 2) Send pass: ready, unsent chunks, nearest first.
-        let mut candidates: Vec<(i64, ChunkPos)> = Vec::new();
-        for dx in -VIEW_RADIUS..=VIEW_RADIUS {
-            for dz in -VIEW_RADIUS..=VIEW_RADIUS {
-                if dx * dx + dz * dz > (VIEW_RADIUS + 1) * (VIEW_RADIUS + 1) {
-                    continue;
-                }
-                for cy in 0..(WORLD_HEIGHT / rustcraft_world::CHUNK) {
-                    let c = ChunkPos::new(pc.x + dx, cy, pc.z + dz);
-                    if c.guaranteed_air() || self.sent.contains(&c) {
-                        continue;
-                    }
-                    if self.region_ready(c) {
-                        let d2 = (dx * dx + dz * dz) as i64 + (cy as i64).abs() * 2;
-                        candidates.push((d2, c));
-                    }
-                }
-            }
-        }
-        candidates.sort_by_key(|(d, _)| *d);
-        candidates.truncate(STREAM_PER_TICK);
-        for (_d, c) in candidates {
-            let region = self.world.region(c);
-            self.sent.insert(c);
-            self.updates.push(WorldUpdate::Chunk { pos: c, data: region });
-        }
-    }
-
-    /// A chunk's streamed region covers its 3x3x3 chunk neighbourhood
-    /// (16 + 2*5 blocks). All of that must be known (generated or air).
-    fn region_ready(&self, c: ChunkPos) -> bool {
-        for k in self.context_chunks(c) {
-            if k.guaranteed_air() {
-                continue;
-            }
-            if k.y * rustcraft_world::CHUNK < 0
-                || k.y * rustcraft_world::CHUNK >= WORLD_HEIGHT
-            {
-                continue; // outside world = air
-            }
-            if !self.world.contains(&k) {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// The 3x3x3 chunk neighbourhood overlapping a chunk's region payload.
-    fn context_chunks(&self, c: ChunkPos) -> [ChunkPos; 27] {
-        let mut out = [ChunkPos::new(0, 0, 0); 27];
-        let mut i = 0;
-        for dy in -1i32..=1 {
-            for dz in -1i32..=1 {
-                for dx in -1i32..=1 {
-                    out[i] = ChunkPos::new(c.x + dx, c.y + dy, c.z + dz);
-                    i += 1;
-                }
-            }
-        }
-        out
-    }
-
-    /// Queue region resends for chunks whose data changed (edits).
-    fn queue_resends(&mut self, dirty: &[ChunkPos]) {
-        for c in dirty {
-            if self.sent.contains(c) {
-                let region = self.world.region(*c);
-                self.updates.push(WorldUpdate::Chunk { pos: *c, data: region });
-            }
-        }
-    }
-
-    /// Drain world updates produced since the last call.
-    pub fn take_world_updates(&mut self) -> Vec<WorldUpdate> {
-        std::mem::take(&mut self.updates)
-    }
-
-    /// Re-send an already-generated chunk on client request (the client's
-    /// terrain buffer pool may evict a chunk; the server keeps it). None if
-    /// the chunk was never generated.
-    pub fn resend_chunk(&mut self, pos: ChunkPos) -> Option<Vec<u8>> {
-        if self.world.contains(&pos) {
-            Some(self.world.region(pos))
-        } else {
-            None
-        }
+    /// Chunks dirtied by world edits since the last call. Each viewer that
+    /// already holds one of these chunks gets a region resend for it
+    /// (`Streamer::apply_edits`); new viewers get the current data when the
+    /// chunk is first streamed to them.
+    pub fn drain_dirty(&mut self) -> Vec<ChunkPos> {
+        std::mem::take(&mut self.dirty)
     }
 
     /// The configured NPC load (count, spacing in blocks).
@@ -429,10 +428,12 @@ impl Server {
     /// and every NPC gets a fresh local block window. Spawning is one-shot
     /// (a brief frame hitch at high counts: each window's first build
     /// materialises its chunks on demand).
-    pub fn spawn_npcs(&mut self) {
+    pub fn spawn_npcs(&mut self, around: u32) {
         let (count, spacing) = self.npc_load_config();
-        let p = self.agents[0].pos;
-        self.agents.truncate(1); // keep the player; replace the NPC set
+        let idx = self.agent_index(around);
+        let p = self.agents[idx].pos;
+        self.agents
+            .retain(|a| a.kind == AgentKind::Player); // keep players; replace the NPC set
         for i in 0..count {
             let angle = (i as f32) * GOLDEN_ANGLE;
             let radius = spacing * (i as f32 + 1.0).sqrt();
@@ -440,17 +441,19 @@ impl Server {
             let tz = (p.z + radius * angle.cos()) as i32;
             let (x, z) = Self::find_spawn(&self.world, tx, tz, 2);
             let h = self.world.height_at(x, z);
+            let id = self.next_id;
+            self.next_id += 1;
             self.agents.push(Agent::npc(
-                1 + i as u32,
+                id,
                 Vec3::new(x as f32 + 0.5, (h + 1) as f32, z as f32 + 0.5),
             ));
         }
         self.reset_cache_stats();
     }
 
-    /// Remove all NPCs (the player remains).
+    /// Remove all NPCs (every player remains).
     pub fn clear_npcs(&mut self) {
-        self.agents.truncate(1);
+        self.agents.retain(|a| a.kind == AgentKind::Player);
         self.reset_cache_stats();
     }
 
@@ -473,31 +476,46 @@ impl Server {
         }
     }
 
-    /// Snapshot of all agent states (player first).
+    /// Snapshot of all agent states (players first, then NPCs).
     pub fn agents(&self) -> Vec<AgentState> {
-        self.agents.iter().map(|a| a.state()).collect()
+        let mut out = Vec::with_capacity(self.agents.len());
+        for a in &self.agents {
+            if a.kind == AgentKind::Player {
+                out.push(a.state());
+            }
+        }
+        for a in &self.agents {
+            if a.kind == AgentKind::Npc {
+                out.push(a.state());
+            }
+        }
+        out
     }
 
-    /// Player state (camera source of truth).
+    /// The primary player's (id 0) state — the camera source of truth for
+    /// the single-player (built-in) client.
     pub fn player_state(&self) -> AgentState {
-        let mut s = self.agents[0].state();
-        s.target = self.target;
-        s
+        self.agent_state(0)
     }
 
     /// Simple stats for the HUD / debugging (cache counters aggregated over
-    /// all agents; they reset when the NPC load changes).
-    pub fn stats(&self) -> ServerStats {
+    /// all agents; they reset when the NPC load changes). `chunks_sent` is
+    /// per-viewer, so the caller supplies its own streamer's count.
+    pub fn stats(&self, chunks_sent: usize) -> ServerStats {
         let mut cache = CacheStats::default();
+        let mut npcs = 0usize;
         for a in &self.agents {
             cache.add(a.cache.stats());
+            if a.kind == AgentKind::Npc {
+                npcs += 1;
+            }
         }
         ServerStats {
             chunks_generated: self.world.chunks_generated(),
-            chunks_sent: self.sent.len(),
+            chunks_sent,
             deltas: self.world.delta_count(),
             agents: self.agents.len(),
-            npcs: self.agents.len().saturating_sub(1),
+            npcs,
             cache,
         }
     }
@@ -517,6 +535,153 @@ pub struct ServerStats {
     pub cache: CacheStats,
 }
 
+/// Per-viewer chunk streaming state. The world is shared, but each viewer
+/// (a built-in page or a network connection) sees it from its own player and
+/// receives each chunk region exactly once — so the `sent` set and the
+/// outbound queue are per-viewer, not per-world.
+pub struct Streamer {
+    /// Chunks whose region has already been sent to this viewer.
+    sent: std::collections::HashSet<ChunkPos>,
+    /// Regions queued for delivery, nearest first.
+    queue: Vec<WorldUpdate>,
+}
+
+impl Streamer {
+    pub fn new() -> Self {
+        Self {
+            sent: std::collections::HashSet::new(),
+            queue: Vec::new(),
+        }
+    }
+
+    /// Stream the world around `viewpoint`: proactively generate chunks
+    /// within VIEW_RADIUS+1 (nearest first) so streaming context is ready,
+    /// then emit region payloads for the nearest ready, unsent chunks.
+    pub fn tick(&mut self, world: &mut World, viewpoint: Vec3) {
+        let pc = ChunkPos::of(BlockPos::new(viewpoint.x as i32, 0, viewpoint.z as i32));
+
+        // 1) Generation pass: ungenerated terrain chunks, nearest first.
+        let mut todo: Vec<(i64, ChunkPos)> = Vec::new();
+        for dx in -(VIEW_RADIUS + 1)..=VIEW_RADIUS + 1 {
+            for dz in -(VIEW_RADIUS + 1)..=VIEW_RADIUS + 1 {
+                if dx * dx + dz * dz > (VIEW_RADIUS + 1) * (VIEW_RADIUS + 1) {
+                    continue;
+                }
+                for cy in 0..(WORLD_HEIGHT / rustcraft_world::CHUNK) {
+                    let c = ChunkPos::new(pc.x + dx, cy, pc.z + dz);
+                    if c.guaranteed_air() || world.contains(&c) {
+                        continue;
+                    }
+                    let d2 = (dx * dx + dz * dz) as i64 + (cy as i64).abs() * 4;
+                    todo.push((d2, c));
+                }
+            }
+        }
+        todo.sort_by_key(|(d, _)| *d);
+        todo.truncate(GEN_PER_TICK);
+        for (_d, c) in todo {
+            world.generate(c);
+        }
+
+        // 2) Send pass: ready, unsent chunks, nearest first.
+        let mut candidates: Vec<(i64, ChunkPos)> = Vec::new();
+        for dx in -VIEW_RADIUS..=VIEW_RADIUS {
+            for dz in -VIEW_RADIUS..=VIEW_RADIUS {
+                if dx * dx + dz * dz > (VIEW_RADIUS + 1) * (VIEW_RADIUS + 1) {
+                    continue;
+                }
+                for cy in 0..(WORLD_HEIGHT / rustcraft_world::CHUNK) {
+                    let c = ChunkPos::new(pc.x + dx, cy, pc.z + dz);
+                    if c.guaranteed_air() || self.sent.contains(&c) {
+                        continue;
+                    }
+                    if Self::region_ready(world, c) {
+                        let d2 = (dx * dx + dz * dz) as i64 + (cy as i64).abs() * 2;
+                        candidates.push((d2, c));
+                    }
+                }
+            }
+        }
+        candidates.sort_by_key(|(d, _)| *d);
+        candidates.truncate(STREAM_PER_TICK);
+        for (_d, c) in candidates {
+            let region = world.region(c);
+            self.sent.insert(c);
+            self.queue.push(WorldUpdate::Chunk { pos: c, data: region });
+        }
+    }
+
+    /// Queue resends of edited chunks this viewer already holds (so a break
+    /// in one client is seen by every other client that has the chunk).
+    pub fn apply_edits(&mut self, world: &World, dirty: &[ChunkPos]) {
+        for c in dirty {
+            if self.sent.contains(c) {
+                let region = world.region(*c);
+                self.queue.push(WorldUpdate::Chunk { pos: *c, data: region });
+            }
+        }
+    }
+
+    /// Drain the regions queued for delivery since the last call.
+    pub fn take(&mut self) -> Vec<WorldUpdate> {
+        std::mem::take(&mut self.queue)
+    }
+
+    /// Re-send an already-generated chunk on viewer request (the viewer's
+    /// terrain buffer pool may have evicted it; the world keeps everything).
+    /// None if the chunk was never generated.
+    pub fn resend(&mut self, world: &World, pos: ChunkPos) -> Option<WorldUpdate> {
+        if world.contains(&pos) {
+            Some(WorldUpdate::Chunk { pos, data: world.region(pos) })
+        } else {
+            None
+        }
+    }
+
+    /// How many distinct chunk regions this viewer has been sent.
+    pub fn sent_count(&self) -> usize {
+        self.sent.len()
+    }
+
+    /// A chunk's streamed region covers its 3x3x3 chunk neighbourhood
+    /// (16 + 2*5 blocks). All of that must be known (generated or air).
+    fn region_ready(world: &World, c: ChunkPos) -> bool {
+        for k in Self::context_chunks(c) {
+            if k.guaranteed_air() {
+                continue;
+            }
+            if k.y * rustcraft_world::CHUNK < 0 || k.y * rustcraft_world::CHUNK >= WORLD_HEIGHT {
+                continue; // outside world = air
+            }
+            if !world.contains(&k) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The 3x3x3 chunk neighbourhood overlapping a chunk's region payload.
+    fn context_chunks(c: ChunkPos) -> [ChunkPos; 27] {
+        let mut out = [ChunkPos::new(0, 0, 0); 27];
+        let mut i = 0;
+        for dy in -1i32..=1 {
+            for dz in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    out[i] = ChunkPos::new(c.x + dx, c.y + dy, c.z + dz);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+}
+
+impl Default for Streamer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,20 +696,25 @@ mod tests {
     #[test]
     fn resend_chunk_round_trips_generated_chunks() {
         let mut s = Server::new(1337);
-        tick_n(&mut s, 30); // let the streamer generate the spawn area
+        let mut st = Streamer::new();
+        for _ in 0..30 {
+            s.tick(1.0 / 60.0); // let the streamer generate the spawn area
+            let vp = s.player_state().pos;
+            st.tick(s.world_mut(), vp);
+        }
         let p = s.player_state().pos;
         let pos = rustcraft_world::ChunkPos::of(rustcraft_world::BlockPos::new(
             p.x as i32,
             p.y as i32,
             p.z as i32,
         ));
-        let data = s
-            .resend_chunk(pos)
+        let WorldUpdate::Chunk { data, .. } = st
+            .resend(s.world(), pos)
             .expect("the player's own chunk must have been generated");
         assert_eq!(data.len(), REGION_BLOCKS, "re-send must be a full region");
         // A chunk that was never generated (far away) is None, not an error.
         let far = rustcraft_world::ChunkPos::new(1000, 0, 1000);
-        assert!(s.resend_chunk(far).is_none(), "unknown chunk must be None");
+        assert!(st.resend(s.world(), far).is_none(), "unknown chunk must be None");
     }
 
     #[test]
@@ -808,8 +978,14 @@ mod tests {
     #[test]
     fn streaming_sends_region_payloads() {
         let mut s = Server::new(42);
-        tick_n(&mut s, 240); // 4s: generation + streaming
-        let updates = s.take_world_updates();
+        let mut st = Streamer::new();
+        for _ in 0..240 {
+            // 4s: generation + streaming (the streamer is driven per-viewer).
+            s.tick(1.0 / 60.0);
+            let vp = s.player_state().pos;
+            st.tick(s.world_mut(), vp);
+        }
+        let updates = st.take();
         assert!(!updates.is_empty(), "expected chunk updates");
         let mut saw_terrain = false;
         for u in &updates {
@@ -824,7 +1000,7 @@ mod tests {
         }
         assert!(saw_terrain, "expected terrain in at least one region");
         // Player's own chunk should have been sent.
-        let stats = s.stats();
+        let stats = s.stats(st.sent_count());
         assert!(stats.chunks_sent >= 20, "sent {} chunks", stats.chunks_sent);
         assert!(stats.chunks_generated > stats.chunks_sent / 4);
     }
@@ -981,7 +1157,7 @@ mod tests {
         s.push_action(Action::NpcLoad);
         tick_n(&mut s, 2);
         assert_eq!(s.agents().len(), 51, "player + 50 NPCs");
-        assert_eq!(s.stats().npcs, 50);
+        assert_eq!(s.stats(0).npcs, 50);
         // Re-spawning replaces the load: the count stays exact.
         s.set_npc_load(10, 8.0);
         s.push_action(Action::NpcLoad);
@@ -991,7 +1167,7 @@ mod tests {
         s.push_action(Action::NpcClear);
         tick_n(&mut s, 2);
         assert_eq!(s.agents().len(), 1, "only the player remains");
-        assert_eq!(s.stats().npcs, 0);
+        assert_eq!(s.stats(0).npcs, 0);
     }
 
     #[test]
@@ -1055,7 +1231,7 @@ mod tests {
         tick_n(&mut s, 121); // spawn tick + 2s of landing/window building
         s.reset_cache_stats(); // measure steady state only
         tick_n(&mut s, 600); // 10s of wandering
-        let c = s.stats().cache;
+        let c = s.stats(0).cache;
         assert!(c.lookups > 100_000, "expected >100k lookups, got {}", c.lookups);
         let hit_rate = c.hits as f64 / c.lookups as f64;
         assert!(
@@ -1139,6 +1315,75 @@ mod tests {
         for a in s.agents() {
             assert!(a.pos.y > 0.0 && a.pos.y < (WORLD_HEIGHT - 2) as f32);
         }
+    }
+
+    #[test]
+    fn add_remove_player_and_unique_ids() {
+        let mut s = Server::new_world(1337);
+        let a = s.add_player();
+        let b = s.add_player();
+        assert_ne!(a, b, "player ids must be unique");
+        assert_eq!(s.player_ids(), vec![a, b]);
+        s.remove_player(a);
+        assert_eq!(s.player_ids(), vec![b], "removing a player drops only that player");
+        // The remaining player still simulates (no dangling per-player state).
+        s.tick(1.0 / 60.0);
+        assert!(s.agent_state(b).is_player);
+    }
+
+    #[test]
+    fn shared_world_players_see_each_other_and_edits() {
+        let mut s = Server::new_world(1337);
+        let a = s.add_player();
+        let b = s.add_player();
+        let mut st_a = Streamer::new();
+        let mut st_b = Streamer::new();
+
+        // Stream a few seconds so both viewers hold the spawn area.
+        for _ in 0..180 {
+            s.tick(1.0 / 60.0);
+            let va = s.agent_state(a).pos;
+            let vb = s.agent_state(b).pos;
+            st_a.tick(s.world_mut(), va);
+            st_b.tick(s.world_mut(), vb);
+            let _ = st_a.take();
+            let _ = st_b.take();
+        }
+        assert!(st_a.sent_count() >= 20, "viewer A streamed {} chunks", st_a.sent_count());
+        assert!(st_b.sent_count() >= 20, "viewer B streamed {} chunks", st_b.sent_count());
+
+        // Both players are live in the shared world (each viewer renders all).
+        let agents = s.agents();
+        let players: Vec<u32> = agents.iter().filter(|x| x.is_player).map(|x| x.id).collect();
+        assert!(
+            players.contains(&a) && players.contains(&b),
+            "both players must be present: {players:?}"
+        );
+
+        // A breaks the block under its feet; the edit is a change to the
+        // shared world. Viewer B already holds that chunk, so it must get a
+        // region resend (this is what makes the edit visible to B).
+        let pa = s.agent_state(a);
+        let feet_block = BlockPos::new(pa.pos.x as i32, pa.pos.y as i32 - 1, pa.pos.z as i32);
+        let feet_chunk = ChunkPos::of(feet_block);
+        s.push_agent_action(a, Action::Break { yaw: pa.yaw, pitch: -1.55 });
+        s.tick(1.0 / 60.0);
+        let dirty = s.drain_dirty();
+        st_b.apply_edits(s.world(), &dirty);
+        let resent = st_b.take();
+        assert!(
+            resent
+                .iter()
+                .any(|u| matches!(u, WorldUpdate::Chunk { pos, .. } if *pos == feet_chunk)),
+            "viewer B must receive the edited chunk's region (got {} resends)",
+            resent.len()
+        );
+        // And the world actually lost the block (a single shared world).
+        assert_eq!(
+            s.world.block_at(feet_block),
+            Block::Air,
+            "A's break must land in the shared world"
+        );
     }
 }
 

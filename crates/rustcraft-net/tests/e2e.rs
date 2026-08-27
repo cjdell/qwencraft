@@ -24,6 +24,9 @@ struct Sample {
     chunks: u32,
     chunk_positions: Vec<ChunkPos>,
     npcs: u32,
+    /// Max number of player agents seen in an `Agents` message (a shared
+    /// world with N connected clients reports N players to each of them).
+    players: u32,
     npc_load: Option<(u32, f32)>,
 }
 
@@ -34,6 +37,7 @@ impl Default for Sample {
             chunks: 0,
             chunk_positions: Vec::new(),
             npcs: 0,
+            players: 0,
             npc_load: None,
         }
     }
@@ -56,7 +60,11 @@ fn sample(sock: &mut Sock, secs: f32) -> Sample {
                         ServerMsg::NpcLoad { count, spacing } => {
                             s.npc_load = Some((count, spacing));
                         }
-                        ServerMsg::Hello { .. } | ServerMsg::Agents(_) => {}
+                        ServerMsg::Agents(v) => {
+                            let np = v.iter().filter(|x| x.is_player).count() as u32;
+                            s.players = s.players.max(np);
+                        }
+                        ServerMsg::Hello { .. } => {}
                     }
                 }
             }
@@ -204,7 +212,7 @@ async fn end_to_end_single_player() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_connections_get_independent_worlds() {
+async fn two_connections_share_one_world() {
     let addr = serve(ServerOptions {
         seed: SEED,
         port: 0,
@@ -219,30 +227,35 @@ async fn two_connections_get_independent_worlds() {
     expect_hello(&mut a, "A");
     expect_hello(&mut b, "B");
 
-    // Both spawn in the same place (same seed), so let their worlds finish
-    // streaming, then verify a quiet window: no chunk traffic when idle.
-    sample(&mut a, 4.0);
-    sample(&mut b, 4.0);
-    let qa = sample(&mut a, 1.0);
-    let qb = sample(&mut b, 1.0);
-    assert_eq!(qa.chunks, 0, "A should be fully streamed (quiet window)");
-    assert_eq!(qb.chunks, 0, "B should be fully streamed (quiet window)");
+    // Let both players' views stream in.
+    let sa = sample(&mut a, 4.0);
+    let sb = sample(&mut b, 4.0);
+    assert!(sa.chunks >= 1 && sb.chunks >= 1, "both views must stream");
 
-    // Edit the world on A only: A's edited chunk must be re-sent, and B's
-    // world must stay silent (each connection owns its world — the
-    // single-player model).
-    let pa = sample(&mut a, 0.2).player.expect("A player");
+    // Shared world: each connection's `Agents` list contains BOTH players
+    // (itself and the other), so each client can see the other.
+    assert!(
+        sa.players >= 2,
+        "A must see both players in the shared world (saw {})",
+        sa.players
+    );
+    assert!(
+        sb.players >= 2,
+        "B must see both players in the shared world (saw {})",
+        sb.players
+    );
+
+    // A breaks the block under its feet; the edit lands in the shared world,
+    // so B (which holds that chunk) must receive the region re-send. This is
+    // what makes one player's block edits visible to the other.
+    let pa = sample(&mut a, 0.3).player.expect("A player");
     let edited = feet_chunk(&pa);
     break_under_feet(&mut a, &pa);
-    let sa = sample(&mut a, 3.0);
+    let sb2 = sample(&mut b, 3.0);
     assert!(
-        sa.chunk_positions.contains(&edited),
-        "A's edited chunk must be re-sent in A's world"
-    );
-    let sb = sample(&mut b, 0.5);
-    assert_eq!(
-        sb.chunks, 0,
-        "B's world must not see A's edits (no chunk traffic expected)"
+        sb2.chunk_positions.contains(&edited),
+        "B must receive A's edited chunk (shared world) — got {} chunks",
+        sb2.chunks
     );
 
     drop(a);

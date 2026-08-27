@@ -41,7 +41,7 @@ fn main() {
         settle(&mut s, 300);
         s.reset_cache_stats();
         let us = measure(&mut s, 300);
-        let st = s.stats();
+        let st = s.stats(0);
         let c = st.cache;
         let hit_pct = 100.0 * c.hits as f64 / c.lookups.max(1) as f64;
         let rebuilds_per_s = c.rebuilds as f64 / (300.0 / 60.0);

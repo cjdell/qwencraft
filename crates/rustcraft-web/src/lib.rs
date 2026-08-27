@@ -28,7 +28,7 @@ use web_sys::{
 use rustcraft_client::Renderer;
 use rustcraft_server::protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
 use rustcraft_server::{
-    Action, AgentState, Input, Key, KeySet, Server, ServerStats, WorldUpdate,
+    Action, AgentState, Input, Key, KeySet, Server, ServerStats, Streamer, WorldUpdate,
 };
 use rustcraft_world::ChunkPos;
 
@@ -39,14 +39,14 @@ fn log(msg: &str) {
 /// Which server backs the game: the embedded one, or a headless one over
 /// WebSocket. The frame loop only ever talks to this abstraction.
 enum Backend {
-    Builtin(Server),
+    Builtin { server: Server, streamer: Streamer },
     Remote(RemoteLink),
 }
 
 impl Backend {
     fn set_input(&mut self, input: Input) {
         match self {
-            Backend::Builtin(s) => s.set_input(input),
+            Backend::Builtin { server, .. } => server.set_input(input),
             Backend::Remote(r) => {
                 if r.connected {
                     r.send(ClientMsg::Input {
@@ -61,7 +61,7 @@ impl Backend {
 
     fn push_action(&mut self, a: Action) {
         match self {
-            Backend::Builtin(s) => s.push_action(a),
+            Backend::Builtin { server, .. } => server.push_action(a),
             Backend::Remote(r) => {
                 if r.connected {
                     r.send(ClientMsg::Action(a));
@@ -73,42 +73,51 @@ impl Backend {
     /// Advance the simulation. The remote backend is a no-op: its world
     /// ticks on the server at a fixed rate, independent of this page.
     fn tick(&mut self, dt: f64) {
-        if let Backend::Builtin(s) = self {
-            s.tick(dt);
+        if let Backend::Builtin { server, .. } = self {
+            server.tick(dt);
         }
     }
 
     fn take_world_updates(&mut self) -> Vec<WorldUpdate> {
         match self {
-            Backend::Builtin(s) => s.take_world_updates(),
+            Backend::Builtin { server, streamer } => {
+                // This page is the single viewer of its built-in world: drain
+                // edits, resend the changed chunks it holds, and stream the
+                // world around the player.
+                let dirty = server.drain_dirty();
+                streamer.apply_edits(server.world(), &dirty);
+                let vp = server.player_state().pos;
+                streamer.tick(server.world_mut(), vp);
+                streamer.take()
+            }
             Backend::Remote(r) => std::mem::take(&mut r.inbound),
         }
     }
 
     fn player_state(&self) -> AgentState {
         match self {
-            Backend::Builtin(s) => s.player_state(),
+            Backend::Builtin { server, .. } => server.player_state(),
             Backend::Remote(r) => r.player,
         }
     }
 
     fn agents(&self) -> Vec<AgentState> {
         match self {
-            Backend::Builtin(s) => s.agents(),
+            Backend::Builtin { server, .. } => server.agents(),
             Backend::Remote(r) => r.agents.clone(),
         }
     }
 
     fn stats(&self) -> ServerStats {
         match self {
-            Backend::Builtin(s) => s.stats(),
+            Backend::Builtin { server, streamer } => server.stats(streamer.sent_count()),
             Backend::Remote(r) => r.stats,
         }
     }
 
     fn npc_load_config(&self) -> (u32, f32) {
         match self {
-            Backend::Builtin(s) => s.npc_load_config(),
+            Backend::Builtin { server, .. } => server.npc_load_config(),
             Backend::Remote(r) => r.npc_load,
         }
     }
@@ -118,9 +127,7 @@ impl Backend {
     /// `take_world_updates`.
     fn request_resend(&mut self, pos: ChunkPos) -> Option<WorldUpdate> {
         match self {
-            Backend::Builtin(s) => {
-                s.resend_chunk(pos).map(|data| WorldUpdate::Chunk { pos, data })
-            }
+            Backend::Builtin { server, streamer } => streamer.resend(server.world(), pos),
             Backend::Remote(r) => {
                 if r.connected {
                     r.send(ClientMsg::ResendChunk(pos));
@@ -247,6 +254,7 @@ impl App {
     ) -> Self {
         let mut server = Server::new(seed);
         let spawn = server.player_state().pos;
+        let streamer = Streamer::new();
         let mut actions = Vec::new();
         if let Some((count, spacing)) = npcs {
             server.set_npc_load(count, spacing);
@@ -254,7 +262,7 @@ impl App {
             actions.push(Action::NpcLoad);
         }
         App {
-            backend: Backend::Builtin(server),
+            backend: Backend::Builtin { server, streamer },
             builtin_seed: seed,
             walk_mode,
             walk_anchor: [0.0; 2],
@@ -300,7 +308,7 @@ impl App {
     fn remote_id(&self) -> u32 {
         match &self.backend {
             Backend::Remote(r) => r.id,
-            Backend::Builtin(_) => u32::MAX,
+            Backend::Builtin { .. } => u32::MAX,
         }
     }
 
@@ -312,7 +320,10 @@ impl App {
 
     /// Drop any remote link and return to a fresh built-in server.
     fn fallback_to_builtin(&mut self) {
-        self.backend = Backend::Builtin(Server::new(self.builtin_seed));
+        self.backend = Backend::Builtin {
+            server: Server::new(self.builtin_seed),
+            streamer: Streamer::new(),
+        };
         // The previous world's terrain belongs to the old backend.
         if let Some(r) = self.renderer.as_mut() {
             r.clear_terrain();
@@ -613,7 +624,7 @@ impl App {
             // server the user connected to; "connecting" while the socket
             // is still handshaking).
             let net = match &self.backend {
-                Backend::Builtin(_) => format!("builtin (seed {})", self.builtin_seed),
+                Backend::Builtin { .. } => format!("builtin (seed {})", self.builtin_seed),
                 Backend::Remote(r) => {
                     if r.connected {
                         format!("{} (seed {})", r.url, r.seed.unwrap_or(0))

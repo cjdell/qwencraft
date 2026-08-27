@@ -4,9 +4,11 @@
 //! rustcraft-net [--seed N] [--port N] [--bind IP] [--cert FILE --key FILE]
 //! ```
 //!
-//! Serves one world per WebSocket connection (see `rustcraft-net` lib docs).
-//! Browser clients point at it with `?server=ws://host:port` (or the in-page
-//! connect panel).
+//! Serves one **shared world** for all WebSocket connections: every client
+//! that connects joins the same world and can see the other players and
+//! their edits (see `rustcraft-net` lib docs). Browser clients point at it
+//! with `?server=ws://host:port` (or the in-page connect panel); open two
+//! browsers at the same URL to play together.
 //!
 //! The server is host-only (tokio/mio don't support wasm); the wasm stub at
 //! the bottom keeps the shared workspace's wasm build green.

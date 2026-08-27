@@ -11,9 +11,11 @@ An **authoritative server** (infinite seeded world, physics, agents) runs
 **two ways**: **embedded in the same wasm module** as the **renderer**
 (terrain meshing, voxel lighting + AO, translucent water, block highlight,
 first-person controls; direct function calls, no network), or **headless**
-(`rustcraft-net`, a tokio WebSocket server — one world per connection,
-`ws://`/`wss://`). The client renders whatever a `Backend` gives it and
-forwards input; it never mutates world state (golden rule 4 holds for both
+(`rustcraft-net`, a tokio WebSocket server — one **shared world** for all
+connections: every socket joins the same `Server`, each gets its own
+streaming window, and players see each other and each other's edits; `ws://`
+/`wss://`). The client renders whatever a `Backend` gives it and forwards
+input; it never mutates world state (golden rule 4 holds for both
 transports). The wire codec lives in `rustcraft-server::protocol`.
 
 ## Golden rules
@@ -50,7 +52,7 @@ writes temp files):
 
 | Command | What it does |
 |---|---|
-| `cargo test` | All host unit tests (57: world 22, server 32, net e2e 3 incl. a wss TLS round-trip). The only place Rust tests run — **wasm tests can't execute here**. |
+| `cargo test` | All host unit tests (59: world 22, server 34, net e2e 3 incl. a wss TLS round-trip and a two-client shared-world test). The only place Rust tests run — **wasm tests can't execute here**. |
 | `./scripts/build.sh` | Release build → `web/dist` (wasm-bindgen 0.2.100). |
 | `./scripts/serve.sh` | Serve `web/dist` at `http://localhost:8080` (python3). |
 | `./scripts/serve.sh --https` | Same over TLS with a self-signed cert (`.certs/`, generated once via openssl). **Required for LAN play** — WebGPU needs a secure context. |
@@ -70,39 +72,55 @@ crates/
                       camera matrices + the WGSL shader source.
                       Host-testable — put geometry/logic tests here.
   rustcraft-server/   Authoritative game state. Server { world, agents,
-                      actions }, fixed 60Hz tick, physics (walk/jump/fly/
-                      swim), per-agent LocalBlockCache (dense 7³ local
-                      block window — steady-state physics lookups never
-                      touch the chunk buffers; edits invalidate it),
-                      NPC load test (Action::Npc*, phyllotaxis spawn),
-                      world deltas, block highlight target, spawn scan.
-                      protocol.rs = versioned little-endian binary wire
-                      codec (ClientMsg/ServerMsg, encode/decode/decode_-
-                      stream) shared by both transports; pure + host-
-                      testable, no deps.
+                      inputs/actions/targets per agent id }, fixed 60Hz
+                      tick, physics (walk/jump/fly/swim), per-agent
+                      LocalBlockCache (dense 7³ local block window —
+                      steady-state physics lookups never touch the chunk
+                      buffers; edits invalidate it), NPC load test
+                      (Action::Npc*, phyllotaxis spawn), block highlight
+                      target, spawn scan. Supports N players (add_player/
+                      remove_player/player_ids; `new` = 1 player + ambient
+                      NPCs for the builtin, `new_world` = 0 for the net
+                      server). Streamer = per-viewer chunk streaming state
+                      (sent set + queue + dirty-chunk re-sends) so the
+                      builtin (one viewer) and the net server (one per
+                      connection) share the logic. protocol.rs = versioned
+                      little-endian binary wire codec (ClientMsg/ServerMsg,
+                      encode/decode/decode_stream) shared by both
+                      transports; pure + host-testable, no deps.
   rustcraft-net/      HEADLESS server binary. tokio + tokio-tungstenite
-                      WebSocket front end (ws://, wss:// via --cert/--key);
-                      one Server world per connection, 60Hz tick loop,
-                      per-session reader task. HOST-ONLY: deps are
+                      WebSocket front end (ws://, wss:// via --cert/--key).
+                      ONE SHARED WORLD: a single Server (Arc<Mutex<
+                      WorldState>>) for all connections; each connection
+                      registers a player (add_player) and gets its own
+                      Streamer (per-viewer chunks). A single 60Hz tick
+                      loop ticks the world once and streams/updates every
+                      player; block edits re-send to every viewer holding
+                      the chunk; each client gets the full Agents list so
+                      players see each other. Per-session reader task
+                      applies inbound msgs. HOST-ONLY: deps are
                       cfg(not(target_arch = "wasm32"))-gated so the shared
                       workspace wasm build stays green (empty lib + stub
-                      bin on wasm). e2e tests (tests/e2e.rs) run a real
-                      sync WebSocket client against serve(), incl. a
-                      wss round-trip with an openssl-generated
-                      self-signed cert.
+                      bin on wasm). e2e tests (tests/e2e.rs) run real sync
+                      WebSocket clients against serve(): single player,
+                      two clients sharing one world (see each other +
+                      edit sync), and a wss round-trip with an
+                      openssl-generated self-signed cert.
   rustcraft-client/   WebGPU renderer. Terrain buffer POOL (one 2M-vertex
                       vbo/ibo, chunks own index ranges, compaction when
                       full), opaque+water pipelines (translucent water
                       pass), agent spheres, wireframe block highlight,
                       clear_terrain() for world switches.
-  rustcraft-web/      wasm glue. Backend { Builtin(Server), Remote } — the
-                      frame loop talks only to the Backend; remote mode
-                      decodes ServerMsg frames into the same
-                      WorldUpdate/AgentState shapes, forwards input/
-                      actions as ClientMsg. Connect panel (start screen)
-                      + ?server=ws://… param; failed connect falls back
-                      to builtin. verify_gl.rs = WebGL2 "shadow
-                      renderer" that re-renders the scene for headless
+  rustcraft-web/      wasm glue. Backend { Builtin { server, streamer },
+                      Remote } — the frame loop talks only to the Backend;
+                      builtin drives the embedded Server + Streamer
+                      directly, remote decodes ServerMsg frames into the
+                      same WorldUpdate/AgentState shapes and forwards
+                      input/actions as ClientMsg (so the client renders
+                      whatever the world is — builtin or shared). Connect
+                      panel (start screen) + ?server=ws://… param; failed
+                      connect falls back to builtin. verify_gl.rs = WebGL2
+                      "shadow renderer" that re-renders the scene for headless
                       pixel verification.
 web/                  index.html (HUD, overlay) + dist/ (build output).
 scripts/              build.sh, serve.sh, verify.sh, walk_test.sh,
@@ -113,10 +131,12 @@ Data flow per frame: input → `Server::push_action` → (fixed-tick)
 `Server::tick` → `player_state()`/delta sync → client uploads changed
 chunks to the terrain pool → WebGPU render pass (opaque → water → agents →
 highlight). In remote mode the same flow crosses the wire: input →
-`ClientMsg` (WebSocket) → server ticks at 60 Hz → `ServerMsg` frames →
-client's `RemoteLink` folds them into the Backend's state → same render
-pass. The client's `tick()` is a no-op in remote mode (the world ticks on
-the server).
+`ClientMsg` (WebSocket) → the net server ticks its **shared** `Server` once
+per 60 Hz step and streams **each** connected player (its own `Streamer`
+around that player's position + the full agent list, so players see each
+other) → `ServerMsg` frames → each client's `RemoteLink` folds them into
+its Backend's state → same render pass. The client's `tick()` is a no-op in
+remote mode (the world ticks on the server).
 
 ### Invariants that are easy to break
 

@@ -18,11 +18,16 @@ PORT="${PORT:-$((20000 + RANDOM % 20000))}"
 WS_PORT="${WS_PORT:-$((40000 + RANDOM % 20000))}"
 SEED="${SEED:-1337}"
 LOG="${LOG:-${TMPDIR:-/tmp}/rustcraft-remote-chrome.log}"
+LOG2="${LOG2:-${TMPDIR:-/tmp}/rustcraft-remote-chrome2.log}"
 WS_LOG="${WS_LOG:-${TMPDIR:-/tmp}/rustcraft-remote-server.log}"
 # Wall-clock seconds the page is left to connect, stream, and run the
 # WebGL2 shadow readback (the app renders at ~60 fps real time; the
 # readback fires at frame 410, ~7 s after the first frame).
 RUN_SECS="${RUN_SECS:-45}"
+# A second browser joins the SAME shared world concurrently (the multi-
+# player scenario): it runs for this many seconds and must connect and be
+# seen by the server alongside the first client.
+SECOND_SECS="${SECOND_SECS:-25}"
 
 # NOTE: no --virtual-time-budget here. Chromium's virtual-time
 # fast-forward stalls against a live WebSocket (the server streams at a
@@ -77,6 +82,26 @@ if ! grep -q "rustcraft-net: ready" "$WS_LOG" 2>/dev/null; then
   exit 1
 fi
 
+# Second browser: joins the same shared world concurrently (a second
+# profile dir, no pixel readback — it just has to connect and be seen).
+PROF_DIR2="${TMPDIR}/rustcraft-remote-chrome-prof2"
+rm -rf "$PROF_DIR2"
+mkdir -p "$PROF_DIR2"
+echo "==> second browser (same shared world, ${SECOND_SECS}s real time, background)"
+timeout "$SECOND_SECS" chromium \
+  --headless \
+  --no-sandbox \
+  --disable-gpu-sandbox \
+  --enable-unsafe-webgpu \
+  --enable-unsafe-swiftshader \
+  --use-angle=swiftshader \
+  --user-data-dir="$PROF_DIR2" \
+  --window-size=1280,720 \
+  --enable-logging=stderr --v=0 \
+  "http://127.0.0.1:${PORT}/?seed=${SEED}&server=ws://127.0.0.1:${WS_PORT}" \
+  >"$LOG2" 2>&1 &
+SECOND=$!
+
 echo "==> headless chromium (remote mode, ?server=ws://127.0.0.1:${WS_PORT}, ${RUN_SECS}s real time)"
 timeout "$RUN_SECS" chromium \
   --headless \
@@ -90,6 +115,9 @@ timeout "$RUN_SECS" chromium \
   --enable-logging=stderr --v=0 \
   "http://127.0.0.1:${PORT}/?seed=${SEED}&server=ws://127.0.0.1:${WS_PORT}&verify=1" \
   >"$LOG" 2>&1 || true
+
+# Let the second browser finish (it runs shorter than the first).
+wait "$SECOND" 2>/dev/null || true
 
 fail=0
 check() {
@@ -107,7 +135,11 @@ check "remote server connected"        grep -q "RustCraft: remote server connect
 check "renderer ready (WebGPU)"        grep -q "RustCraft: renderer ready" "$LOG"
 check "first frame rendered"           grep -q "RustCraft: first frame rendered" "$LOG"
 check "no uncaught JS errors"          bash -c "! grep -E 'Uncaught|TypeError|ReferenceError' '$LOG' | grep -v 'favicon' | grep -q ."
-check "server saw the client"          grep -q "client connected" "$WS_LOG"
+check "server saw the client"          grep -q "player 0 joined" "$WS_LOG"
+# The second browser must have joined the SAME shared world while the first
+# was connected (the server reports the online count on each join).
+check "second browser connected"       grep -q "RustCraft: remote server connected (seed ${SEED})" "$LOG2"
+check "shared world saw two players"   grep -q "2 online" "$WS_LOG"
 
 # GPU readback: the shadow renderer re-renders the scene built from the
 # server-streamed chunk regions; the 4x3 grid must show sky + terrain.
