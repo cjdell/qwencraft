@@ -122,17 +122,19 @@ impl Backend {
         }
     }
 
-    /// Ask for a chunk re-send (terrain-pool eviction). The built-in server
-    /// answers synchronously; the remote one re-sends asynchronously through
-    /// `take_world_updates`.
-    fn request_resend(&mut self, pos: ChunkPos) -> Option<WorldUpdate> {
+    /// Report chunks the terrain pool evicted (compaction). The streamer
+    /// forgets them and its normal stream re-sends the ones that are
+    /// visible again — nearest-first, with lookahead, at the stream rate.
+    fn report_evicted(&mut self, evicted: Vec<ChunkPos>) {
+        if evicted.is_empty() {
+            return;
+        }
         match self {
-            Backend::Builtin { server, streamer } => streamer.resend(server.world(), pos),
+            Backend::Builtin { server: _, streamer } => streamer.note_evicted(&evicted),
             Backend::Remote(r) => {
                 if r.connected {
-                    r.send(ClientMsg::ResendChunk(pos));
+                    r.send(ClientMsg::Evicted(evicted));
                 }
-                None
             }
         }
     }
@@ -208,6 +210,21 @@ struct App {
     /// Walk test fly phase (starts at t=30s): hold W+Space and ramp the
     /// fly speed to the max, exercising fly mode + high-speed streaming.
     walk_fly: bool,
+    /// Walk test return leg (starts at t=36s): 180° turn, fly back over
+    /// the just-flown route (re-enters pool-evicted terrain).
+    walk_return: bool,
+    /// Walk test: fly off (event-driven, when the return flight is back
+    /// near the walk endpoint) — the player then walks through the
+    /// re-entered (evicted) terrain slowly, so the final view is that
+    /// terrain and the POOL hole count is meaningful (drained, not fresh
+    /// territory).
+    walk_flyoff: bool,
+    /// Walk test: the xz where the fly phase started (the walk endpoint)
+    /// — the return flight lands when it is back within 64 blocks of this.
+    walk_end_pos: [f32; 2],
+    /// Previous frame's player xz (event-driven walk-test transitions;
+    /// the input section runs before this frame's player state exists).
+    last_player_xz: [f32; 2],
     /// Previous frame's xz (for accumulating distance walked).
     walk_anchor_prev: [f32; 2],
     /// Total horizontal distance walked (for the WALK telemetry).
@@ -228,9 +245,7 @@ struct App {
     hud_updates: u32,
     verify_regions: HashMap<ChunkPos, Vec<u8>>,
     gl_verify: Option<verify_gl::GlVerifier>,
-    // Per-chunk cooldown for terrain-pool re-sends (avoids a ping-pong when
-    // the pool stays full: (x,y,z) -> last request time, s).
-    resend_cooldown: HashMap<(i32, i32, i32), f64>,
+
     // Remote-server bookkeeping (the live link itself lives in `backend`).
     next_link_id: u32,
     /// NPC load armed via `?npcs=`, applied once a remote connection says
@@ -267,6 +282,10 @@ impl App {
             walk_mode,
             walk_anchor: [0.0; 2],
             walk_fly: false,
+            walk_return: false,
+            walk_flyoff: false,
+            walk_end_pos: [spawn.x, spawn.z],
+            last_player_xz: [spawn.x, spawn.z],
             walk_anchor_prev: [spawn.x, spawn.z],
             walk_dist: 0.0,
             walk_episodes: 0,
@@ -296,7 +315,6 @@ impl App {
             hud_updates: 0,
             verify_regions: HashMap::new(),
             gl_verify: None,
-            resend_cooldown: HashMap::new(),
             next_link_id: 0,
             pending_npcs: npcs,
             server_status,
@@ -445,12 +463,45 @@ impl App {
         if self.walk_mode {
             // Hold W: a walk through fresh terrain (turning away when
             // blocked). The trail of streamed chunks behind the player is
-            // the worst case for the terrain pool. From t=30s: fly phase
-            // (W+Space, speed ramped to the max).
+            // the worst case for the terrain pool. From t=30s: a horizontal
+            // fly phase (W at the max speed, level pitch — no climb: the
+            // long corridor is what fills the pool and evicts the walk
+            // endpoint as fog-bound trail). At t=38s: turn 180° and fly
+            // straight back along the route; back near the walk endpoint
+            // the player lands and walks through the re-entered terrain.
+            // The re-entry exercises the eviction->re-stream path: without
+            // it, the walked-back terrain would stay a hole, and the POOL
+            // missing count (the player ends the run walking through that
+            // re-entered terrain) would show it.
             input.keys.insert(Key::W);
             if self.walk_fly {
-                input.keys.insert(Key::Space);
                 self.actions.push(Action::FlyFaster); // clamps at the max
+            }
+            // Fly start: level the pitch so the flight is horizontal
+            // (fly moves along the look direction; a climb would leave the
+            // return flight landing far from the route).
+            if self.frames_total == 1800 {
+                input.mouse_dy += self.aim_pitch / 0.0024;
+            }
+            if self.frames_total == 2280 && !self.walk_return {
+                self.walk_return = true;
+                input.mouse_dx += std::f32::consts::PI / 0.0024; // 180°
+                log("WALK t=38s — turn around, fly back to the route");
+            }
+            if self.walk_return && !self.walk_flyoff {
+                let dx = self.last_player_xz[0] - self.walk_end_pos[0];
+                let dz = self.last_player_xz[1] - self.walk_end_pos[1];
+                let near = (dx * dx + dz * dz).sqrt() < 64.0;
+                if near || self.frames_total == 3300 { // fallback: t=55s
+                    self.walk_flyoff = true;
+                    self.actions.push(Action::ToggleFly); // land: walk back
+                    log(&format!(
+                        "WALK t={}s — fly off at ({:.0},{:.0}) (walk back through re-entered terrain)",
+                        self.frames_total / 60,
+                        self.last_player_xz[0],
+                        self.last_player_xz[1]
+                    ));
+                }
             }
             if self.pending_walk_jump {
                 input.keys.insert(Key::Space);
@@ -483,10 +534,13 @@ impl App {
         // actions (see the `aim_*` field docs).
         self.aim_yaw = player.yaw;
         self.aim_pitch = player.pitch;
+        self.last_player_xz = [player.pos.x, player.pos.z];
         if self.walk_mode {
             // At t=30s switch to the fly phase (max-speed straight flight).
             if self.frames_total == 1800 && !self.walk_fly {
                 self.walk_fly = true;
+                // The walk endpoint: the return flight lands here.
+                self.walk_end_pos = [player.pos.x, player.pos.z];
                 self.actions.push(Action::ToggleFly);
                 log("WALK t=30s — fly phase on");
             }
@@ -538,19 +592,15 @@ impl App {
 
         if let Some(r) = &mut self.renderer {
             r.apply_updates(updates);
-            // The terrain buffer pool may have evicted chunks that are still
-            // visible (rough terrain + a busy pool): ask the server to
-            // re-send them (budgeted, per-chunk cooldown).
-            let lost = r.take_lost();
-            for pos in lost {
-                let key = (pos.x, pos.y, pos.z);
-                if self.resend_cooldown.get(&key).map(|t| now - *t < 2.0).unwrap_or(false) {
-                    continue;
-                }
-                self.resend_cooldown.insert(key, now);
-                if let Some(u) = self.backend.request_resend(pos) {
-                    r.requeue(u);
-                }
+            // Report every chunk the pool evicted (visible or fog-bound).
+            // The streamer forgets them and re-sends the ones that are
+            // visible again (its normal stream: nearest-first, with
+            // lookahead). Without this, chunks evicted while far away —
+            // fully fogged, dropped silently — would stay holes when the
+            // player walks back over the terrain.
+            let evicted = r.take_evicted();
+            if !evicted.is_empty() {
+                self.backend.report_evicted(evicted);
             }
             let t_render = js_sys::Date::now();
             r.set_agents(agents);
@@ -656,6 +706,21 @@ impl App {
                     "PERF fps={:.0} tick={:.1} mesh={:.1} render={:.1} ms/f (frames={nf})",
                     self.fps, pt, pm, pr
                 ));
+                // Terrain pool state: chunks held, plus meshed-but-evicted
+                // chunks that are clearly visible (holes). `missing` counts
+                // chunks the client has rendered geometry for that are no
+                // longer in the pool — a sustained non-zero count means the
+                // pool is losing visible chunks (capacity too small, or the
+                // eviction->re-stream path is broken). The walk test asserts
+                // on this.
+                if let Some(r) = &self.renderer {
+                    let missing = r.missing_visible(6).len();
+                    log(&format!(
+                        "POOL chunks={} missing={}",
+                        r.chunk_count(),
+                        missing
+                    ));
+                }
             }
         }
     }

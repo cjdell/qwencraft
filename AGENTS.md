@@ -52,12 +52,12 @@ writes temp files):
 
 | Command | What it does |
 |---|---|
-| `cargo test` | All host unit tests (59: world 22, server 34, net e2e 3 incl. a wss TLS round-trip and a two-client shared-world test). The only place Rust tests run — **wasm tests can't execute here**. |
+| `cargo test` | All host unit tests (60: world 22, server 35, net e2e 3 incl. a wss TLS round-trip, a two-client shared-world test, and a worst-view-vs-pool-capacity test). The only place Rust tests run — **wasm tests can't execute here**. |
 | `./scripts/build.sh` | Release build → `web/dist` (wasm-bindgen 0.2.100). |
 | `./scripts/serve.sh` | Serve `web/dist` at `http://localhost:8080` (python3). |
 | `./scripts/serve.sh --https` | Same over TLS with a self-signed cert (`.certs/`, generated once via openssl). **Required for LAN play** — WebGPU needs a secure context. |
 | `./scripts/verify.sh` | Headless Chromium smoke test: app start, pointer lock, WebGL2 shadow-render **pixel readback** of the 3D scene, PNG export. This is the main end-to-end check. |
-| `./scripts/walk_test.sh` | ~60s scripted walk+fly in headless Chromium; asserts the terrain pool never loses or duplicates blocks (26k+ blocks, compaction safety). |
+| `./scripts/walk_test.sh` | ~80s scripted walk→fly→return-walk in headless Chromium (`SEED=N` env, default 1337); the fly phase makes a long corridor so the pool evicts the walk endpoint as fog-bound trail, then the player walks back through that re-entered terrain. Asserts no *sustained* visible holes (3+ consecutive POOL samples > 15 missing meshed-but-evicted chunks) — catches a broken eviction→re-stream path; a single-sample transient (fast re-entry) is OK. |
 | `./scripts/npc_test.sh [COUNT] [SPACING]` | Headless NPC load test (`?npcs=COUNT:SPACING`); asserts boot with the load, live count in the HUD, and that steady-state physics runs on the per-agent local block window (hit rate ≥ 99%, solid fallbacks at spawn-tick scale). |
 | `./scripts/secure_context_test.sh` | LAN-HTTP (graceful "WebGPU unavailable" message, no panic) + HTTPS startup on localhost and LAN IP. |
 | `./scripts/remote_test.sh` | Headless-server e2e: standalone `rustcraft-net` + Chromium with `?server=ws://…`; asserts connect, streamed world, GPU pixel readback of the rendered scene. |
@@ -140,11 +140,19 @@ remote mode (the world ticks on the server).
 
 ### Invariants that are easy to break
 
-- **Terrain pool capacity** (`VERT_CAP`/`IDX_CAP` in the client) is sized to
-  a *measured* worst case (`rustcraft-server/examples/pool_measure.rs`
-  measures it — run it after any change that adds vertices per chunk, e.g.
-  new mesh features). Compaction drops fog-bound chunks (Chebyshev distance
-  ≥ 8 from the player is fully fogged and safe); the walk test guards it.
+- **Terrain pool capacity** lives in `rustcraft_world` as
+  `TERRAIN_POOL_VERTS`/`TERRAIN_POOL_IDX`; the client aliases them as
+  `VERT_CAP`/`IDX_CAP`. **Do not fork the numbers in the client** — a stale
+  2M/3M fork (while the world crate said 2.5M/3.75M) left the worst-case
+  view at 93.5% of the *real* pool, so compaction dropped still-visible
+  chunks (holes that only filled on a block edit). Sized to a *measured*
+  worst case: `rustcraft-server/examples/pool_measure.rs` scans seeds and
+  the `worst_view_fits_terrain_pool_with_headroom` host test pins the known
+  worst positions — both fail if the worst view exceeds 80% of the caps.
+  Run `pool_measure` after any change that adds vertices per chunk (new
+  mesh/terrain features) and update the pins. Compaction drops fog-bound
+  chunks (Chebyshev distance ≥ 8 from the player is fully fogged and safe);
+  the walk test guards the eviction→re-stream path end to end.
 - **Chunk meshing margin**: `build_chunk_mesh` renders a 5-block margin
   beyond the 16³ chunk so faces at chunk borders agree with neighbors.
   There was a misalignment bug here once (dark scene); regression test
@@ -235,6 +243,13 @@ These are properties of *this machine/headless setup*, not code bugs:
   calls are atomic — one bad match fails the whole call.
 - `f32`/`f64` mixing requires explicit casts in Rust; physics is `f64`,
   meshing/rendering is `f32` — cast at the boundary deliberately.
+- The visible-hole metric (client `missing_visible`, the `POOL` telemetry
+  line) counts **`known`-but-not-in-pool** chunks, where `known` = chunks
+  whose mesh was **non-empty**. Do *not* switch it to the streamer's `sent`
+  set: buried (geometry-less) chunks are sent but never meshed, so a
+  sent-based count reads ~200+ "missing" on a perfectly healthy view.
+  `known`-based reads 0. (This distinction is why the walk test asserts
+  *sustained* missing, not a single high sample.)
 
 ## Testing conventions
 
@@ -251,7 +266,9 @@ These are properties of *this machine/headless setup*, not code bugs:
   cross-boundary agreement test (two neighboring chunks agree), and, if it
   renders, a mirror in `verify_gl.rs`.
 - New mesh features need a `pool_measure` re-run: the worst-case vertex
-  count must stay under ~80% of `VERT_CAP`.
+  count must stay under ~80% of `TERRAIN_POOL_VERTS`/`TERRAIN_POOL_IDX`
+  (and the `worst_view_fits_terrain_pool_with_headroom` pins updated to the
+  new worst positions).
 
 ## Definition of done (per change)
 

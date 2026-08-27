@@ -23,6 +23,10 @@ TMPDIR="${TMPDIR:-/tmp}"
 LOG="${LOG:-${TMPDIR}/rustcraft-walk.log}"
 DOM="${DOM:-${TMPDIR}/rustcraft-walk-dom.html}"
 BUDGET="${BUDGET:-90000}"
+# World seed. The pool-capacity regression lives on dense-terrain seeds
+# (e.g. SEED=888 or 31337, the worst views per pool_measure) — an
+# under-sized pool only loses chunks once the view fills it.
+SEED="${SEED:-1337}"
 
 if [ ! -f web/dist/index.html ]; then
   echo "web/dist not found — run ./scripts/build.sh first" >&2
@@ -69,7 +73,7 @@ chromium \
   --window-size=1280,720 \
   --enable-logging=stderr --v=0 \
   --virtual-time-budget="$BUDGET" \
-  --dump-dom "http://127.0.0.1:${PORT}/?walk=1" >"$DOM" 2>"$LOG" || true
+  --dump-dom "http://127.0.0.1:${PORT}/?walk=1&seed=${SEED}" >"$DOM" 2>"$LOG" || true
 
 fail=0
 check() {
@@ -88,7 +92,38 @@ check "no uncaught JS errors"      bash -c "! grep -E 'Uncaught|TypeError|Refere
 
 # The pool must not have lost chunks (the old bug).
 check "no 'pool full — chunk lost' warnings" bash -c "! grep -q 'chunk lost' '$LOG'"
-check "no chunk re-sends needed"        bash -c "! grep -q 're-send' '$LOG'"
+check "return leg ran"                  grep -q "turn around" "$LOG"
+# Terrain pool integrity: the POOL line reports chunks held + meshed-but-
+# evicted chunks that are clearly visible (holes). The run ends with the
+# player walking back through terrain evicted on the way out, so a broken
+# eviction->re-stream path (or an under-sized pool) would leave hundreds of
+# visible chunks missing. Assert the MAX over the whole run, not just the
+# final sample: a pool that thrashes (visible chunks evicted and re-queued)
+# can show holes at intermediate moments even if the final view recovered.
+POOL_LINES=$(grep -o "POOL chunks=[0-9]* missing=[0-9]*" "$LOG")
+if [ -z "$POOL_LINES" ]; then
+  echo "FAIL: no POOL telemetry in log"
+  fail=1
+else
+  POOL_LINE=$(echo "$POOL_LINES" | tail -1)
+  MISSING_LIST=$(echo "$POOL_LINES" | grep -o 'missing=[0-9]*' | cut -d= -f2 | tr '\n' ' ')
+  # The re-stream refills evicted visible chunks within a couple of app
+  # seconds, far shorter than the ~10s POOL sample interval, so a healthy
+  # run only ever shows a single-sample transient (e.g. re-entering fast
+  # after the fly phase). The bug this guards against — the user's "chunks
+  # don't render until I edit a block" — is SUSTAINED: a broken
+  # eviction->re-stream path leaves the re-entered terrain missing for the
+  # rest of the run (measured: ~27+ on sparse seeds, ~200+ on dense, across
+  # 3+ consecutive samples). So fail on a run of 3+ consecutive samples
+  # above 15, or a final sample above 15 — not on single transient spikes.
+  # (Healthy walk-back missing is ~0-10; the 15 threshold sits in the gap.)
+  python3 - $MISSING_LIST <<'PY' && echo "PASS: no sustained visible holes (missing series: $MISSING_LIST)" || { echo "FAIL: sustained visible holes (missing series: $MISSING_LIST)"; fail=1; }
+import sys
+vals = [int(v) for v in sys.argv[1:]]
+sustained = any(all(v > 15 for v in vals[i:i + 3]) for i in range(len(vals) - 2))
+sys.exit(1 if (sustained or vals[-1] > 15) else 0)
+PY
+fi
 
 # Frames kept being rendered for the whole run (PERF is logged every 20 HUD
 # updates, i.e. every ~10s of app time).
@@ -98,11 +133,14 @@ check "frame loop ran the whole time (PERF lines: $NP)" test "$NP" -ge 3
 
 # The player must actually have walked a substantial path length (the
 # walker turns around, so use the accumulated distance, not displacement),
-# and the t=30s fly phase must have engaged at near-max speed.
-WALK_LINE=$(grep -o '"WALK [^"]*"' "$LOG" | tail -1 | sed 's/"//g')
-DIST=$(echo "$WALK_LINE" | grep -o 'dist=[0-9.]*' | cut -d= -f2)
-FLY=$(echo "$WALK_LINE" | grep -o 'fly=[01]' | cut -d= -f2)
-SPEED=$(echo "$WALK_LINE" | grep -o 'speed=[0-9.]*' | cut -d= -f2)
+# and the fly phase must have engaged at near-max speed (checked on the
+# t=35s telemetry line — during the dive back: the run ends on foot,
+# walking back through the re-entered terrain — see the POOL check above).
+WALK_LAST=$(grep -o '"WALK t=[0-9]*s pos=[^"]*"' "$LOG" | tail -1 | sed 's/"//g')
+WALK_FLY=$(grep -o '"WALK t=35s[^"]*fly=[01][^"]*"' "$LOG" | tail -1 | sed 's/"//g')
+DIST=$(echo "$WALK_LAST" | grep -o 'dist=[0-9.]*' | cut -d= -f2)
+FLY=$(echo "$WALK_FLY" | grep -o 'fly=[01]' | cut -d= -f2)
+SPEED=$(echo "$WALK_FLY" | grep -o 'speed=[0-9.]*' | cut -d= -f2)
 if [ -z "$DIST" ]; then
   echo "FAIL: no WALK telemetry in log"
   fail=1

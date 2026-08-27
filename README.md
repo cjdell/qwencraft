@@ -199,11 +199,16 @@ headless Chromium (SwiftShader WebGL, lavapipe Vulkan for WebGPU):
 The WGSL itself is exercised for real: the browser compiles the actual
 WebGPU pipeline at startup, and a shader error fails renderer init.
 
-`./scripts/walk_test.sh` drives the app in `?walk=1` mode: the player
-holds W (hopping + turning when blocked by 1-step terrain) for ~60 virtual
-seconds, walking a few hundred blocks of fresh terrain. It fails if the
-terrain buffer pool loses a chunk (the "invisible landscape" bug) or if
-frames stop being rendered.
+`./scripts/walk_test.sh` drives the app in `?walk=1` mode (default
+seed 1337, `SEED=N` env): the player holds W (hopping + turning when
+blocked) for 30s, then flies a long horizontal corridor for 8s — far
+enough that the pool evicts the walk endpoint as fog-bound trail — then
+flies straight back, lands, and walks through that re-entered terrain for
+the rest of the ~80s run. It fails if the pool shows *sustained* visible
+holes (3+ consecutive samples of meshed-but-evicted chunks that should be
+rendered) — the signature of a broken eviction→re-stream path — or if
+frames stop being rendered. A brief single-sample spike while re-entering
+at speed is expected and allowed.
 
 ## Terrain buffer pool
 
@@ -211,17 +216,24 @@ All terrain chunk meshes live in one pre-allocated vertex/index buffer
 pair (`rustcraft-client`): a frame costs one `set_index_buffer` +
 `set_vertex_buffer` plus a single `draw_indexed` per chunk. When the pool
 fills, `compact_pool` drops chunks from the *farthest* first (3D Chebyshev
-distance, including Y): chunks beyond `FOG_CHUNK_DIST` are fully inside
-the fog (nearest corner past `FOG_END` blocks) and are dropped silently;
-anything closer that still has to go is reported and the embedded server
-re-sends it from its own copy (the server keeps every generated chunk).
+distance, including Y) and reports **every** eviction — fog-bound or
+visible. The client forwards the report to the server (built-in: direct
+`note_evicted`; remote: `ClientMsg::Evicted`); the streamer forgets the
+chunk and its normal stream re-sends it when it is visible again, at the
+normal stream rate. Without the report, chunks evicted while far away
+would stay holes when the player walks back over them.
 
-Capacity is sized with headroom over the measured worst case: a radius-7
-streaming sphere of the current landscape (caves, mountains, lakes, trees,
-beaches, snow) needs ~1.0-1.2M vertices in typical walking and ~1.65M at
-spawn (`rustcraft-server`'s `pool_measure` example); the pool holds
-2M vertices / 3M indices. A walk test with the cap artificially shrunken
-to 300K exercises 100+ compactions per minute with zero lost chunks.
+Capacity (`rustcraft-world`'s `TERRAIN_POOL_VERTS`/`TERRAIN_POOL_IDX`,
+aliased by the client) is sized with headroom over the measured worst
+case: the exact radius-7 streamed view needs up to ~1.87M vertices /
+~2.8M indices across seeds (`rustcraft-server`'s `pool_measure` example
+scans them; the `worst_view_fits_terrain_pool_with_headroom` unit test
+pins the known worst positions); the pool holds 2.5M vertices / 3.75M
+indices — the worst view is ~75%, leaving room for the fog-bound trail
+and fast-movement view overlap. The pool must hold the whole view, not
+just fit it: a view bigger than the pool forces compaction to drop
+still-visible chunks, which thrash on the evict/re-send loop (holes in
+the landscape that only fill when a block edit re-sends them).
 
 ## World generation
 

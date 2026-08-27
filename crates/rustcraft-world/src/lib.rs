@@ -31,6 +31,15 @@ pub const TERRAIN_MIN: i32 = 8;
 pub const REGION_MARGIN: i32 = 5;
 pub const REGION: i32 = CHUNK + 2 * REGION_MARGIN; // 26
 
+/// Client terrain-pool capacities (shared with `rustcraft-client`). These
+/// must hold the ENTIRE worst-case streamed view (the radius-7 view plus
+/// the fog-bound trail that coexists with it) — not just one chunk. They
+/// are sized by `rustcraft-server/examples/pool_measure.rs` from a multi-
+/// seed measurement of the exact streamed view; keep the worst case under
+/// ~80% of these (see AGENTS.md, "Terrain pool capacity").
+pub const TERRAIN_POOL_VERTS: u32 = 2_500_000;
+pub const TERRAIN_POOL_IDX: u32 = 3_750_000;
+
 /// Euclidean modulo (always in `0..m` for `m > 0`).
 #[inline]
 pub fn imod(a: i32, m: i32) -> i32 {

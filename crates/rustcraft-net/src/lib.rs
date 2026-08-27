@@ -231,14 +231,11 @@ fn apply_inbound(world: &Mutex<WorldState>, player_id: u32, m: ClientMsg) {
         ClientMsg::Action(a) => {
             server.push_agent_action(player_id, a);
         }
-        ClientMsg::ResendChunk(pos) => {
-            // Pool eviction: re-send this viewer's region immediately.
+        ClientMsg::Evicted(evicted) => {
+            // Pool eviction: forget the chunks for this viewer; its stream
+            // re-sends the ones that are visible again (next tick).
             if let Some(conn) = players.get_mut(&player_id) {
-                if let Some(WorldUpdate::Chunk { pos, data }) =
-                    conn.streamer.resend(server.world(), pos)
-                {
-                    let _ = conn.tx.send(ServerMsg::Chunk { pos, data });
-                }
+                conn.streamer.note_evicted(&evicted);
             }
         }
         ClientMsg::SetNpcLoad { count, spacing } => {

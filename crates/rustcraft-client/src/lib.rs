@@ -17,32 +17,34 @@ use wgpu::{
     VertexStepMode,
 };
 
-use rustcraft_server::{AgentState, WorldUpdate};
+use rustcraft_server::{AgentState, WorldUpdate, VIEW_RADIUS};
 use rustcraft_world::camera::{
     uniform_bytes, view_projection, FOG_END, FOG_START, SHADER, SKY, UNIFORM_SIZE,
 };
-use rustcraft_world::{ChunkPos, REGION_BLOCKS};
+use rustcraft_world::{ChunkPos, REGION_BLOCKS, TERRAIN_POOL_IDX, TERRAIN_POOL_VERTS};
+// Pool capacity lives in rustcraft_world so the host-side `pool_measure`
+// example can assert the worst-case view stays under ~80% of it. Do not
+// fork these numbers here (the old 2M/3M fork caused exactly the
+// visible-eviction thrash the walk test guards against).
+const IDX_CAP: u32 = TERRAIN_POOL_IDX;
+const VERT_CAP: u32 = TERRAIN_POOL_VERTS;
 
-
-/// Terrain mesh pool capacity. Chunks append into one pre-allocated
-/// vertex/index buffer pair, so a frame costs one set_index_buffer +
-/// one set_vertex_buffer plus a single draw_indexed per chunk (instead
-/// of three state changes per chunk). When the pool fills up, chunks far
-/// from the player are dropped and the survivors are compacted to the
-/// front (CPU-side copies are kept so this needs no GPU readback).
+/// Terrain mesh pool. Chunks append into one pre-allocated vertex/index
+/// buffer pair, so a frame costs one set_index_buffer + one
+/// set_vertex_buffer plus a single draw_indexed per chunk (instead of
+/// three state changes per chunk). When the pool fills up, chunks far from
+/// the player are dropped and the survivors are compacted to the front
+/// (CPU-side copies are kept so this needs no GPU readback).
 ///
-/// Capacity is sized with headroom over the measured worst case: a
-/// radius-7 streaming sphere of the current landscape (caves, mountains,
-/// lakes, trees, beaches, snow) needs ~1.0-1.2M vertices while walking and
-/// ~1.65M at spawn (see rustcraft-server's `pool_measure` example).
-const VERT_CAP: u32 = 2_000_000;
-const IDX_CAP: u32 = 3_000_000;
+/// `VERT_CAP`/`IDX_CAP` (in `rustcraft_world`) are sized to hold the
+/// ENTIRE worst-case streamed view — a view bigger than the pool forces
+/// compaction to drop still-visible chunks, which then thrash on the
+/// evict/re-send loop. Keep the worst case under ~80% of the caps
+/// (measured by rustcraft-server's `pool_measure` example).
 /// Chunks at 3D Chebyshev chunk-cell distance >= this are fully inside
 /// the fog: their nearest corner is (d-1)*16 > FOG_END blocks from the
 /// camera, so they are invisible and can be dropped without a re-send.
 /// (FOG_END = 108 blocks -> d >= 8.)
-const FOG_CHUNK_DIST: i32 = FOG_END as i32 / 16 + 2;
-
 struct TerrainChunk {
     pos: ChunkPos,
     verts: Vec<f32>,
@@ -87,9 +89,16 @@ pub struct Renderer {
     terrain_i_used: u32,
     /// Meshed terrain chunks (CPU-side copies + pool offsets).
     terrain: Vec<TerrainChunk>,
-    /// Chunks lost to pool pressure while still inside the fog range;
-    /// the app asks the server to re-send them (see `take_lost`).
-    lost: Vec<ChunkPos>,
+    /// Chunks evicted from the pool by pressure (visible or fog-bound);
+    /// the app reports them to the streamer, which re-sends the ones that
+    /// are visible again (see `take_evicted`).
+    evicted: Vec<ChunkPos>,
+    /// Every chunk ever meshed (received from the server), including
+    /// chunks since evicted by pool pressure. Telemetry only (the
+    /// `POOL` log line / `missing_visible`): a chunk that is known but not
+    /// in the pool while visible is a hole. (Re-sending itself is the
+    /// streamer's job, driven by `note_evicted`.)
+    known: std::collections::HashSet<ChunkPos>,
     /// Rate-limits the "pool full" console warning.
     pool_full_warns: u32,
     /// Agent spheres by id (HashMap: the NPC load test can push thousands
@@ -293,7 +302,8 @@ impl Renderer {
             terrain_v_used: 0,
             terrain_i_used: 0,
             terrain: Vec::new(),
-            lost: Vec::new(),
+            evicted: Vec::new(),
+            known: std::collections::HashSet::new(),
             pool_full_warns: 0,
             agents: std::collections::HashMap::new(),
             backlog: Vec::new(),
@@ -336,7 +346,8 @@ impl Renderer {
         self.backlog.clear();
         self.terrain_v_used = 0;
         self.terrain_i_used = 0;
-        self.lost.clear();
+        self.evicted.clear();
+        self.known.clear();
         self.pool_full_warns = 0;
     }
 
@@ -380,9 +391,9 @@ impl Renderer {
         }
         if self.terrain_v_used + nv > VERT_CAP || self.terrain_i_used + ni > IDX_CAP {
             // The whole pool is in-view chunks (pathological terrain):
-            // report this chunk as lost so the app can ask the server for
-            // a re-send, and warn (rate-limited).
-            self.lost.push(pos);
+            // report this chunk as evicted so the streamer keeps trying to
+            // deliver it, and warn (rate-limited).
+            self.evicted.push(pos);
             self.pool_full_warns += 1;
             if self.pool_full_warns == 1 || self.pool_full_warns % 120 == 0 {
                 web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(
@@ -424,6 +435,7 @@ impl Renderer {
         });
         self.terrain_v_used += nv;
         self.terrain_i_used += ni;
+        self.known.insert(pos);
     }
 
     /// 3D Chebyshev distance in chunk cells between `pos` and the camera.
@@ -439,10 +451,12 @@ impl Renderer {
     /// The drop decision is based on the *live* total (not the high-water
     /// mark, which may include orphaned space from replaced chunks that a
     /// plain rewrite reclaims). Chunks are dropped from the farthest (3D
-    /// Chebyshev) first: chunks fully inside the fog (`FOG_CHUNK_DIST`) are
-    /// dropped silently — they are invisible. Anything closer that still
-    /// has to go is reported via `lost` so the app can ask the server to
-    /// re-send it. Survivors are rewritten to the front of the pool.
+    /// Chebyshev) first, so the first casualties are chunks fully inside
+    /// the fog (Chebyshev distance >= FOG_END/16+2: their nearest corner is
+    /// (d-1)*16 > FOG_END blocks away — invisible). Every evicted chunk is
+    /// reported via `evicted`; the streamer re-sends a chunk only if it is
+    /// visible again, so fog-bound evictions cost nothing visually.
+    /// Survivors are rewritten to the front of the pool.
     fn compact_pool(&mut self, need_v: u32, need_i: u32) {
         let before = self.terrain.len();
         // (index, distance, vertex count, index count) per chunk — water
@@ -471,17 +485,18 @@ impl Renderer {
         let mut drop = vec![false; self.terrain.len()];
         let mut used_v = live_v;
         let mut used_i = live_i;
-        for &(i, d, vc, ic) in &ranked {
+        for &(_i, _d, vc, ic) in &ranked {
             if used_v + need_v <= VERT_CAP && used_i + need_i <= IDX_CAP {
                 break;
             }
-            drop[i] = true;
+            // Every evicted chunk is reported (visible or fog-bound): the
+            // streamer forgets it and re-sends it only if it is visible
+            // again. Fog-bound drops cost a little bookkeeping; without
+            // them, walking back over evicted terrain would leave holes.
+            self.evicted.push(self.terrain[_i].pos);
+            drop[_i] = true;
             used_v -= vc;
             used_i -= ic;
-            if d < FOG_CHUNK_DIST {
-                // Still potentially visible: report for re-send.
-                self.lost.push(self.terrain[i].pos);
-            }
         }
         let dropping = drop.iter().any(|&d| d);
         let has_orphans = self.terrain_v_used > live_v || self.terrain_i_used > live_i;
@@ -518,6 +533,26 @@ impl Renderer {
         });
         self.terrain_v_used = nv;
         self.terrain_i_used = ni;
+        // Keep `known` bounded over long exploration: once it grows past
+        // 256K entries (~8 MB), forget chunks far beyond the fog. Trade-off:
+        // if the player later returns to such distant terrain, silently
+        // evicted chunks there are no longer re-requested (holes until a
+        // block edit re-sends them). Everything within ~230 blocks is
+        // always kept, so re-entering recently visited terrain (a few km
+        // of travel) still works.
+        if self.known.len() > 262144 {
+            // (The closure can't call self.chunk_dist while `known` is
+            // mutably borrowed, so compute the camera cell up front.)
+            let cell = [
+                (self.camera[0] / 16.0).floor() as i32,
+                (self.camera[1] / 16.0).floor() as i32,
+                (self.camera[2] / 16.0).floor() as i32,
+            ];
+            self.known.retain(|c| {
+                (c.x - cell[0]).abs().max((c.y - cell[1]).abs()).max((c.z - cell[2]).abs())
+                    <= VIEW_RADIUS + 2
+            });
+        }
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
             "RustCraft: compacted terrain pool {} -> {} chunks ({} verts, {} dropped)",
             before,
@@ -527,16 +562,39 @@ impl Renderer {
         )));
     }
 
-    /// Chunks lost to pool pressure while still inside the fog range. The
-    /// app should ask the server to re-send them (budgeted, with a
-    /// per-chunk cooldown to avoid a ping-pong while the pool stays full).
-    pub fn take_lost(&mut self) -> Vec<ChunkPos> {
-        std::mem::take(&mut self.lost)
+    /// Chunks evicted from the pool since the last call (visible or
+    /// fog-bound). The app reports them to the streamer/backend via
+    /// `report_evicted`; the streamer re-sends the ones that are visible
+    /// again, at the normal stream rate.
+    pub fn take_evicted(&mut self) -> Vec<ChunkPos> {
+        std::mem::take(&mut self.evicted)
     }
 
-    /// Re-queue a world update (e.g. a server re-send of a lost chunk).
-    pub fn requeue(&mut self, update: WorldUpdate) {
-        self.backlog.push(update);
+    /// Horizontal (x/z) Chebyshev distance in chunk cells to the camera.
+    /// (The 3D distance penalises the small y offset between the camera
+    /// and the 4 chunk layers of terrain, which would hide chunks that are
+    /// clearly visible.)
+    fn chunk_dist_h(&self, pos: ChunkPos) -> i32 {
+        let cx = (self.camera[0] / 16.0).floor() as i32;
+        let cz = (self.camera[2] / 16.0).floor() as i32;
+        (pos.x - cx).abs().max((pos.z - cz).abs())
+    }
+
+    /// Chunks we have renderable geometry for (`known`) that are NOT in the
+    /// pool and within `max_dist` (horizontal Chebyshev) of the camera —
+    /// i.e. visible holes. Used by the `POOL` telemetry line (and the walk
+    /// test): a sustained non-zero count means the pool is losing visible
+    /// chunks (capacity too small, or the eviction->re-stream path is
+    /// broken). Note: `known` only ever contains chunks whose mesh was
+    /// non-empty, so buried (geometry-less) chunks never count as holes.
+    pub fn missing_visible(&self, max_dist: i32) -> Vec<ChunkPos> {
+        let in_pool: std::collections::HashSet<ChunkPos> =
+            self.terrain.iter().map(|t| t.pos).collect();
+        self.known
+            .iter()
+            .filter(|c| self.chunk_dist_h(**c) <= max_dist && !in_pool.contains(c))
+            .copied()
+            .collect()
     }
 
     /// Set the wireframe highlight target (the block under the

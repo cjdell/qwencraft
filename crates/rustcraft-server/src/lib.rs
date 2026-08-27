@@ -627,20 +627,27 @@ impl Streamer {
         std::mem::take(&mut self.queue)
     }
 
-    /// Re-send an already-generated chunk on viewer request (the viewer's
-    /// terrain buffer pool may have evicted it; the world keeps everything).
-    /// None if the chunk was never generated.
-    pub fn resend(&mut self, world: &World, pos: ChunkPos) -> Option<WorldUpdate> {
-        if world.contains(&pos) {
-            Some(WorldUpdate::Chunk { pos, data: world.region(pos) })
-        } else {
-            None
+    /// Note chunks the viewer's terrain pool evicted (compaction). The
+    /// world keeps all data — only this viewer's bookkeeping changes: the
+    /// chunks are forgotten so [`Self::tick`] re-sends the ones that are
+    /// visible again (nearest-first, at the normal stream rate). Without
+    /// this, chunks evicted while far away (fully fogged, dropped silently)
+    /// would stay holes when the viewer walks back over them.
+    pub fn note_evicted(&mut self, evicted: &[ChunkPos]) {
+        for c in evicted {
+            self.sent.remove(c);
         }
     }
 
     /// How many distinct chunk regions this viewer has been sent.
     pub fn sent_count(&self) -> usize {
         self.sent.len()
+    }
+
+    /// Whether the region for `pos` is recorded as already sent to this
+    /// viewer (i.e. the streamer won't re-send it unless it is evicted).
+    pub fn sent_contains(&self, pos: &ChunkPos) -> bool {
+        self.sent.contains(pos)
     }
 
     /// A chunk's streamed region covers its 3x3x3 chunk neighbourhood
@@ -685,7 +692,7 @@ impl Default for Streamer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustcraft_world::{Block, BlockPos, REGION_BLOCKS, WORLD_HEIGHT};
+    use rustcraft_world::{Block, BlockPos, REGION_BLOCKS, TERRAIN_POOL_IDX, TERRAIN_POOL_VERTS, WORLD_HEIGHT};
 
     fn tick_n(s: &mut Server, n: u32) {
         for _ in 0..n {
@@ -693,8 +700,75 @@ mod tests {
         }
     }
 
+    /// The pool must hold the ENTIRE worst-case streamed view (all layers,
+    /// opaque + water) with headroom — see `examples/pool_measure.rs` for
+    /// the full multi-seed scan. These are the pinned known-worst
+    /// positions from that scan: if a meshing/terrain change raises the
+    /// demand above 80% of the caps, this fails and the caps (or the
+    /// measurement) must be revisited. Keep the pins in sync with
+    /// `pool_measure` when re-running it.
     #[test]
-    fn resend_chunk_round_trips_generated_chunks() {
+    fn worst_view_fits_terrain_pool_with_headroom() {
+        let pinned: [(u64, i32, i32); 2] = [
+            (888, 120, 0), // measured worst: 1,870,648 verts
+            (888, 500, 500), // runner-up: 1,838,180 verts
+        ];
+        let mut worst = (0usize, 0usize, String::from("none"));
+        for (seed, ox, oz) in pinned {
+            let mut world = World::new(seed);
+            let pc = ChunkPos::of(BlockPos::new(ox, 0, oz));
+            // Pre-generate view + ±1 chunk halo: a chunk's region reads at
+            // most 5 blocks into each neighbour, so ±1 generated context is
+            // enough for exact meshes (missing context would sample as air
+            // and inflate boundary meshes).
+            let halo = VIEW_RADIUS + 1;
+            for dx in -halo..=halo {
+                for dz in -halo..=halo {
+                    for cy in 0..=(WORLD_HEIGHT / rustcraft_world::CHUNK) {
+                        world
+                            .generate(ChunkPos::new(pc.x + dx, cy, pc.z + dz));
+                    }
+                }
+            }
+            let mut v = 0usize;
+            let mut i = 0usize;
+            for dx in -VIEW_RADIUS..=VIEW_RADIUS {
+                for dz in -VIEW_RADIUS..=VIEW_RADIUS {
+                    if dx * dx + dz * dz > (VIEW_RADIUS + 1) * (VIEW_RADIUS + 1) {
+                        continue;
+                    }
+                    for cy in 0..(WORLD_HEIGHT / rustcraft_world::CHUNK) {
+                        let pos = ChunkPos::new(pc.x + dx, cy, pc.z + dz);
+                        let data = world.region(pos);
+                        let mesh = rustcraft_world::mesh::build_chunk_mesh(
+                            (pos.x * 16, pos.y * 16, pos.z * 16),
+                            &data,
+                        );
+                        v += mesh.vertices.len() / 6 + mesh.water_vertices.len() / 6;
+                        i += mesh.indices.len() + mesh.water_indices.len();
+                    }
+                }
+            }
+            if v > worst.0 {
+                worst = (v, i, format!("seed {seed} @ ({ox},{oz})"));
+            }
+        }
+        let v_pct = worst.0 as f64 / TERRAIN_POOL_VERTS as f64 * 100.0;
+        let i_pct = worst.1 as f64 / TERRAIN_POOL_IDX as f64 * 100.0;
+        assert!(
+            worst.0 as f64 <= TERRAIN_POOL_VERTS as f64 * 0.8,
+            "worst pinned view ({}) uses {v_pct:.0}% of TERRAIN_POOL_VERTS (> 80%): raise the caps in rustcraft-world or re-run pool_measure",
+            worst.2
+        );
+        assert!(
+            worst.1 as f64 <= TERRAIN_POOL_IDX as f64 * 0.8,
+            "worst pinned view ({}) uses {i_pct:.0}% of TERRAIN_POOL_IDX (> 80%): raise the caps in rustcraft-world or re-run pool_measure",
+            worst.2
+        );
+    }
+
+    #[test]
+    fn evicted_chunks_are_re_streamed_when_visible_again() {
         let mut s = Server::new(1337);
         let mut st = Streamer::new();
         for _ in 0..30 {
@@ -702,19 +776,46 @@ mod tests {
             let vp = s.player_state().pos;
             st.tick(s.world_mut(), vp);
         }
+        let sent_before = st.sent_count();
+        assert!(sent_before > 10, "the spawn view must have been streamed");
         let p = s.player_state().pos;
-        let pos = rustcraft_world::ChunkPos::of(rustcraft_world::BlockPos::new(
+        // The player's own chunk: evict it (the client's pool dropped it) —
+        // the streamer must re-send it on the next tick, since it is still
+        // visible.
+        let own = rustcraft_world::ChunkPos::of(rustcraft_world::BlockPos::new(
             p.x as i32,
             p.y as i32,
             p.z as i32,
         ));
-        let WorldUpdate::Chunk { data, .. } = st
-            .resend(s.world(), pos)
-            .expect("the player's own chunk must have been generated");
+        st.note_evicted(&[own]);
+        assert!(!st.sent_contains(&own), "eviction must be forgotten");
+        st.tick(s.world_mut(), p);
+        let updates = st.take();
+        let re = updates
+            .iter()
+            .find(|u| matches!(u, WorldUpdate::Chunk { pos, .. } if *pos == own))
+            .expect("the evicted, still-visible chunk must be re-sent");
+        let WorldUpdate::Chunk { data, .. } = re;
         assert_eq!(data.len(), REGION_BLOCKS, "re-send must be a full region");
-        // A chunk that was never generated (far away) is None, not an error.
-        let far = rustcraft_world::ChunkPos::new(1000, 0, 1000);
-        assert!(st.resend(s.world(), far).is_none(), "unknown chunk must be None");
+        // A chunk evicted far from the viewpoint (out of the stream radius)
+        // must NOT be re-sent — it is invisible to this viewer for now.
+        let far = rustcraft_world::ChunkPos::new(
+            own.x + VIEW_RADIUS + 5,
+            0,
+            own.z + VIEW_RADIUS + 5,
+        );
+        // Generate it first so it is a real (not unknown) chunk, then
+        // pretend the client evicted it.
+        s.world_mut().generate(far);
+        st.note_evicted(&[far]);
+        st.tick(s.world_mut(), p);
+        let updates = st.take();
+        assert!(
+            !updates
+                .iter()
+                .any(|u| matches!(u, WorldUpdate::Chunk { pos, .. } if *pos == far)),
+            "an evicted chunk outside the view must not be re-sent"
+        );
     }
 
     #[test]

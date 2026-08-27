@@ -23,12 +23,18 @@ use rustcraft_world::{BlockPos, ChunkPos};
 
 /// Protocol layout version. The server announces it in `ServerMsg::Hello`;
 /// the client refuses to play against a mismatch. Bump on any layout change.
-pub const PROTOCOL_VERSION: u8 = 1;
+///
+/// v2: `ResendChunk` (a single-chunk pull) became `Evicted` (a batch of
+/// pool-eviction reports): the server's streamer forgets the reported
+/// chunks and its normal stream re-sends the ones that are visible again,
+/// rate-limited and nearest-first — the client no longer has to track and
+/// re-request its own pool.
+pub const PROTOCOL_VERSION: u8 = 2;
 
 // ---- client -> server message types --------------------------------------
 const T_INPUT: u8 = 0x01;
 const T_ACTION: u8 = 0x02;
-const T_RESEND: u8 = 0x03;
+const T_EVICTED: u8 = 0x03;
 const T_SET_NPC_LOAD: u8 = 0x04;
 
 // ---- server -> client message types --------------------------------------
@@ -63,8 +69,11 @@ pub enum ClientMsg {
     },
     /// One-shot action (break/place carry the click-time aim).
     Action(Action),
-    /// The client's terrain pool evicted this chunk: re-send its region.
-    ResendChunk(ChunkPos),
+    /// The client's terrain pool evicted these chunks (pool compaction). The
+    /// server's streamer forgets them and re-sends the ones that are visible
+    /// again (its normal stream does this, nearest-first); without this the
+    /// server would never re-send them and they would stay holes.
+    Evicted(Vec<ChunkPos>),
     /// Set the NPC load-test dial (count, spacing) and spawn the load —
     /// the network form of `Server::set_npc_load` + `Action::NpcLoad`
     /// (armed via `?npcs=` for headless runs).
@@ -123,11 +132,14 @@ impl ClientMsg {
                 }
                 T_ACTION
             }
-            ClientMsg::ResendChunk(c) => {
-                p.i32(c.x);
-                p.i32(c.y);
-                p.i32(c.z);
-                T_RESEND
+            ClientMsg::Evicted(v) => {
+                p.u32(v.len() as u32);
+                for c in v {
+                    p.i32(c.x);
+                    p.i32(c.y);
+                    p.i32(c.z);
+                }
+                T_EVICTED
             }
             ClientMsg::SetNpcLoad { count, spacing } => {
                 p.u32(*count);
@@ -176,11 +188,19 @@ impl ClientMsg {
                 }
                 ClientMsg::Action(a)
             }
-            T_RESEND => {
-                let x = d.i32()?;
-                let y = d.i32()?;
-                let z = d.i32()?;
-                ClientMsg::ResendChunk(ChunkPos::new(x, y, z))
+            T_EVICTED => {
+                let n = d.u32()? as usize;
+                if n > 65536 {
+                    return None; // implausible eviction batch
+                }
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let x = d.i32()?;
+                    let y = d.i32()?;
+                    let z = d.i32()?;
+                    v.push(ChunkPos::new(x, y, z));
+                }
+                ClientMsg::Evicted(v)
             }
             T_SET_NPC_LOAD => {
                 let count = d.u32()?;
@@ -560,7 +580,11 @@ mod tests {
             ClientMsg::Action(Action::NpcCountDown),
             ClientMsg::Action(Action::NpcSpacingUp),
             ClientMsg::Action(Action::NpcSpacingDown),
-            ClientMsg::ResendChunk(ChunkPos::new(-4, 2, 17)),
+            ClientMsg::Evicted(vec![
+                ChunkPos::new(-4, 2, 17),
+                ChunkPos::new(0, 0, -1),
+                ChunkPos::new(123, 1, -50),
+            ]),
             ClientMsg::SetNpcLoad {
                 count: 128,
                 spacing: 24.0,
@@ -634,7 +658,7 @@ mod tests {
     #[test]
     fn decode_stream_handles_multiple_and_partial_frames() {
         let m1 = ClientMsg::Action(Action::ToggleFly);
-        let m2 = ClientMsg::ResendChunk(ChunkPos::new(1, 0, -2));
+        let m2 = ClientMsg::Evicted(vec![ChunkPos::new(1, 0, -2)]);
         let mut buf = m1.encode();
         buf.extend_from_slice(&m2.encode());
         // Append a partial third frame: it must be left unconsumed.

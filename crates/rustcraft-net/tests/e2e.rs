@@ -202,11 +202,19 @@ async fn end_to_end_single_player() {
     assert_eq!(s.npc_load, Some((8, 8.0)), "server should echo the load dial");
     assert_eq!(s.npcs, 8, "exactly 8 NPCs after SetNpcLoad");
 
-    // 6) Resend: ask for the player's own chunk region; a chunk must come back.
+    // 6) Pool eviction: report the player's own chunk as evicted — the
+    // streamer must re-send it (it is still visible), so the client can
+    // rebuild it. This is what keeps walked-back-over terrain from turning
+    // into holes.
     let p = s.player.expect("player state");
-    send(&mut sock, &ClientMsg::ResendChunk(feet_chunk(&p)));
-    let s = sample(&mut sock, 1.0);
-    assert!(s.chunks >= 1, "re-send of a generated chunk must arrive");
+    let evicted = feet_chunk(&p);
+    send(&mut sock, &ClientMsg::Evicted(vec![evicted]));
+    let s = sample(&mut sock, 2.0);
+    assert!(
+        s.chunk_positions.contains(&evicted),
+        "evicted, still-visible chunk must be re-sent by the stream (got {} chunks)",
+        s.chunks
+    );
 
     drop(sock);
 }
