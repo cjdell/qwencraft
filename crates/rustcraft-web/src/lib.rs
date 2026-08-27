@@ -1,8 +1,12 @@
 //! RustCraft browser entry point.
 //!
-//! Embeds the game server in the page (default mode; a standalone server is a
-//! later milestone) and drives it from the browser event loop: keyboard/mouse
-//! input -> server tick -> world/agent updates -> WebGPU render.
+//! Two server backends:
+//! - **built-in** (default): the game server is embedded in this wasm module
+//!   and driven directly from the browser event loop;
+//! - **remote**: a headless server (`rustcraft-net`) served over WebSocket —
+//!   pointed at via the overlay's connect panel or `?server=ws://host:port`.
+//!   The client renders server state and forwards input; it never mutates
+//!   world state (the server stays authoritative in both modes).
 //!
 //! This crate only compiles for wasm32 (browser entry point).
 
@@ -16,18 +20,151 @@ use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{HtmlCanvasElement, HtmlDivElement, KeyboardEvent, MouseEvent, Window};
+use web_sys::{
+    HtmlCanvasElement, HtmlDivElement, HtmlInputElement, KeyboardEvent, MessageEvent, MouseEvent,
+    Window,
+};
 
 use rustcraft_client::Renderer;
-use rustcraft_server::{Action, Input, Key, KeySet, Server, WorldUpdate};
+use rustcraft_server::protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
+use rustcraft_server::{
+    Action, AgentState, Input, Key, KeySet, Server, ServerStats, WorldUpdate,
+};
 use rustcraft_world::ChunkPos;
 
 fn log(msg: &str) {
     web_sys::console::log_1(&JsValue::from_str(msg));
 }
 
+/// Which server backs the game: the embedded one, or a headless one over
+/// WebSocket. The frame loop only ever talks to this abstraction.
+enum Backend {
+    Builtin(Server),
+    Remote(RemoteLink),
+}
+
+impl Backend {
+    fn set_input(&mut self, input: Input) {
+        match self {
+            Backend::Builtin(s) => s.set_input(input),
+            Backend::Remote(r) => {
+                if r.connected {
+                    r.send(ClientMsg::Input {
+                        keys: input.keys.bits(),
+                        dx: input.mouse_dx,
+                        dy: input.mouse_dy,
+                    });
+                }
+            }
+        }
+    }
+
+    fn push_action(&mut self, a: Action) {
+        match self {
+            Backend::Builtin(s) => s.push_action(a),
+            Backend::Remote(r) => {
+                if r.connected {
+                    r.send(ClientMsg::Action(a));
+                }
+            }
+        }
+    }
+
+    /// Advance the simulation. The remote backend is a no-op: its world
+    /// ticks on the server at a fixed rate, independent of this page.
+    fn tick(&mut self, dt: f64) {
+        if let Backend::Builtin(s) = self {
+            s.tick(dt);
+        }
+    }
+
+    fn take_world_updates(&mut self) -> Vec<WorldUpdate> {
+        match self {
+            Backend::Builtin(s) => s.take_world_updates(),
+            Backend::Remote(r) => std::mem::take(&mut r.inbound),
+        }
+    }
+
+    fn player_state(&self) -> AgentState {
+        match self {
+            Backend::Builtin(s) => s.player_state(),
+            Backend::Remote(r) => r.player,
+        }
+    }
+
+    fn agents(&self) -> Vec<AgentState> {
+        match self {
+            Backend::Builtin(s) => s.agents(),
+            Backend::Remote(r) => r.agents.clone(),
+        }
+    }
+
+    fn stats(&self) -> ServerStats {
+        match self {
+            Backend::Builtin(s) => s.stats(),
+            Backend::Remote(r) => r.stats,
+        }
+    }
+
+    fn npc_load_config(&self) -> (u32, f32) {
+        match self {
+            Backend::Builtin(s) => s.npc_load_config(),
+            Backend::Remote(r) => r.npc_load,
+        }
+    }
+
+    /// Ask for a chunk re-send (terrain-pool eviction). The built-in server
+    /// answers synchronously; the remote one re-sends asynchronously through
+    /// `take_world_updates`.
+    fn request_resend(&mut self, pos: ChunkPos) -> Option<WorldUpdate> {
+        match self {
+            Backend::Builtin(s) => {
+                s.resend_chunk(pos).map(|data| WorldUpdate::Chunk { pos, data })
+            }
+            Backend::Remote(r) => {
+                if r.connected {
+                    r.send(ClientMsg::ResendChunk(pos));
+                }
+                None
+            }
+        }
+    }
+}
+
+/// A live connection to a headless server. Inbound messages are applied by
+/// the WebSocket `onmessage` handler (single-threaded wasm: it runs between
+/// frame-loop turns, so no synchronization is needed); the frame loop then
+/// consumes the results.
+struct RemoteLink {
+    /// Monotonic id; handlers of a replaced link are no-ops for it.
+    id: u32,
+    ws: web_sys::WebSocket,
+    url: String,
+    /// True once the server's Hello has arrived (input flows from then on).
+    connected: bool,
+    seed: Option<u64>,
+    /// Chunk updates received, waiting for the frame loop.
+    inbound: Vec<WorldUpdate>,
+    /// Latest server state (the rendering source of truth).
+    player: AgentState,
+    agents: Vec<AgentState>,
+    stats: ServerStats,
+    npc_load: (u32, f32),
+}
+
+impl RemoteLink {
+    /// Encode and fire one client message (best-effort; the browser queues
+    /// until the socket opens and we drop sends before Hello anyway).
+    fn send(&mut self, msg: ClientMsg) {
+        let data = msg.encode();
+        let _ = self.ws.send_with_u8_array(&data);
+    }
+}
+
 struct App {
-    server: Server,
+    backend: Backend,
+    /// Seed of the built-in world (used when switching back to it).
+    builtin_seed: u64,
     renderer: Option<Renderer>,
     hud: HtmlDivElement,
     overlay: HtmlDivElement,
@@ -87,6 +224,13 @@ struct App {
     // Per-chunk cooldown for terrain-pool re-sends (avoids a ping-pong when
     // the pool stays full: (x,y,z) -> last request time, s).
     resend_cooldown: HashMap<(i32, i32, i32), f64>,
+    // Remote-server bookkeeping (the live link itself lives in `backend`).
+    next_link_id: u32,
+    /// NPC load armed via `?npcs=`, applied once a remote connection says
+    /// Hello (the built-in backend already got it in `App::new`).
+    pending_npcs: Option<(u32, f32)>,
+    /// Status line of the overlay's server-connect panel.
+    server_status: HtmlDivElement,
     // Keep event closures alive for the life of the page.
     _closures: Vec<*mut std::ffi::c_void>,
 }
@@ -96,6 +240,7 @@ impl App {
         seed: u64,
         hud: HtmlDivElement,
         overlay: HtmlDivElement,
+        server_status: HtmlDivElement,
         verify_mode: bool,
         walk_mode: bool,
         npcs: Option<(u32, f32)>,
@@ -109,7 +254,8 @@ impl App {
             actions.push(Action::NpcLoad);
         }
         App {
-            server,
+            backend: Backend::Builtin(server),
+            builtin_seed: seed,
             walk_mode,
             walk_anchor: [0.0; 2],
             walk_fly: false,
@@ -143,7 +289,80 @@ impl App {
             verify_regions: HashMap::new(),
             gl_verify: None,
             resend_cooldown: HashMap::new(),
+            next_link_id: 0,
+            pending_npcs: npcs,
+            server_status,
             _closures: Vec::new(),
+        }
+    }
+
+    /// The live remote link's id (u32::MAX when not in remote mode).
+    fn remote_id(&self) -> u32 {
+        match &self.backend {
+            Backend::Remote(r) => r.id,
+            Backend::Builtin(_) => u32::MAX,
+        }
+    }
+
+    /// Update the connect panel's status line (and the console log).
+    fn set_server_status(&mut self, msg: &str) {
+        self.server_status.set_text_content(Some(msg));
+        log(&format!("RustCraft: server: {msg}"));
+    }
+
+    /// Drop any remote link and return to a fresh built-in server.
+    fn fallback_to_builtin(&mut self) {
+        self.backend = Backend::Builtin(Server::new(self.builtin_seed));
+        // The previous world's terrain belongs to the old backend.
+        if let Some(r) = self.renderer.as_mut() {
+            r.clear_terrain();
+        }
+        self.keys = KeySet::default();
+    }
+
+    /// Apply decoded server messages to the remote link `id`.
+    fn apply_remote_messages(&mut self, id: u32, msgs: Vec<ServerMsg>, url: &str) {
+        let mut hello_seed: Option<u64> = None;
+        if let Backend::Remote(r) = &mut self.backend {
+            if r.id != id {
+                return;
+            }
+            for m in msgs {
+                match m {
+                    ServerMsg::Hello { version, seed } => {
+                        if version != PROTOCOL_VERSION {
+                            log(&format!(
+                                "RustCraft: server speaks protocol {version}, client has {PROTOCOL_VERSION} — closing"
+                            ));
+                            let _ = r.ws.close();
+                            return; // the close handler does the fallback
+                        }
+                        r.connected = true;
+                        r.seed = Some(seed);
+                        hello_seed = Some(seed);
+                        log(&format!("RustCraft: remote server connected (seed {seed})"));
+                    }
+                    ServerMsg::PlayerState(s) => r.player = s,
+                    ServerMsg::Agents(v) => r.agents = v,
+                    ServerMsg::Chunk { pos, data } => {
+                        r.inbound.push(WorldUpdate::Chunk { pos, data })
+                    }
+                    ServerMsg::Stats(s) => r.stats = s,
+                    ServerMsg::NpcLoad { count, spacing } => r.npc_load = (count, spacing),
+                }
+            }
+        } else {
+            return;
+        }
+        if let Some(seed) = hello_seed {
+            self.set_server_status(&format!("connected: {url} (seed {seed})"));
+            // ?npcs= armed before connecting: apply it now that the world
+            // is live.
+            if let Some((count, spacing)) = self.pending_npcs.take() {
+                if let Backend::Remote(r) = &mut self.backend {
+                    r.send(ClientMsg::SetNpcLoad { count, spacing });
+                }
+            }
         }
     }
 
@@ -153,7 +372,7 @@ impl App {
     /// verify.sh can reconstruct a real screenshot of the 3D scene (the
     /// WebGPU canvas itself cannot be composited in headless Chromium).
     fn run_gl_verify(&mut self) {
-        let p = self.server.player_state();
+        let p = self.backend.player_state();
         let cam = [p.pos.x, p.pos.y + rustcraft_server::agent::EYE_HEIGHT, p.pos.z];
         if self.gl_verify.is_none() {
             let doc = web_sys::window().and_then(|w| w.document());
@@ -229,15 +448,15 @@ impl App {
             input.mouse_dx += self.pending_walk_turn;
             self.pending_walk_turn = 0.0;
         }
-        self.server.set_input(input);
+        self.backend.set_input(input);
         for a in self.actions.drain(..) {
-            self.server.push_action(a);
+            self.backend.push_action(a);
         }
         let t_tick = js_sys::Date::now();
-        self.server.tick(dt);
+        self.backend.tick(dt);
         let t_mesh = js_sys::Date::now();
 
-        let updates = self.server.take_world_updates();
+        let updates = self.backend.take_world_updates();
         if self.verify_mode {
             for u in &updates {
                 match u {
@@ -247,8 +466,8 @@ impl App {
                 }
             }
         }
-        let agents = self.server.agents();
-        let player = self.server.player_state();
+        let agents = self.backend.agents();
+        let player = self.backend.player_state();
         // The rendered camera uses exactly this state; stamp it for click
         // actions (see the `aim_*` field docs).
         self.aim_yaw = player.yaw;
@@ -318,8 +537,8 @@ impl App {
                     continue;
                 }
                 self.resend_cooldown.insert(key, now);
-                if let Some(data) = self.server.resend_chunk(pos) {
-                    r.requeue(WorldUpdate::Chunk { pos, data });
+                if let Some(u) = self.backend.request_resend(pos) {
+                    r.requeue(u);
                 }
             }
             let t_render = js_sys::Date::now();
@@ -368,13 +587,13 @@ impl App {
             self.frames = 0;
             self.fps_time = now;
             self.hud_updates += 1;
-            let stats = self.server.stats();
+            let stats = self.backend.stats();
             let fly = if player.fly {
                 format!(" | FLY {:.0} b/s [F off · Q/E speed]", player.fly_speed)
             } else {
                 String::new()
             };
-            let (load_count, load_spacing) = self.server.npc_load_config();
+            let (load_count, load_spacing) = self.backend.npc_load_config();
             // NPC load-test line: the configured load, the live count, and
             // the local-block-window stats (reset when the load changes):
             // hit % = lookups served by the per-agent window instead of the
@@ -390,8 +609,21 @@ impl App {
                 "\nnpc {load_count}/{load_spacing:.0}m [N load · C clear · I/U count · [ ] spacing] (live {}) | window {hit_pct:.1}% · solid-fb {} · rebuilds {}",
                 stats.npcs, cache.solid_misses, cache.rebuilds
             );
+            // Which backend is serving the world (built-in vs. the remote
+            // server the user connected to; "connecting" while the socket
+            // is still handshaking).
+            let net = match &self.backend {
+                Backend::Builtin(_) => format!("builtin (seed {})", self.builtin_seed),
+                Backend::Remote(r) => {
+                    if r.connected {
+                        format!("{} (seed {})", r.url, r.seed.unwrap_or(0))
+                    } else {
+                        format!("connecting {}…", r.url)
+                    }
+                }
+            };
             self.hud.set_inner_html(&format!(
-                "fps {:.0} | perf tick={:.1} mesh={:.1} draw={:.1} ms/f | pos {:.0} {:.0} {:.0} | chunks {} sent / {} gen | edits {} | agents {}{}{}",
+                "fps {:.0} | perf tick={:.1} mesh={:.1} draw={:.1} ms/f | pos {:.0} {:.0} {:.0} | chunks {} sent / {} gen | edits {} | agents {} | net {}{}{}",
                 self.fps,
                 pt,
                 pm,
@@ -403,6 +635,7 @@ impl App {
                 stats.chunks_generated,
                 stats.deltas,
                 stats.agents,
+                net,
                 fly,
                 npc_line
             ));
@@ -414,6 +647,137 @@ impl App {
                 ));
             }
         }
+    }
+}
+
+/// Connect to a headless server at `url` (see `normalize_ws_url`).
+///
+/// The new backend takes over immediately (the old link is closed; its
+/// handlers stay alive but are no-ops via the link id check). Input and
+/// actions are held until the server's Hello arrives; a failed or dropped
+/// connection falls back to the built-in server so the app stays playable.
+fn connect_remote(app: &Rc<RefCell<App>>, raw_url: &str) {
+    let Some(url) = normalize_ws_url(raw_url) else {
+        app.borrow_mut()
+            .set_server_status(&format!("invalid URL: {raw_url:?} — use ws://host:port"));
+        return;
+    };
+    // Close any previous link first.
+    if let Backend::Remote(r) = &app.borrow().backend {
+        let _ = r.ws.close();
+    }
+    let Ok(ws) = web_sys::WebSocket::new(&url) else {
+        app.borrow_mut()
+            .set_server_status(&format!("invalid URL: {raw_url:?} — use ws://host:port"));
+        return;
+    };
+    // Some browser builds default the binary type to "blob"; the codec
+    // wants raw ArrayBuffer bytes.
+    ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
+    let id = {
+        let mut a = app.borrow_mut();
+        let id = a.next_link_id;
+        a.next_link_id += 1;
+        a.backend = Backend::Remote(RemoteLink {
+            id,
+            ws: ws.clone(),
+            url: url.clone(),
+            connected: false,
+            seed: None,
+            inbound: Vec::new(),
+            player: AgentState::default(),
+            agents: Vec::new(),
+            stats: ServerStats::default(),
+            npc_load: (
+                rustcraft_server::NPC_COUNT_DEFAULT,
+                rustcraft_server::NPC_SPACING_DEFAULT,
+            ),
+        });
+        // The old world's terrain belongs to the old backend.
+        if let Some(r) = a.renderer.as_mut() {
+            r.clear_terrain();
+        }
+        a.set_server_status(&format!("connecting to {url} …"));
+        id
+    };
+    log(&format!("RustCraft: connecting to {url}"));
+
+    // open
+    {
+        let app_cb = app.clone();
+        let url_cb = url.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            if app_cb.borrow().remote_id() != id {
+                return;
+            }
+            log(&format!("RustCraft: remote socket open: {url_cb}"));
+        });
+        ws.set_onopen(Some(cb.as_ref().unchecked_ref()));
+        app.borrow_mut()
+            ._closures
+            .push(Box::into_raw(Box::new(cb)) as *mut _);
+    }
+    // message
+    {
+        let app_cb = app.clone();
+        let url_cb = url.clone();
+        let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+            // Binary frames arrive as ArrayBuffers; view them as bytes.
+            let bytes = js_sys::Uint8Array::new(&e.data()).to_vec();
+            let (msgs, _) = ServerMsg::decode_stream(&bytes);
+            if msgs.is_empty() {
+                return;
+            }
+            app_cb.borrow_mut().apply_remote_messages(id, msgs, &url_cb);
+        });
+        ws.set_onmessage(Some(cb.as_ref().unchecked_ref()));
+        app.borrow_mut()
+            ._closures
+            .push(Box::into_raw(Box::new(cb)) as *mut _);
+    }
+    // close
+    {
+        let app_cb = app.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            let mut a = app_cb.borrow_mut();
+            if a.remote_id() != id {
+                return;
+            }
+            let (had_hello, url) = match &a.backend {
+                Backend::Remote(r) => (r.connected, r.url.clone()),
+                _ => return,
+            };
+            a.fallback_to_builtin();
+            if had_hello {
+                log(&format!(
+                    "RustCraft: remote server {url} disconnected — running built-in server"
+                ));
+                a.set_server_status(
+                    "disconnected — running built-in server (re-click Connect to retry)",
+                );
+            } else {
+                log(&format!(
+                    "RustCraft: remote connection to {url} failed — running built-in server"
+                ));
+                a.set_server_status(
+                    "connection failed — running built-in server (re-click Connect to retry)",
+                );
+            }
+        });
+        ws.set_onclose(Some(cb.as_ref().unchecked_ref()));
+        app.borrow_mut()
+            ._closures
+            .push(Box::into_raw(Box::new(cb)) as *mut _);
+    }
+    // error (the close event follows and performs the fallback)
+    {
+        let cb = Closure::<dyn FnMut()>::new(|| {
+            log("RustCraft: remote socket error");
+        });
+        ws.set_onerror(Some(cb.as_ref().unchecked_ref()));
+        app.borrow_mut()
+            ._closures
+            .push(Box::into_raw(Box::new(cb)) as *mut _);
     }
 }
 
@@ -439,13 +803,16 @@ fn key_from_code(code: &str) -> Option<Key> {
     }
 }
 
-fn params_from_url() -> (u64, bool, bool, Option<(u32, f32)>) {
+fn params_from_url() -> (u64, bool, bool, Option<(u32, f32)>, Option<String>) {
     let mut seed = 1337u64;
     let mut verify = false;
     let mut walk = false;
     // `npcs=COUNT[:SPACING]` starts the app with an NPC load already
     // spawned (headless load testing without a keyboard).
     let mut npcs: Option<(u32, f32)> = None;
+    // `server=ws://host:port` points the app at a headless server
+    // (pre-fills the connect panel and auto-connects; headless testing).
+    let mut server: Option<String> = None;
     if let Some(win) = web_sys::window() {
         let search = win.location().search().unwrap_or_default();
         for part in search.split('?').flat_map(|s| s.split('&')) {
@@ -473,10 +840,32 @@ fn params_from_url() -> (u64, bool, bool, Option<(u32, f32)>) {
                         npcs = Some((c, s.unwrap_or(rustcraft_server::NPC_SPACING_DEFAULT)));
                     }
                 }
+            } else if let Some(v) = part.strip_prefix("server=") {
+                if !v.is_empty() {
+                    server = Some(v.to_string());
+                }
             }
         }
     }
-    (seed, verify, walk, npcs)
+    (seed, verify, walk, npcs, server)
+}
+
+/// Accept `ws://…`, `wss://…`, or bare `host:port` (ws:// implied).
+/// Returns None for empty input or foreign schemes.
+fn normalize_ws_url(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix("ws://") {
+        (!rest.is_empty()).then(|| s.to_string())
+    } else if let Some(rest) = s.strip_prefix("wss://") {
+        (!rest.is_empty()).then(|| s.to_string())
+    } else if s.contains("://") {
+        None
+    } else {
+        Some(format!("ws://{s}"))
+    }
 }
 
 #[wasm_bindgen(start)]
@@ -497,8 +886,21 @@ pub fn start() -> Result<(), JsValue> {
         .and_then(|e| e.dyn_into::<HtmlDivElement>().ok())
         .expect("missing #overlay");
 
-    let (seed, verify_mode, walk_mode, npcs) = params_from_url();
+    let (seed, verify_mode, walk_mode, npcs, server_url_param) = params_from_url();
     log(&format!("RustCraft: app started (seed {seed})"));
+
+    let server_input = document
+        .get_element_by_id("server-url")
+        .and_then(|e| e.dyn_into::<HtmlInputElement>().ok())
+        .expect("missing #server-url");
+    let server_button = document
+        .get_element_by_id("server-connect")
+        .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+        .expect("missing #server-connect");
+    let server_status = document
+        .get_element_by_id("server-status")
+        .and_then(|e| e.dyn_into::<HtmlDivElement>().ok())
+        .expect("missing #server-status");
 
     // In verify mode the headless test never gets pointer lock, so hide the
     // "click to play" overlay to let screenshots show the rendered canvas.
@@ -516,12 +918,20 @@ pub fn start() -> Result<(), JsValue> {
         seed,
         hud.clone(),
         overlay.clone(),
+        server_status.clone(),
         verify_mode,
         walk_mode,
         npcs,
     )));
     if let Some((c, s)) = npcs {
         log(&format!("RustCraft: NPC load test armed: {c} agents @ {s:.0} m spacing"));
+    }
+    // Server-connect panel: pre-fill from ?server= and connect right away
+    // (the headless-test path); otherwise the user drives it from the UI.
+    if let Some(url) = server_url_param.as_deref() {
+        server_input.set_value(url);
+        log(&format!("RustCraft: auto-connecting to {url}"));
+        connect_remote(&app, url);
     }
 
     // ---- Input events ----------------------------------------------------
@@ -644,11 +1054,19 @@ pub fn start() -> Result<(), JsValue> {
         // Click anywhere to (re)enter pointer lock. The listener is on
         // `document`, not the canvas, because the click-to-play overlay
         // covers the canvas — a canvas-only listener would never fire while
-        // the menu is up.
-        let cb = Closure::<dyn FnMut()>::new({
+        // the menu is up. Clicks on the server-connect controls are exempt
+        // (they need a focused input / a real button click, not a lock).
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new({
             let app = app.clone();
             let canvas_for_lock = canvas.clone();
-            move || {
+            move |e: web_sys::Event| {
+                let in_controls = e
+                    .target()
+                    .and_then(|t| t.dyn_ref::<web_sys::HtmlElement>().map(|el| el.id()))
+                    .is_some_and(|id| id == "server-url" || id == "server-connect");
+                if in_controls {
+                    return;
+                }
                 let a = app.borrow();
                 if !a.locked {
                     let _ = canvas_for_lock.request_pointer_lock();
@@ -658,6 +1076,52 @@ pub fn start() -> Result<(), JsValue> {
         document
             .add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
             .expect("click listener");
+        app.borrow_mut()
+            ._closures
+            .push(Box::into_raw(Box::new(cb)) as *mut _);
+
+        // Server-connect panel: the URL field never feeds game input
+        // (typing it must not move the player), Enter connects.
+        let cb = Closure::<dyn FnMut(KeyboardEvent)>::new({
+            let app = app.clone();
+            let input_el = server_input.clone();
+            move |e: KeyboardEvent| {
+                e.stop_propagation();
+                if e.code() == "Enter" {
+                    let url = input_el.value().trim().to_string();
+                    if !url.is_empty() {
+                        connect_remote(&app, &url);
+                    }
+                }
+            }
+        });
+        server_input
+            .add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref())
+            .expect("server-url keydown listener");
+        app.borrow_mut()
+            ._closures
+            .push(Box::into_raw(Box::new(cb)) as *mut _);
+
+        // Connect button: non-empty field connects, empty field falls back
+        // to the built-in server.
+        let cb = Closure::<dyn FnMut()>::new({
+            let app = app.clone();
+            let input_el = server_input.clone();
+            move || {
+                let url = input_el.value().trim().to_string();
+                if url.is_empty() {
+                    let mut a = app.borrow_mut();
+                    let seed = a.builtin_seed;
+                    a.fallback_to_builtin();
+                    a.set_server_status(&format!("built-in server (seed {seed})"));
+                } else {
+                    connect_remote(&app, &url);
+                }
+            }
+        });
+        server_button
+            .add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
+            .expect("server-connect click listener");
         app.borrow_mut()
             ._closures
             .push(Box::into_raw(Box::new(cb)) as *mut _);

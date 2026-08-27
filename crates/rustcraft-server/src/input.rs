@@ -114,6 +114,16 @@ impl KeySet {
     pub fn contains(&self, k: Key) -> bool {
         self.bits & Self::bit(k) != 0
     }
+
+    /// Raw key bitmask (wire format).
+    pub fn bits(&self) -> u32 {
+        self.bits
+    }
+
+    /// Construct from a raw key bitmask (wire format).
+    pub fn from_bits(bits: u32) -> Self {
+        Self { bits }
+    }
 }
 
 impl Input {

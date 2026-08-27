@@ -5,6 +5,7 @@ members = [
     "crates/rustcraft-server",
     "crates/rustcraft-client",
     "crates/rustcraft-web",
+    "crates/rustcraft-net",
 ]
 
 [workspace.package]

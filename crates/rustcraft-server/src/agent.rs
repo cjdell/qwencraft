@@ -42,7 +42,7 @@ const EPS: f32 = 1e-4;
 const MOUSE_SENS: f32 = 0.0024;
 
 /// Snapshot of an agent for the client (rendering).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AgentState {
     pub id: u32,
     pub is_player: bool,
@@ -62,6 +62,26 @@ pub struct AgentState {
     /// The block under the player's crosshair (client draws a wireframe
     /// highlight around it); None when nothing is within break range.
     pub target: Option<BlockPos>,
+}
+
+impl Default for AgentState {
+    /// A stand-in player state: used by the remote client before the first
+    /// `PlayerState` message arrives.
+    fn default() -> Self {
+        AgentState {
+            id: 0,
+            is_player: true,
+            pos: crate::Vec3::new(0.0, 0.0, 0.0),
+            yaw: 0.7,
+            pitch: -0.15,
+            on_ground: false,
+            fly: false,
+            fly_speed: FLY_BASE_SPEED,
+            color: [255, 255, 255],
+            radius: 0.42,
+            target: None,
+        }
+    }
 }
 
 const NPC_COLORS: [[u8; 3]; 8] = [

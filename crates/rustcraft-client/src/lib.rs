@@ -328,6 +328,18 @@ impl Renderer {
         configure_surface(&self.surface, &self.device, self.surface_format, w, h);
     }
 
+    /// Drop all terrain (and its pool occupancy) — used when switching to a
+    /// different world (connecting to another server, or back to the
+    /// built-in one). The GPU buffers are kept; new chunks stream in fresh.
+    pub fn clear_terrain(&mut self) {
+        self.terrain.clear();
+        self.backlog.clear();
+        self.terrain_v_used = 0;
+        self.terrain_i_used = 0;
+        self.lost.clear();
+        self.pool_full_warns = 0;
+    }
+
     /// Ingest world updates; meshing is budgeted (a few chunks per frame).
     pub fn apply_updates(&mut self, updates: Vec<WorldUpdate>) {
         self.backlog.extend(updates);

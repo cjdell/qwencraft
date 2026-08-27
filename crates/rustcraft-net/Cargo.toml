@@ -1,0 +1,25 @@
+[package]
+name = "rustcraft-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless RustCraft server: WebSocket (ws://, wss://) front end over the authoritative server"
+
+[dependencies]
+rustcraft-server = { path = "../rustcraft-server" }
+
+# The server is host-only (tokio/mio do not support wasm). The target gate
+# keeps the shared workspace's `--target wasm32-unknown-unknown` build green:
+# on wasm this crate compiles to an empty lib + a stub bin (see src/main.rs).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+tokio-tungstenite = "0.30"
+futures-util = { version = "0.3", features = ["sink"] }
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
+[dev-dependencies]
+tungstenite = "0.30"
+tokio-tungstenite = { version = "0.30", features = ["__rustls-tls"] }
+rustcraft-world = { path = "../rustcraft-world" }

@@ -7,11 +7,14 @@ build, test, verify, and the environment quirks that will bite you.
 ## What this is
 
 A Minecraft-style voxel engine in Rust that runs in the browser with WebGPU.
-An **authoritative server** (infinite seeded world, physics, agents) is
-**embedded in the same wasm module** as the **renderer** (terrain meshing,
-voxel lighting + AO, translucent water, block highlight, first-person
-controls). There is no network layer yet — server and client talk through
-direct function calls in one wasm module; a standalone server is planned.
+An **authoritative server** (infinite seeded world, physics, agents) runs
+**two ways**: **embedded in the same wasm module** as the **renderer**
+(terrain meshing, voxel lighting + AO, translucent water, block highlight,
+first-person controls; direct function calls, no network), or **headless**
+(`rustcraft-net`, a tokio WebSocket server — one world per connection,
+`ws://`/`wss://`). The client renders whatever a `Backend` gives it and
+forwards input; it never mutates world state (golden rule 4 holds for both
+transports). The wire codec lives in `rustcraft-server::protocol`.
 
 ## Golden rules
 
@@ -47,7 +50,7 @@ writes temp files):
 
 | Command | What it does |
 |---|---|
-| `cargo test` | All host unit tests (42; world + server). The only place Rust tests run — **wasm tests can't execute here**. |
+| `cargo test` | All host unit tests (57: world 22, server 32, net e2e 3 incl. a wss TLS round-trip). The only place Rust tests run — **wasm tests can't execute here**. |
 | `./scripts/build.sh` | Release build → `web/dist` (wasm-bindgen 0.2.100). |
 | `./scripts/serve.sh` | Serve `web/dist` at `http://localhost:8080` (python3). |
 | `./scripts/serve.sh --https` | Same over TLS with a self-signed cert (`.certs/`, generated once via openssl). **Required for LAN play** — WebGPU needs a secure context. |
@@ -55,9 +58,7 @@ writes temp files):
 | `./scripts/walk_test.sh` | ~60s scripted walk+fly in headless Chromium; asserts the terrain pool never loses or duplicates blocks (26k+ blocks, compaction safety). |
 | `./scripts/npc_test.sh [COUNT] [SPACING]` | Headless NPC load test (`?npcs=COUNT:SPACING`); asserts boot with the load, live count in the HUD, and that steady-state physics runs on the per-agent local block window (hit rate ≥ 99%, solid fallbacks at spawn-tick scale). |
 | `./scripts/secure_context_test.sh` | LAN-HTTP (graceful "WebGPU unavailable" message, no panic) + HTTPS startup on localhost and LAN IP. |
-
-`cargo test` is fast (~7s); `build.sh` + `verify.sh` is the slow path
-(~2–4 min total). Run the full set before committing anything user-visible.
+| `./scripts/remote_test.sh` | Headless-server e2e: standalone `rustcraft-net` + Chromium with `?server=ws://…`; asserts connect, streamed world, GPU pixel readback of the rendered scene. |
 
 ## Architecture map
 
@@ -75,13 +76,32 @@ crates/
                       touch the chunk buffers; edits invalidate it),
                       NPC load test (Action::Npc*, phyllotaxis spawn),
                       world deltas, block highlight target, spawn scan.
+                      protocol.rs = versioned little-endian binary wire
+                      codec (ClientMsg/ServerMsg, encode/decode/decode_-
+                      stream) shared by both transports; pure + host-
+                      testable, no deps.
+  rustcraft-net/      HEADLESS server binary. tokio + tokio-tungstenite
+                      WebSocket front end (ws://, wss:// via --cert/--key);
+                      one Server world per connection, 60Hz tick loop,
+                      per-session reader task. HOST-ONLY: deps are
+                      cfg(not(target_arch = "wasm32"))-gated so the shared
+                      workspace wasm build stays green (empty lib + stub
+                      bin on wasm). e2e tests (tests/e2e.rs) run a real
+                      sync WebSocket client against serve(), incl. a
+                      wss round-trip with an openssl-generated
+                      self-signed cert.
   rustcraft-client/   WebGPU renderer. Terrain buffer POOL (one 2M-vertex
                       vbo/ibo, chunks own index ranges, compaction when
                       full), opaque+water pipelines (translucent water
-                      pass), agent spheres, wireframe block highlight.
-  rustcraft-web/      wasm glue. Embeds the server, wires input
-                      (pointer-lock mouse, keyboard, aim-stamped clicks),
-                      state sync, HUD. verify_gl.rs = WebGL2 "shadow
+                      pass), agent spheres, wireframe block highlight,
+                      clear_terrain() for world switches.
+  rustcraft-web/      wasm glue. Backend { Builtin(Server), Remote } — the
+                      frame loop talks only to the Backend; remote mode
+                      decodes ServerMsg frames into the same
+                      WorldUpdate/AgentState shapes, forwards input/
+                      actions as ClientMsg. Connect panel (start screen)
+                      + ?server=ws://… param; failed connect falls back
+                      to builtin. verify_gl.rs = WebGL2 "shadow
                       renderer" that re-renders the scene for headless
                       pixel verification.
 web/                  index.html (HUD, overlay) + dist/ (build output).
@@ -92,7 +112,11 @@ scripts/              build.sh, serve.sh, verify.sh, walk_test.sh,
 Data flow per frame: input → `Server::push_action` → (fixed-tick)
 `Server::tick` → `player_state()`/delta sync → client uploads changed
 chunks to the terrain pool → WebGPU render pass (opaque → water → agents →
-highlight).
+highlight). In remote mode the same flow crosses the wire: input →
+`ClientMsg` (WebSocket) → server ticks at 60 Hz → `ServerMsg` frames →
+client's `RemoteLink` folds them into the Backend's state → same render
+pass. The client's `tick()` is a no-op in remote mode (the world ticks on
+the server).
 
 ### Invariants that are easy to break
 
@@ -125,6 +149,20 @@ highlight).
 - **Frame pacing**: an 8ms min-frame guard + rAF *and* 16ms `setInterval`
   drive the loop. Headless Chromium never fires rAF — the interval is what
   keeps the app alive there. Don't "clean up" the interval.
+- **WebSocket binaryType**: this headless Chromium reports the socket
+  default as `"blob"` (spec says `"arraybuffer"`), so incoming frames
+  arrive as Blobs and `Uint8Array(blob)` throws — the connection silently
+  delivers *nothing* (onopen fires, onmessage never does). `connect_remote`
+  sets `BinaryType::Arraybuffer` explicitly; keep that. Symptom if it
+  regresses: "remote socket open" logged but never "remote server
+  connected".
+- **Virtual time vs cold SwiftShader**: under `--virtual-time-budget`, a
+  *cold* WebGPU device init can consume ~20s of virtual time while the
+  16ms interval fast-forwards (frames run before the renderer exists); a
+  warm init costs ~1s. verify.sh's budget is 40s for exactly this reason —
+  don't lower it. Remote mode can't use virtual time at all (a live 60 Hz
+  WebSocket never quiesces, so virtual time stalls): `remote_test.sh` runs
+  in real time with a wall-clock timeout instead.
 
 ## Environment quirks (read before debugging "it's broken")
 
@@ -206,7 +244,9 @@ These are properties of *this machine/headless setup*, not code bugs:
 4. For anything touching the pool, streaming, or world sync:
    `./scripts/walk_test.sh` — "WALK TEST PASSED".
 5. For anything touching startup/context: `./scripts/secure_context_test.sh`.
-6. Update README.md if user-visible behavior changed; keep the version
+6. For anything touching the protocol, `rustcraft-net`, or the remote
+   backend: `./scripts/remote_test.sh` — "ALL CHECKS PASSED".
+7. Update README.md if user-visible behavior changed; keep the version
    pins in lockstep if you touched them.
-7. Commit on `main` with a message explaining *why* (root cause), not just
+8. Commit on `main` with a message explaining *why* (root cause), not just
    *what*.

@@ -28,6 +28,20 @@
     #overlay h1 { margin: 0 0 8px; font-size: 22px; letter-spacing: 2px; }
     #overlay p { margin: 4px 0; opacity: 0.85; }
     #overlay .seed { opacity: 0.6; font-size: 12px; margin-top: 12px; }
+    #overlay .server-row { margin-top: 14px; display: flex; gap: 8px; justify-content: center; }
+    #overlay #server-url {
+      font: 13px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      background: rgba(10, 12, 18, 0.9); color: #cde3ff; border: 1px solid rgba(120, 150, 200, 0.4);
+      border-radius: 6px; padding: 6px 10px; width: 260px; text-align: left;
+    }
+    #overlay #server-url:focus { outline: none; border-color: rgba(140, 180, 255, 0.9); }
+    #overlay #server-connect {
+      font: 13px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      background: rgba(60, 90, 150, 0.55); color: #fff; border: 1px solid rgba(120, 150, 200, 0.5);
+      border-radius: 6px; padding: 6px 14px; cursor: pointer;
+    }
+    #overlay #server-connect:hover { background: rgba(80, 120, 190, 0.75); }
+    #overlay #server-status { margin-top: 6px; font-size: 12px; opacity: 0.7; min-height: 14px; }
   </style>
 </head>
 <body>
@@ -43,6 +57,12 @@
       <p>Left click break &nbsp;·&nbsp; Right click place stone &nbsp;·&nbsp; Esc release mouse</p>
       <p>NPC load test: N spawn &nbsp;·&nbsp; C clear &nbsp;·&nbsp; I/U count ×2 ÷2 &nbsp;·&nbsp; [ ] spacing</p>
       <p>The black outline shows the block you'll break / place against</p>
+      <div class="server-row">
+        <input id="server-url" type="text" spellcheck="false" autocomplete="off"
+               placeholder="ws://host:port — blank = built-in server" />
+        <button id="server-connect" type="button">Connect</button>
+      </div>
+      <div id="server-status">built-in server</div>
       <p class="seed" id="seedline"></p>
     </div>
   </div>

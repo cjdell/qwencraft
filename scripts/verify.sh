@@ -21,7 +21,10 @@ PORT="${PORT:-$((20000 + RANDOM % 20000))}"
 SHOT="${SHOT:-${TMPDIR:-/tmp}/rustcraft-shot.png}"
 LOG="${LOG:-${TMPDIR:-/tmp}/rustcraft-chrome.log}"
 DOM="${DOM:-${TMPDIR:-/tmp}/rustcraft-dom.html}"
-BUDGET="${BUDGET:-25000}"
+# 40s virtual budget: a COLD SwiftShader device init can consume ~20s of
+# virtual time while the 16ms interval fast-forwards (the first run after a
+# while); 25s left no budget for the frame-410 pixel readback.
+BUDGET="${BUDGET:-40000}"
 # The app streams the WebGL2 shadow-rendered scene as base64 VERIFY_PNG
 # chunks; we reconstruct a real PNG screenshot of the 3D view here.
 SCENE_PNG="${SCENE_PNG:-${TMPDIR:-/tmp}/rustcraft-scene.png}"

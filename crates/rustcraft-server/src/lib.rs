@@ -13,6 +13,7 @@
 
 pub mod agent;
 pub mod local_block_cache;
+pub mod protocol;
 pub mod sphere;
 pub mod world;
 
@@ -503,7 +504,7 @@ impl Server {
 }
 
 /// HUD-facing statistics.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ServerStats {
     pub chunks_generated: usize,
     pub chunks_sent: usize,
@@ -1142,7 +1143,7 @@ mod tests {
 }
 
 /// Minimal 3D vector (avoids a glam dependency in the server).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Vec3 {
     pub x: f32,
     pub y: f32,
