@@ -16,12 +16,14 @@
 #[cfg(not(target_arch = "wasm32"))]
 const USAGE: &str = "\
 usage: rustcraft-net [options]
-  --seed N     world seed (default 1337)
-  --port N     listen port (default 9000; 0 = let the OS pick)
-  --bind IP    interface to bind (default 0.0.0.0)
-  --cert FILE  TLS certificate (PEM) — with --key, serves wss://
-  --key FILE   TLS private key (PEM, RSA or PKCS#8)
-  -h, --help   this help";
+  --seed N       world seed (default 1337)
+  --port N       WebSocket listen port (default 9000; 0 = let the OS pick)
+  --bind IP      interface to bind (default 0.0.0.0)
+  --cert FILE    TLS certificate (PEM) — with --key, serves wss://
+  --key FILE     TLS private key (PEM, RSA or PKCS#8)
+  --http-port N  dashboard HTTP port (default 9001; 0 = let the OS pick)
+  --no-http      disable the dashboard HTTP server
+  -h, --help     this help";
 
 #[cfg(not(target_arch = "wasm32"))]
 fn next_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
@@ -65,6 +67,14 @@ fn parse_opts(args: &[String]) -> Result<rustcraft_net::ServerOptions, String> {
             "--key" => {
                 opts.key = Some(std::path::PathBuf::from(next_value(args, &mut i, "--key")?))
             }
+            "--http-port" => {
+                opts.http_port = Some(
+                    next_value(args, &mut i, "--http-port")?
+                        .parse()
+                        .map_err(|e| format!("--http-port: {e}"))?,
+                )
+            }
+            "--no-http" => opts.http_port = None,
             other => return Err(format!("unknown option {other:?} (see --help)")),
         }
     }
@@ -83,8 +93,11 @@ async fn main() {
         }
     };
     match rustcraft_net::serve(opts).await {
-        Ok(addr) => {
-            eprintln!("rustcraft-net: ready (connect a browser to ws://{addr})");
+        Ok(endpoints) => {
+            eprintln!("rustcraft-net: ready (connect a browser to ws://{})", endpoints.ws);
+            if let Some(h) = endpoints.http {
+                eprintln!("rustcraft-net: dashboard at http://{h}");
+            }
             let _ = tokio::signal::ctrl_c().await;
             eprintln!("rustcraft-net: shutting down");
         }

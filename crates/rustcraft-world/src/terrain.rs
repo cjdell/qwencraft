@@ -122,6 +122,22 @@ impl WorldGen {
         self.tree_at_h(x, z, h, |x, z| self.height(x, z))
     }
 
+    /// `tree_at` with an explicit, persistent column-height cache: callers
+    /// that scan many columns (the server dashboard's minimap) reuse
+    /// already-computed heights within and between calls — terrain heights
+    /// are immutable, so the cache is safe forever.
+    pub fn tree_at_cached(
+        &self,
+        x: i32,
+        z: i32,
+        heights: &mut HashMap<(i32, i32), i32>,
+    ) -> Option<Tree> {
+        let h = *heights.entry((x, z)).or_insert_with(|| self.height(x, z));
+        self.tree_at_h(x, z, h, |nx, nz| {
+            *heights.entry((nx, nz)).or_insert_with(|| self.height(nx, nz))
+        })
+    }
+
     /// `tree_at` with a height oracle (used to amortise noise calls when
     /// scanning a chunk's halo, where heights are already known/cached).
     fn tree_at_h(
@@ -607,5 +623,26 @@ mod tests {
             Block::from_u8(a[crate::chunk_index(wa.local())]),
             expect_a
         );
+    }
+
+    /// The cached tree lookup must agree with the plain one, and must keep
+    /// the supplied height cache correct (it is the dashboard's map source).
+    #[test]
+    fn tree_at_cached_matches_tree_at() {
+        let g = WorldGen::new(1337);
+        let mut cache: HashMap<(i32, i32), i32> = HashMap::new();
+        let mut trees = 0;
+        for z in -48..48 {
+            for x in -48..48 {
+                let cached = g.tree_at_cached(x, z, &mut cache);
+                assert_eq!(cached, g.tree_at(x, z), "mismatch at ({x},{z})");
+                // The cache must hold the exact height for the column.
+                assert_eq!(cache[&(x, z)], g.height(x, z));
+                if cached.is_some() {
+                    trees += 1;
+                }
+            }
+        }
+        assert!(trees > 50, "expected plenty of trees in a 96x96 area, got {trees}");
     }
 }

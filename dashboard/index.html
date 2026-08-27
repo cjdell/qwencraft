@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RustCraft server</title>
+    <link rel="stylesheet" href="./dashboard.css" />
+  </head>
+  <body>
+    <!-- dioxus mounts here (default root id "main") -->
+    <div id="main"></div>
+    <noscript>
+      <p style="font-family: monospace; padding: 2rem">
+        The RustCraft dashboard needs JavaScript (it is a wasm dioxus app).
+      </p>
+    </noscript>
+    <script type="module">
+      import init, { start } from "./rustcraft_dashboard.js";
+      init()
+        .then(start)
+        .catch((e) => {
+          document
+            .getElementById("main")
+            .replaceWith(Object.assign(document.createElement("pre"), {
+              style: "color:#f66;font-family:monospace;padding:2rem",
+              textContent: "dashboard failed to start: " + e,
+            }));
+          console.error("dashboard init failed", e);
+        });
+    </script>
+  </body>
+</html>

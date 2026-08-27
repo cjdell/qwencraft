@@ -5,6 +5,7 @@
 //! Runs on a multi-threaded runtime: the client below blocks on socket
 //! reads while the server task ticks in the background.
 
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use rustcraft_net::{serve, ServerOptions};
@@ -129,13 +130,15 @@ fn break_under_feet(sock: &mut Sock, p: &rustcraft_server::AgentState) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn end_to_end_single_player() {
-    let addr = serve(ServerOptions {
+    let ep = serve(ServerOptions {
         seed: SEED,
         port: 0,
+        http_port: None, // keep the fixed default (9001) free for other tests
         ..Default::default()
     })
     .await
     .expect("serve");
+    let addr = ep.ws;
     let (mut sock, _) = connect(&format!("ws://{addr}")).expect("connect");
 
     // 1) Hello with our protocol version and seed.
@@ -221,14 +224,15 @@ async fn end_to_end_single_player() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_connections_share_one_world() {
-    let addr = serve(ServerOptions {
+    let ep = serve(ServerOptions {
         seed: SEED,
         port: 0,
+        http_port: None, // keep the fixed default (9001) free for other tests
         ..Default::default()
     })
     .await
     .expect("serve");
-    let url = format!("ws://{addr}");
+    let url = format!("ws://{}", ep.ws);
     let (mut a, _) = connect(&url).expect("connect A");
     let (mut b, _) = connect(&url).expect("connect B");
 
@@ -310,15 +314,18 @@ async fn wss_serves_encrypted_sessions() {
         .expect("spawn openssl");
     assert!(status.success(), "openssl could not generate a self-signed cert");
 
-    let addr = serve(ServerOptions {
+    let ep = serve(ServerOptions {
         seed: SEED,
         port: 0,
         bind: "127.0.0.1".parse().unwrap(),
         cert: Some(cert.clone()),
         key: Some(key.clone()),
+        http_port: None, // TLS test: no dashboard needed
     })
     .await
     .expect("serve wss");
+    let addr = ep.ws;
+    assert!(ep.http.is_none());
 
     // Client trusting only the self-signed cert above.
     let cert_pem = std::fs::read_to_string(&cert).unwrap();
@@ -363,4 +370,123 @@ fn which(bin: &str) -> Option<String> {
             candidate.is_file().then(|| candidate.to_string_lossy().into_owned())
         })
     })
+}
+
+/// Minimal synchronous HTTP GET against the dashboard server (the server
+/// answers `Connection: close`, so read-to-EOF gives the full response).
+/// Returns (status code, content-type, body).
+async fn http_get(addr: &SocketAddr, target: &str) -> (u16, String, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("http connect");
+    let req = format!(
+        "GET {target} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    );
+    tcp.write_all(req.as_bytes())
+        .await
+        .expect("http write");
+    let mut buf = Vec::new();
+    tcp.read_to_end(&mut buf).await.expect("http read");
+    let head_end = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("response head terminator");
+    let head = String::from_utf8_lossy(&buf[..head_end]);
+    let body = buf[head_end + 4..].to_vec();
+    let mut lines = head.lines();
+    let code: u16 = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let mut ctype = String::new();
+    for l in lines {
+        if let Some(v) = l.strip_prefix("Content-Type: ") {
+            ctype = v.trim().to_string();
+        }
+    }
+    (code, ctype, body)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dashboard_http_serves_status_map_and_assets() {
+    let ep = serve(ServerOptions {
+        seed: SEED,
+        port: 0,
+        http_port: Some(0),
+        ..Default::default()
+    })
+    .await
+    .expect("serve");
+    let http = ep.http.expect("http enabled by default in this test");
+
+    // Health probe.
+    let (code, _ct, body) = http_get(&http, "/healthz").await;
+    assert_eq!(code, 200);
+    assert_eq!(body, b"ok");
+
+    // Status before any client: no players, seed present, startup logged.
+    let (code, ct, body) = http_get(&http, "/api/status").await;
+    assert_eq!(code, 200);
+    assert!(ct.contains("application/json"), "{ct}");
+    let s = String::from_utf8_lossy(&body).into_owned();
+    assert!(s.contains(&format!("\"seed\":{SEED}")), "status: {s}");
+    assert!(s.contains("\"players\":0"), "status: {s}");
+    assert!(s.contains("server started"), "event log: {s}");
+
+    // The dashboard page + its assets (the embedded dioxus build).
+    let (code, ct, body) = http_get(&http, "/").await;
+    assert_eq!(code, 200);
+    assert!(ct.contains("text/html"));
+    assert!(String::from_utf8_lossy(&body).contains("RustCraft"));
+    let (code, ct, _) = http_get(&http, "/rustcraft_dashboard.js").await;
+    assert_eq!(code, 200);
+    assert!(ct.contains("javascript"), "{ct}");
+    let (code, ct, body) = http_get(&http, "/rustcraft_dashboard_bg.wasm").await;
+    assert_eq!(code, 200);
+    assert_eq!(ct, "application/wasm");
+    assert!(body.len() > 10_000, "wasm asset looks empty: {} bytes", body.len());
+    let (code, _ct, _) = http_get(&http, "/dashboard.css").await;
+    assert_eq!(code, 200);
+
+    // A player joins over ws: the status must reflect it (agent + event).
+    let (mut sock, _) = connect(&format!("ws://{}", ep.ws)).expect("connect");
+    expect_hello(&mut sock, "conn");
+    let _ = sample(&mut sock, 0.5);
+    let (_, _, body) = http_get(&http, "/api/status").await;
+    let s = String::from_utf8_lossy(&body).into_owned();
+    assert!(s.contains("\"players\":1"), "status: {s}");
+    assert!(s.contains("\"player\":true"), "agent present: {s}");
+    assert!(s.contains("joined"), "join event: {s}");
+
+    // Map: 64x64 region = 64*64*2 bytes, mostly non-air near spawn, and
+    // the origin header echoes the clamped region.
+    let (code, _ct, body) = http_get(&http, "/api/map?x=8&z=8&w=64&h=64").await;
+    assert_eq!(code, 200);
+    assert_eq!(body.len(), 64 * 64 * 2);
+    let mut non_air = 0usize;
+    let mut i = 0;
+    while i < body.len() {
+        if body[i + 1] != 0 {
+            non_air += 1;
+        }
+        i += 2;
+    }
+    assert!(
+        non_air > 64 * 64 / 2,
+        "map near spawn should be mostly non-air (got {non_air})"
+    );
+
+    // Oversized requests clamp to the max side (256), tiny ones to the min.
+    let (_, _, body) = http_get(&http, "/api/map?x=8&z=8&w=4096&h=4096").await;
+    assert_eq!(body.len(), 256 * 256 * 2);
+    let (_, _, body) = http_get(&http, "/api/map?x=8&z=8&w=1&h=1").await;
+    assert_eq!(body.len(), 16 * 16 * 2);
+
+    // Unknown paths 404.
+    let (code, _, _) = http_get(&http, "/nope").await;
+    assert_eq!(code, 404);
+
+    drop(sock);
 }

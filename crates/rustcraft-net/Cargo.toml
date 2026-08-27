@@ -7,6 +7,7 @@ description = "Headless RustCraft server: WebSocket (ws://, wss://) front end ov
 
 [dependencies]
 rustcraft-server = { path = "../rustcraft-server" }
+rustcraft-world = { path = "../rustcraft-world" }
 
 # The server is host-only (tokio/mio do not support wasm). The target gate
 # keeps the shared workspace's `--target wasm32-unknown-unknown` build green:
@@ -18,6 +19,7 @@ futures-util = { version = "0.3", features = ["sink"] }
 rustls = "0.23"
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+include_dir = "0.7"
 
 [dev-dependencies]
 tungstenite = "0.30"

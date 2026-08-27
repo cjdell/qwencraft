@@ -36,6 +36,7 @@ nix develop
 ./scripts/npc_test.sh  # headless NPC load test (physics on cached surfaces)
 ./scripts/secure_context_test.sh  # secure-context / HTTPS regression test
 ./scripts/remote_test.sh          # headless-server + browser end-to-end test
+./scripts/dashboard_test.sh       # server dashboard end-to-end test
 cargo test             # host unit tests (worldgen, physics, streaming, …)
 
 # headless server (separate process, one shared world for all connections):
@@ -157,6 +158,38 @@ to the embedded server automatically. `./scripts/remote_test.sh` runs the
 whole loop headlessly: standalone server + two Chromium browsers in remote
 mode on the same shared world, asserting both connect, the server sees both
 players, the world streams, and a GPU pixel readback of the rendered scene.
+
+## Server dashboard
+
+`rustcraft-net` also runs a small **HTTP dashboard** (separate port, default
+**9001**; `--http-port N`, `--no-http` to disable) so you can jump onto a
+server and see what's going on without launching a game client:
+
+```
+cargo run -p rustcraft-net --release -- --seed 1337 --port 9000 --http-port 9001
+# → http://192.168.49.50:9001
+```
+
+It shows the **live connection count** (players + NPCs), an **event log**
+(joins/leaves, block break/place, fly toggles, NPC loads — capped at 256
+entries), and a **2D minimap**: a top-down view of the world's surface
+(grass/water/sand/snow/stone, tree canopies) with players and NPCs plotted
+on top (players labelled, with a “focus” button). Drag to pan, wheel to
+zoom (16–256 block views). The map is computed from the *pure* terrain
+function plus the world's edit history (so it is exact modulo flowers and
+canopy overhang, invisible at 1 px/block), and it updates within a tick of
+any block edit made by a connected player.
+
+The dashboard is a dioxus (wasm) app in its own workspace under
+`dashboard/` — built by `./scripts/build_dashboard.sh` into
+`dashboard/dist/`, which is **embedded into the server binary**
+(`include_dir!`), so the server has no filesystem dependencies at runtime.
+After changing dashboard sources: rebuild dist, rebuild `rustcraft-net`,
+and commit the new `dashboard/dist` (the assets are versioned with the
+binary). `./scripts/dashboard_test.sh` covers the whole loop headlessly:
+HTTP endpoint checks + Chromium on the page (DOM shows the live server,
+screenshot shows the rendered map). The HTTP side is also covered by the
+`rustcraft-net` e2e tests (`/healthz`, `/api/status`, `/api/map`, assets).
 
 ## NPC load test
 

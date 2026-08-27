@@ -18,6 +18,14 @@ streaming window, and players see each other and each other's edits; `ws://`
 input; it never mutates world state (golden rule 4 holds for both
 transports). The wire codec lives in `rustcraft-server::protocol`.
 
+`rustcraft-net` additionally runs a small **dashboard** over HTTP (default
+port 9001): a dioxus (wasm) app — player/NPC counts, an event log, and a
+pan/zoom 2D minimap of the world with agents plotted — served from
+`dashboard/dist`, which is embedded into the server binary via
+`include_dir!` (the built assets are committed). The map is computed off
+the tick path from the pure terrain function + the world's edit history,
+never touching the authoritative world's lock.
+
 ## Golden rules
 
 1. **Everything runs through the Nix shell.** Never call host `rustc`/
@@ -32,8 +40,13 @@ transports). The wire codec lives in `rustcraft-server::protocol`.
    - `wgpu = "27.0.1"`
    - `wasm-bindgen = "=0.2.100"`, `js-sys = "=0.3.77"`,
      `web-sys = "=0.3.77"`, `wasm-bindgen-futures = "=0.4.45"`
+   - The dashboard workspace (`dashboard/Cargo.toml`) pins the same
+     `wasm-bindgen =0.2.100` / `js-sys` / `web-sys` (its
+     `wasm-bindgen-futures` is `=0.4.50` — the release that pairs with
+     0.2.100/0.3.77).
    - `pkgs.wasm-bindgen-cli` in `flake.nix` must match the crate pin
-     exactly (mismatch → broken `web/dist` with "unsupported version" at load).
+     exactly (mismatch → broken `web/dist` with "unsupported version" at
+     load). `scripts/build_dashboard.sh` asserts CLI == lockfile version.
 4. **The server is authoritative.** The client renders and forwards input;
    it never mutates world state. All block edits, physics, and spawning are
    server decisions. Keep it that way.
@@ -52,7 +65,7 @@ writes temp files):
 
 | Command | What it does |
 |---|---|
-| `cargo test` | All host unit tests (60: world 22, server 35, net e2e 3 incl. a wss TLS round-trip, a two-client shared-world test, and a worst-view-vs-pool-capacity test). The only place Rust tests run — **wasm tests can't execute here**. |
+| `cargo test` | All host unit tests (67: world 23, server 36, net lib 4 — the dashboard map, net e2e 4 incl. a wss TLS round-trip, a two-client shared-world test, and a dashboard HTTP test). The only place Rust tests run — **wasm tests can't execute here**. |
 | `./scripts/build.sh` | Release build → `web/dist` (wasm-bindgen 0.2.100). |
 | `./scripts/serve.sh` | Serve `web/dist` at `http://localhost:8080` (python3). |
 | `./scripts/serve.sh --https` | Same over TLS with a self-signed cert (`.certs/`, generated once via openssl). **Required for LAN play** — WebGPU needs a secure context. |
@@ -61,6 +74,8 @@ writes temp files):
 | `./scripts/npc_test.sh [COUNT] [SPACING]` | Headless NPC load test (`?npcs=COUNT:SPACING`); asserts boot with the load, live count in the HUD, and that steady-state physics runs on the per-agent local block window (hit rate ≥ 99%, solid fallbacks at spawn-tick scale). |
 | `./scripts/secure_context_test.sh` | LAN-HTTP (graceful "WebGPU unavailable" message, no panic) + HTTPS startup on localhost and LAN IP. |
 | `./scripts/remote_test.sh` | Headless-server e2e: standalone `rustcraft-net` + Chromium with `?server=ws://…`; asserts connect, streamed world, GPU pixel readback of the rendered scene. |
+| `./scripts/build_dashboard.sh` | Builds the dashboard (its own wasm workspace) → `dashboard/dist` (wasm-bindgen + html/css). The dist is **embedded into the `rustcraft-net` binary and committed** — after running it, rebuild `rustcraft-net` and commit `dashboard/dist`. |
+| `./scripts/dashboard_test.sh` | Dashboard e2e: curl checks on `/healthz`, `/api/status`, `/api/map`, assets + headless Chromium on the page (DOM shows the live server, screenshot shows the rendered minimap). |
 
 ## Architecture map
 
@@ -98,14 +113,26 @@ crates/
                       player; block edits re-send to every viewer holding
                       the chunk; each client gets the full Agents list so
                       players see each other. Per-session reader task
-                      applies inbound msgs. HOST-ONLY: deps are
-                      cfg(not(target_arch = "wasm32"))-gated so the shared
-                      workspace wasm build stays green (empty lib + stub
-                      bin on wasm). e2e tests (tests/e2e.rs) run real sync
-                      WebSocket clients against serve(): single player,
-                      two clients sharing one world (see each other +
-                      edit sync), and a wss round-trip with an
-                      openssl-generated self-signed cert.
+                      applies inbound msgs. DASHBOARD: http.rs = minimal
+                      dependency-free HTTP/1.1 (GET only, one request per
+                      connection) serving the embedded dashboard/dist +
+                      /api/status (JSON) + /api/map?x=&z=&w=&h= (binary
+                      2-bytes/column); map.rs = MapState (own lock, own
+                      WorldGen + height cache + last-wins edit overlay —
+                      never touches the world lock) computing the
+                      topmost block per column from pure terrain + the
+                      world's edit history (exact modulo flowers/canopy
+                      overhang — see its tests). The Server's event_sink
+                      (set by serve()) feeds the EventLog (own mutex, cap
+                      256 — must stay outside the world lock). HOST-ONLY:
+                      deps are cfg(not(target_arch = "wasm32"))-gated so
+                      the shared workspace wasm build stays green (empty
+                      lib + stub bin on wasm). e2e tests (tests/e2e.rs)
+                      run real sync WebSocket clients against serve():
+                      single player, two clients sharing one world (see
+                      each other + edit sync), a wss round-trip with an
+                      openssl-generated self-signed cert, and the
+                      dashboard HTTP endpoints.
   rustcraft-client/   WebGPU renderer. Terrain buffer POOL (one 2M-vertex
                       vbo/ibo, chunks own index ranges, compaction when
                       full), opaque+water pipelines (translucent water
@@ -123,8 +150,19 @@ crates/
                       "shadow renderer" that re-renders the scene for headless
                       pixel verification.
 web/                  index.html (HUD, overlay) + dist/ (build output).
+dashboard/            STANDALONE cargo workspace (its dep graph must not
+                      touch the main workspace's exact pins). Dioxus 0.7
+                      wasm app: top bar (players/npcs/seed/uptime), event
+                      log, PLAYERS list (focus button), 2D minimap canvas
+                      (drag-pan, wheel-zoom; terrain colours mirror
+                      Block::color_top). Built by
+                      scripts/build_dashboard.sh into dist/ (COMMITTED —
+                      embedded into the rustcraft-net binary via
+                      include_dir!; the cdylib exposes #[wasm_bindgen]
+                      start(), called from index.html after init()).
 scripts/              build.sh, serve.sh, verify.sh, walk_test.sh,
-                      secure_context_test.sh.
+                      secure_context_test.sh, remote_test.sh,
+                      build_dashboard.sh, dashboard_test.sh.
 ```
 
 Data flow per frame: input → `Server::push_action` → (fixed-tick)
@@ -137,6 +175,13 @@ around that player's position + the full agent list, so players see each
 other) → `ServerMsg` frames → each client's `RemoteLink` folds them into
 its Backend's state → same render pass. The client's `tick()` is a no-op in
 remote mode (the world ticks on the server).
+
+Dashboard flow (independent of the game frame loop): the dioxus app polls
+`GET /api/status` (1 s: agents + event log) and `GET /api/map` (on view
+change + a 3 s refresh: 2 bytes/column, row-major) over same-origin HTTP;
+the map endpoint answers from `MapState` (own lock), which the tick loop
+keeps in sync with the world's append-only edit history — so a block edit
+is visible on the map within one tick.
 
 ### Invariants that are easy to break
 
@@ -190,7 +235,21 @@ remote mode (the world ticks on the server).
   warm init costs ~1s. verify.sh's budget is 40s for exactly this reason —
   don't lower it. Remote mode can't use virtual time at all (a live 60 Hz
   WebSocket never quiesces, so virtual time stalls): `remote_test.sh` runs
-  in real time with a wall-clock timeout instead.
+  in real time with a wall-clock timeout instead. (The dashboard has no
+  live WebSocket — plain fetch polling — so it *can* use virtual time.)
+- **The dashboard dist is embedded and committed**: `rustcraft-net` compiles
+  `dashboard/dist` into the binary via `include_dir!` — the server has no
+  filesystem dependencies at runtime. After changing anything under
+  `dashboard/` (sources, html, css): `./scripts/build_dashboard.sh`,
+  `cargo build -p rustcraft-net`, and **commit the new `dashboard/dist`**
+  (stale dist → stale dashboard on every machine). The JS imports a
+  `snippets/` subtree, so the *whole* tree must be served (the include_dir
+  approach exists for that; don't regress to per-file include_bytes).
+- **Dashboard locks**: `MapState` and `EventLog` each own a mutex and must
+  never be guarded by (or lock while holding) the `WorldState` mutex — the
+  tick loop holds the world lock while syncing map edits and pushing
+  events. The map also must never read the authoritative world (it has its
+  own `WorldGen` + edit overlay; that's how it stays off the tick path).
 
 ## Environment quirks (read before debugging "it's broken")
 
@@ -250,6 +309,26 @@ These are properties of *this machine/headless setup*, not code bugs:
   sent-based count reads ~200+ "missing" on a perfectly healthy view.
   `known`-based reads 0. (This distinction is why the walk test asserts
   *sustained* missing, not a single high sample.)
+- `std::time::Instant` **panics on wasm32** ("time not implemented on this
+  platform") — the dashboard (and any wasm code) must time things with
+  `js_sys::Date::now()` (f64 ms). A panic inside a spawned async task
+  cascades into `RefCell already borrowed` panics in wasm-bindgen-futures'
+  global queue, which hides the root cause — look for the *first* panic.
+- A dioxus wasm app must be a **cdylib with an explicit `#[wasm_bindgen]`
+  entry** (`start()`), not a binary: the wasm-bindgen glue only re-exports
+  `#[wasm_bindgen]` functions, and a binary's `main` (argc/argv) is not one.
+  Also note cargo names the cdylib artifact with **underscores**
+  (`rustcraft_dashboard.wasm`) — a stale hyphenated *bin* artifact left in
+  `target/` will silently ship the wrong wasm (symptom: "does not provide
+  an export named 'start'"). `scripts/build_dashboard.sh` pins the
+  underscored path.
+- Dioxus 0.7 + wasm-bindgen 0.2.100 API notes: `Signal::write()` needs a
+  **mut** signal binding; `Signal::read().clone()` clones the *handle*
+  wrapper — clone the inner value with `(*sig.read()).clone()`; `JsValue`
+  has no `Display` (use `e.as_string()` / `{:?}`); `web-sys` canvas style
+  setters are the `set_fill_style_str(...)` variants; `Closure::once` for
+  `setTimeout` must be a **zero-arg** closure (`move ||`); the event
+  handlers are `onmousedown/onwheel` etc. with `client_coordinates()`.
 
 ## Testing conventions
 
@@ -283,7 +362,11 @@ These are properties of *this machine/headless setup*, not code bugs:
 5. For anything touching startup/context: `./scripts/secure_context_test.sh`.
 6. For anything touching the protocol, `rustcraft-net`, or the remote
    backend: `./scripts/remote_test.sh` — "ALL CHECKS PASSED".
-7. Update README.md if user-visible behavior changed; keep the version
+7. For anything touching `dashboard/` (or the dashboard HTTP side of
+   `rustcraft-net`): `./scripts/build_dashboard.sh` + rebuild
+   `rustcraft-net` + `./scripts/dashboard_test.sh` — "ALL CHECKS PASSED",
+   and commit the regenerated `dashboard/dist`.
+8. Update README.md if user-visible behavior changed; keep the version
    pins in lockstep if you touched them.
-8. Commit on `main` with a message explaining *why* (root cause), not just
+9. Commit on `main` with a message explaining *why* (root cause), not just
    *what*.

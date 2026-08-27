@@ -25,7 +25,9 @@ pub use agent::{
 pub use local_block_cache::{CacheStats, LocalBlockCache};
 pub use sphere::sphere_mesh;
 pub use input::{Action, Input, Key, KeySet};
-pub use world::{World, WorldUpdate};
+pub use world::{Edit, World, WorldUpdate};
+
+use std::sync::Arc;
 
 use rustcraft_world::{Block, BlockPos, ChunkPos, WORLD_HEIGHT};
 
@@ -81,6 +83,10 @@ pub struct Server {
     /// spawn and how far apart the spiral arms sit. Load-test facility.
     npc_count: u32,
     npc_spacing: f32,
+    /// Optional sink for human-readable event strings (the network server
+    /// feeds its dashboard event log from this). `None` in the built-in
+    /// client, so events cost nothing there.
+    event_sink: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl Server {
@@ -101,6 +107,21 @@ impl Server {
             time: 0.0,
             npc_count: NPC_COUNT_DEFAULT,
             npc_spacing: NPC_SPACING_DEFAULT,
+            event_sink: None,
+        }
+    }
+
+    /// Set the event sink (see the `event_sink` field). The network server
+    /// uses this to feed its dashboard's event log; the built-in client
+    /// never sets one.
+    pub fn set_event_sink(&mut self, sink: Option<Arc<dyn Fn(&str) + Send + Sync>>) {
+        self.event_sink = sink;
+    }
+
+    /// Forward one event string to the sink (no-op when unset).
+    fn emit(&self, msg: String) {
+        if let Some(s) = &self.event_sink {
+            s(&msg);
         }
     }
 
@@ -311,6 +332,10 @@ impl Server {
             Action::ToggleFly => {
                 let idx = self.agent_index(id);
                 self.agents[idx].toggle_fly();
+                self.emit(format!(
+                    "player {id} switched to {} mode",
+                    if self.agents[idx].fly { "fly" } else { "walk" }
+                ));
             }
             Action::FlyFaster => {
                 let idx = self.agent_index(id);
@@ -350,10 +375,15 @@ impl Server {
             Some((hit, prev)) => match action {
                 Action::Break { .. } => {
                     if hit.y > 0 {
+                        let removed = self.world.block_at(hit);
                         // World edits go through the delta layer.
                         let dirty = self.world.set_block(hit, Block::Air);
                         self.invalidate_caches_at(hit);
                         self.dirty.extend(dirty);
+                        self.emit(format!(
+                            "player {id} broke {:?} at ({}, {}, {})",
+                            removed, hit.x, hit.y, hit.z
+                        ));
                     }
                 }
                 Action::Place { .. } => {
@@ -371,6 +401,10 @@ impl Server {
                         let dirty = self.world.set_block(prev, Block::Stone);
                         self.invalidate_caches_at(prev);
                         self.dirty.extend(dirty);
+                        self.emit(format!(
+                            "player {id} placed Stone at ({}, {}, {})",
+                            prev.x, prev.y, prev.z
+                        ));
                     }
                 }
                 // Fly/NPC actions never reach here (handled in apply_action).
@@ -449,12 +483,17 @@ impl Server {
             ));
         }
         self.reset_cache_stats();
+        self.emit(format!(
+            "spawned {count} NPCs (spacing {spacing:.0}) around player {around}"
+        ));
     }
 
     /// Remove all NPCs (every player remains).
     pub fn clear_npcs(&mut self) {
+        let n = self.agents.iter().filter(|a| a.kind == AgentKind::Npc).count();
         self.agents.retain(|a| a.kind == AgentKind::Player);
         self.reset_cache_stats();
+        self.emit(format!("cleared {n} NPCs"));
     }
 
     /// Zero the cache statistics of every agent (called when the load
@@ -1484,6 +1523,50 @@ mod tests {
             s.world.block_at(feet_block),
             Block::Air,
             "A's break must land in the shared world"
+        );
+    }
+
+    /// The event sink (dashboard log feed) must see world edits and fly
+    /// toggles with the acting player's id; without a sink nothing panics.
+    #[test]
+    fn event_sink_reports_edits_and_fly() {
+        let mut s = Server::new(1337);
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        s.set_event_sink(Some(Arc::new(move |m: &str| {
+            let _ = tx.send(m.to_string());
+        })));
+
+        // Aim down-forward and break (the same trick as the edit tests: a
+        // steep pitch always hits while standing on the ground).
+        let p = s.player_state();
+        s.push_action(Action::Break { yaw: p.yaw, pitch: -0.7 });
+        s.push_action(Action::ToggleFly);
+        for _ in 0..3 {
+            s.tick(1.0 / 60.0);
+        }
+
+        // try_iter: the channel stays open (the sink owns the sender for
+        // the life of the server), so a blocking iter() would hang.
+        let mut events: Vec<String> = rx.try_iter().collect();
+        // The built-in `new()` world spawns ambient NPCs... only if the
+        // NpcLoad action was applied; here we just expect the two actions
+        // above produced their events.
+        assert!(
+            events.iter().any(|e| e.starts_with("player 0 broke ") && e.contains(" at (")),
+            "expected a break event, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e == "player 0 switched to fly mode"),
+            "expected a fly event, got {events:?}"
+        );
+
+        // Toggling fly back off is reported too.
+        let _ = events.drain(..);
+        s.push_action(Action::ToggleFly);
+        s.tick(1.0 / 60.0);
+        assert!(
+            rx.try_iter().any(|e| e == "player 0 switched to walk mode"),
+            "expected a walk-mode event"
         );
     }
 }

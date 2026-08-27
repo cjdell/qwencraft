@@ -17,7 +17,10 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::collections::HashMap;
+pub mod http;
+pub mod map;
+
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
@@ -43,12 +46,15 @@ pub struct ServerOptions {
     pub seed: u64,
     /// Interface to bind.
     pub bind: IpAddr,
-    /// Port to listen on (0 = let the OS pick; see [`serve`]).
+    /// WebSocket port (0 = let the OS pick; see [`serve`]).
     pub port: u16,
     /// TLS certificate (PEM). With [`Self::key`], the server speaks wss://.
     pub cert: Option<PathBuf>,
     /// TLS private key (PEM, RSA or PKCS#8).
     pub key: Option<PathBuf>,
+    /// Dashboard HTTP port (0 = let the OS pick). `None` disables the
+    /// dashboard entirely.
+    pub http_port: Option<u16>,
 }
 
 impl Default for ServerOptions {
@@ -59,16 +65,62 @@ impl Default for ServerOptions {
             port: 9000,
             cert: None,
             key: None,
+            http_port: Some(9001),
         }
+    }
+}
+
+/// The actual bound addresses after [`serve`].
+pub struct ServerEndpoints {
+    /// The WebSocket game server.
+    pub ws: SocketAddr,
+    /// The dashboard HTTP server (when enabled).
+    pub http: Option<SocketAddr>,
+}
+
+/// Bounded, thread-safe event log for the dashboard (join/leave, world
+/// edits, NPC load, …). Its own mutex: the tick loop pushes server events
+/// from inside the world lock, so the log must never be guarded by the
+/// world mutex itself (that would deadlock the event sink).
+pub struct EventLog {
+    inner: Mutex<VecDeque<(f64, String)>>,
+    cap: usize,
+}
+
+impl EventLog {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(VecDeque::new()),
+            cap: 256,
+        }
+    }
+
+    /// Record one event (`t` = seconds since server start).
+    pub fn push(&self, t: f64, msg: String) {
+        let mut q = self.inner.lock().unwrap();
+        if q.len() >= self.cap {
+            q.pop_front();
+        }
+        q.push_back((t, msg));
+    }
+
+    /// A copy of the log, oldest first.
+    pub fn snapshot(&self) -> Vec<(f64, String)> {
+        self.inner.lock().unwrap().iter().cloned().collect()
     }
 }
 
 /// The shared world: the authoritative [`Server`] plus the live connections.
 /// Each connection owns one player agent (keyed by player id) and a
-/// [`Streamer`] for that player's view.
-struct WorldState {
+/// [`Streamer`] for that player's view. Public (the dashboard HTTP front end
+/// takes a handle to it); the fields stay private.
+pub struct WorldState {
     server: Server,
     players: HashMap<u32, Conn>,
+    /// Dashboard event log (separate lock — see [`EventLog`]).
+    events: Arc<EventLog>,
+    /// Process start (dashboard uptime).
+    started: Instant,
 }
 
 /// One connected client.
@@ -79,13 +131,14 @@ struct Conn {
     streamer: Streamer,
 }
 
-/// Load the TLS acceptor, bind the listener, and spawn the shared-world tick
-/// loop + accept loop.
+/// Load the TLS acceptor, bind the listeners, and spawn the shared-world
+/// tick loop, the WebSocket accept loop, and (when enabled) the dashboard
+/// HTTP server.
 ///
-/// Returns the actual bound address (pass `port: 0` to let the OS pick one —
-/// used by the end-to-end test). The loops keep running for the life of the
-/// current tokio runtime.
-pub async fn serve(opts: ServerOptions) -> Result<SocketAddr, String> {
+/// Returns the actual bound addresses (pass `port: 0` / `http_port: Some(0)`
+/// to let the OS pick one — used by the end-to-end tests). The loops keep
+/// running for the life of the current tokio runtime.
+pub async fn serve(opts: ServerOptions) -> Result<ServerEndpoints, String> {
     let tls = load_tls(&opts)?;
     let listener = TcpListener::bind((opts.bind, opts.port))
         .await
@@ -98,22 +151,53 @@ pub async fn serve(opts: ServerOptions) -> Result<SocketAddr, String> {
         "[rustcraft-net] listening on {scheme}://{addr} (seed {}, shared world — one player per connection)",
         opts.seed
     );
+
+    let started = Instant::now();
+    let events = Arc::new(EventLog::new());
     let world = Arc::new(Mutex::new(WorldState {
         server: Server::new_world(opts.seed),
         players: HashMap::new(),
+        events: events.clone(),
+        started,
     }));
+    // Dashboard map state (its own lock; computed off the tick path).
+    let map = Arc::new(Mutex::new(map::MapState::new(opts.seed)));
+
+    // World edits / fly / NPC events from the server feed the dashboard log.
+    // The sink captures only the (separately-locked) event log + start time:
+    // it is invoked while the tick loop holds the world lock, so it must not
+    // take that lock back.
+    {
+        let events_for_sink = events.clone();
+        let started_for_sink = started;
+        world.lock().unwrap().server.set_event_sink(Some(Arc::new(
+            move |msg: &str| {
+                events_for_sink.push(started_for_sink.elapsed().as_secs_f64(), msg.to_string());
+            },
+        )));
+    }
+
+    events.push(
+        0.0,
+        format!("server started (seed {}, {scheme}://{addr})", opts.seed),
+    );
+
     // The single tick loop for the shared world.
     {
         let world = world.clone();
-        tokio::spawn(tick_loop(world));
+        let map = map.clone();
+        tokio::spawn(tick_loop(world, map));
     }
     let seed = opts.seed;
+    // The accept loop below moves its capture, but the dashboard HTTP
+    // server still needs a handle to the world — hand it its own clone.
+    let world_accept = world.clone();
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((tcp, peer)) => {
                     let tls = tls.clone();
-                    let world = world.clone();
+                    let world = world_accept.clone();
                     tokio::spawn(async move {
                         match handle_conn(tcp, peer, world, seed, tls).await {
                             Ok(()) => {}
@@ -125,18 +209,34 @@ pub async fn serve(opts: ServerOptions) -> Result<SocketAddr, String> {
             }
         }
     });
-    Ok(addr)
+
+    // Dashboard HTTP server (optional).
+    let http = match opts.http_port {
+        Some(p) => Some(http::run_http(opts.bind, p, world.clone(), map).await?),
+        None => None,
+    };
+    if let Some(h) = &http {
+        events.push(
+            started.elapsed().as_secs_f64(),
+            format!("dashboard enabled (http://{h})"),
+        );
+    }
+    Ok(ServerEndpoints { ws: addr, http })
 }
 
 /// The single 60 Hz tick loop for the shared world. Ticks the [`Server`],
 /// then for each connected player streams the world around them and sends
-/// that player's state, all agents, and stats.
-async fn tick_loop(world: Arc<Mutex<WorldState>>) {
+/// that player's state, all agents, and stats. New world edits are also
+/// forwarded to the dashboard map state (last-wins overlay).
+async fn tick_loop(world: Arc<Mutex<WorldState>>, map: Arc<Mutex<map::MapState>>) {
     let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / TICK_HZ as f64));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last = Instant::now();
     // Sentinel so the initial NPC load is echoed once to every connection.
     let mut last_npc_load: (u32, f32) = (u32::MAX, f32::NAN);
+    // How much of the world's (append-only) edit history has been synced to
+    // the dashboard map already.
+    let mut last_edit_seq = 0usize;
 
     loop {
         tick.tick().await;
@@ -147,9 +247,18 @@ async fn tick_loop(world: Arc<Mutex<WorldState>>) {
         // Destructure into disjoint field references so the per-connection
         // loop can touch `players` and `server` independently (the MutexGuard
         // itself doesn't field-split through its deref).
-        let WorldState { server, players } = &mut *w;
+        let WorldState { server, players, .. } = &mut *w;
         server.tick(dt);
         let dirty = server.drain_dirty();
+        // Dashboard map: sync edits added by this tick (usually zero).
+        {
+            let edits = server.world().edits();
+            if edits.len() > last_edit_seq {
+                let mut m = map.lock().unwrap();
+                m.sync_edits(&edits[last_edit_seq..]);
+                last_edit_seq = edits.len();
+            }
+        }
         let agents = server.agents();
         let base_stats = server.stats(0);
         let npc_load = server.npc_load_config();
@@ -219,7 +328,7 @@ async fn handle_conn(
 /// stored per-player; the tick loop applies them on the next step).
 fn apply_inbound(world: &Mutex<WorldState>, player_id: u32, m: ClientMsg) {
     let mut w = world.lock().unwrap();
-    let WorldState { server, players } = &mut *w;
+    let WorldState { server, players, .. } = &mut *w;
     match m {
         ClientMsg::Input { keys, dx, dy } => {
             let mut input = Input::default();
@@ -270,6 +379,10 @@ where
         let id = w.server.add_player();
         w.players
             .insert(id, Conn { tx: tx.clone(), streamer: Streamer::new() });
+        w.events.push(
+            w.started.elapsed().as_secs_f64(),
+            format!("player {id} joined (from {peer}, {} online)", w.players.len()),
+        );
         id
     };
     eprintln!(
@@ -324,6 +437,10 @@ where
         let mut w = world.lock().unwrap();
         w.players.remove(&player_id);
         w.server.remove_player(player_id);
+        w.events.push(
+            w.started.elapsed().as_secs_f64(),
+            format!("player {player_id} left ({} online)", w.players.len()),
+        );
     }
     eprintln!(
         "[rustcraft-net] {peer}: player {} left ({} online)",

@@ -1,0 +1,53 @@
+[package]
+name = "rustcraft-dashboard"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Dioxus web dashboard for the RustCraft headless server (served by rustcraft-net)"
+
+# Standalone workspace on purpose: the dashboard's dependency graph
+# (dioxus et al.) must not interact with the main workspace's exact
+# wasm-bindgen pins. Built by scripts/build_dashboard.sh into dist/, which
+# is embedded into the rustcraft-net binary.
+[workspace]
+
+# A cdylib (not a bin): the wasm-bindgen glue only re-exports
+# `#[wasm_bindgen]` functions, so the app's entry point is the explicit
+# `start()` in src/lib.rs (a binary's `main` would not be exported).
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+dioxus = { version = "0.7.10", features = ["web"] }
+# These must stay in lockstep with the wasm-bindgen CLI in the nix shell
+# (0.2.100): the CLI refuses wasm built against a different version, and
+# wasm-bindgen-futures 0.4.50 pins exactly 0.2.100/0.3.77.
+wasm-bindgen = "=0.2.100"
+wasm-bindgen-futures = "=0.4.50"
+js-sys = "=0.3.77"
+web-sys = { version = "=0.3.77", features = [
+    "Window",
+    "Document",
+    "Element",
+    "EventTarget",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "ImageData",
+    "Request",
+    "RequestInit",
+    "Response",
+    "Headers",
+    "MouseEvent",
+    "WheelEvent",
+    "DomRect",
+] }
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+console_error_panic_hook = "0.1"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"
