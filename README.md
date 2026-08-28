@@ -176,19 +176,31 @@ WebSocket upgrade.
 
 **Connecting the browser:** open **Options** on the start screen and type
 the server URL into the field (a bare `host[:port]` is fine — `/ws` is
-appended), then press **Connect**; or launch with the query param:
+appended, and on an https page the scheme is implied as `wss://`, since a
+plain `ws://` socket would be blocked as mixed content), then press
+**Connect**; or launch with the query param:
 
 ```
 http://localhost:8080/?server=ws://192.168.49.50:9000/ws
 ```
 
-`ws://` works from `localhost` pages; from a non-localhost (https) page the
-socket must be `wss://`. The HUD's `net` line shows which backend is live
+The HUD's `net` line shows which backend is live
 (`builtin (seed …)` or the remote URL), and a failed connection falls back
 to the embedded server automatically. `./scripts/remote_test.sh` runs the
 whole loop headlessly: standalone server + two Chromium browsers in remote
 mode on the same shared world, asserting both connect, the server sees both
 players, the world streams, and a GPU pixel readback of the rendered scene.
+
+**Public deployment:** `./deploy.sh` ships the web build to `/srv/rustcraft`
+and the `rustcraft-net` binary to `/srv/rustcraft-server` on the router, and
+restarts the server service so the new binary is live. The router's NixOS
+config (`hosts/grafton-router/services/rustcraft.nix` in its own
+nixos-config repo) runs the binary on `127.0.0.1:9000` and nginx exposes it
+under `rustcraft.home.chrisdell.info`: the game page at `/` (static), with
+`/ws`, `/dashboard/`, `/api/*` and `/healthz` proxied to the server. So
+`https://rustcraft.home.chrisdell.info` is the game, `…/dashboard/` is the
+operator dashboard, and connecting to `rustcraft.home.chrisdell.info` (bare
+host works — it becomes `wss://…/ws`) plays the shared world.
 
 ## Server dashboard
 

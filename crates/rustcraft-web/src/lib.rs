@@ -1131,7 +1131,9 @@ fn params_from_url() -> (u64, bool, bool, bool, Option<(u32, f32)>, Option<Strin
     (seed, verify, walk, tag_log, npcs, server)
 }
 
-/// Accept `ws://…`, `wss://…`, or bare `host:port` (ws:// implied).
+/// Accept `ws://…`, `wss://…`, or bare `host:port` (scheme implied by the
+/// page: `wss` on https pages, `ws` otherwise — a plain `ws://` socket would
+/// be blocked as mixed content from an https page).
 /// Returns None for empty input or foreign schemes. The server speaks
 /// WebSocket at `/ws` on its single port, so a bare `host[:port]` (or
 /// `host[:port]/`) is upgraded to `…/ws`.
@@ -1145,7 +1147,7 @@ fn normalize_ws_url(raw: &str) -> Option<String> {
     } else if s.contains("://") {
         return None;
     } else {
-        format!("ws://{s}")
+        format!("{}://{s}", default_ws_scheme())
     };
     let (scheme_host, rest) = with_scheme.split_once("://")?;
     // Everything before the first '/', '?' or '#' is the authority.
@@ -1164,6 +1166,16 @@ fn normalize_ws_url(raw: &str) -> Option<String> {
         return Some(format!("{scheme_host}://{host}/ws"));
     }
     Some(format!("{scheme_host}://{host}{tail}"))
+}
+
+/// Scheme implied by the page for a bare `host[:port]` (see
+/// `normalize_ws_url`): `wss` when the page is served over https, `ws`
+/// otherwise.
+fn default_ws_scheme() -> &'static str {
+    match web_sys::window().map(|w| w.location().protocol()) {
+        Some(Ok(p)) if p == "https:" => "wss",
+        _ => "ws",
+    }
 }
 
 // World point → screen pixels for the name tags. Lives in
