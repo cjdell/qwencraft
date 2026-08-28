@@ -1,7 +1,13 @@
 # Qwencraft
 
-Repository: <https://github.com/cjdell/qwencraft> · deployed at
-<https://qwencraft.home.chrisdell.info>
+Repository: <https://github.com/cjdell/qwencraft>
+
+**Live demo:** <https://qwencraft.home.chrisdell.info> · **Server dashboard:**
+<https://qwencraft.home.chrisdell.info/dashboard/> — both hosted on an Intel
+N100 mini-PC.
+
+*Unapologetically vibe-coded with Qwen 3.8 on a single Radeon AI Pro R9700
+32GB, in under 24 hours.*
 
 A voxel (Minecraft-style) engine written in Rust that runs in the browser.
 The world is generated procedurally from a seed, streamed on demand from an
