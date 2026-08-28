@@ -134,10 +134,10 @@ against — even while you're turning fast.
 
 | crate / dir         | what it is                                                              |
 | ------------------- | ----------------------------------------------------------------------- |
-| `qwencraft-world`   | Block types, seeded noise/terrain, 16³ chunks with 26³ region payloads, chunk meshing (voxel lighting + AO), shared WGSL shader + view-projection math |
+| `qwencraft-world`   | Block types, seeded noise/terrain, 16³ chunks with 26³ region payloads, chunk meshing (voxel lighting + AO), view-projection math + the minimap's column queries, shared math types |
 | `qwencraft-server`  | The authoritative game server: infinite lazy world (chunks generated on demand), agent simulation (player + NPCs) with a per-agent local block window, fixed-tick physics, delta-based world updates, NPC load test. Plus the wire `protocol` module (binary codec shared by both transports). Runs in-process in the browser *and* inside the headless server |
 | `qwencraft-net`     | Headless server, single port: WebSocket at `/ws` (`ws://`, `wss://` with `--cert`/`--key`), dashboard at `/dashboard/` (bare `/dashboard` 302-redirects to it), game page at `/`, plus `/api/*` + `/healthz`; one shared world for all connections, 60 Hz tick loop, per-connection streaming |
-| `qwencraft-client`  | WebGPU (wgpu 27) renderer: shared terrain-mesh buffer pool, sphere agents, fog, first-person camera |
+| `qwencraft-client`  | WebGPU (wgpu 27) renderer: shared terrain-mesh buffer pool, the WGSL shader, sphere agents, fog, first-person camera |
 | `qwencraft-web`     | wasm glue: input (keyboard/pointer lock), HUD, main loop, backend abstraction (embedded server or remote over WebSocket) |
 | `web/`              | `index.html` page hosting the wasm app                                  |
 | `scripts/`          | build / serve / verify / walk-stress / NPC-load / secure-context / remote-server tests |

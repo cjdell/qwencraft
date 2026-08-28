@@ -86,8 +86,12 @@ crates/
   qwencraft-world/    PURE, no deps. Blocks, seeded noise, terrain
                       generation (water/trees/snow/flowers/sand), chunk
                       meshing with voxel lighting+AO, raycasting,
-                      camera matrices + the WGSL shader source.
-                      Host-testable — put geometry/logic tests here.
+                      camera matrices + view-projection math, the
+                      minimap's per-column top-block queries (column_top,
+                      sharing top_block/sub_top_block with the generator),
+                      and Vec3 (shared math type). The WGSL shader source
+                      lives in the client. Host-testable — put
+                      geometry/logic tests here.
   qwencraft-server/   Authoritative game state. Server { world, agents,
                       inputs/actions/targets per agent id }, fixed 60Hz
                       tick, physics (walk/jump/fly/swim), per-agent
@@ -158,7 +162,8 @@ crates/
   qwencraft-client/   WebGPU renderer. Terrain buffer POOL (one 2M-vertex
                       vbo/ibo, chunks own index ranges, compaction when
                       full), opaque+water pipelines (translucent water
-                      pass), agent spheres, wireframe block highlight,
+                      pass), the WGSL shader (shader.rs), agent spheres
+                      (sphere.rs), wireframe block highlight,
                       clear_terrain() for world switches.
   qwencraft-web/      wasm glue. Backend { Builtin { server, streamer },
                       Remote } — the frame loop talks only to the Backend;
@@ -181,7 +186,9 @@ crates/
                       appends /ws); failed connect falls back to builtin.
                       verify_gl.rs = WebGL2 "shadow renderer" that
                       re-renders the scene for headless pixel
-                      verification.
+                      verification — behind the `verify` cargo feature
+                      (scripts/build.sh enables it; drop it for a
+                      production build).
 web/                  index.html (HUD, overlay) + dist/ (build output).
 dashboard/            STANDALONE cargo workspace (its dep graph must not
                       touch the main workspace's exact pins). Dioxus 0.7
