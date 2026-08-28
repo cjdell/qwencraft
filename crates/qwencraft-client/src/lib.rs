@@ -9,7 +9,10 @@
 
 #![cfg(target_arch = "wasm32")]
 
+mod shader;
 mod sphere;
+
+use shader::SHADER;
 
 use wgpu::{
     Buffer, BufferUsages, Device, DeviceDescriptor, Instance, InstanceDescriptor, PipelineLayout,
@@ -20,9 +23,7 @@ use wgpu::{
 };
 
 use qwencraft_server::{AgentState, WorldUpdate, VIEW_RADIUS};
-use qwencraft_world::camera::{
-    uniform_bytes, view_projection, FOG_END, FOG_START, SHADER, SKY, UNIFORM_SIZE,
-};
+use qwencraft_world::camera::{uniform_bytes, view_projection, FOG_END, FOG_START, SKY, UNIFORM_SIZE};
 use qwencraft_world::{ChunkPos, REGION_BLOCKS, Slot, TERRAIN_POOL_IDX, TERRAIN_POOL_VERTS, TerrainPool};
 // Pool capacity lives in qwencraft_world so the host-side `pool_measure`
 // example can assert the worst-case view stays under ~80% of it. Do not
