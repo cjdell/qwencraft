@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Headless-browser test for the SERVER DASHBOARD: rustcraft-net's built-in
-# HTTP server serves the embedded dioxus dashboard, which polls
-# /api/status + /api/map and renders a 2D minimap.
+# Headless-browser test for the SERVER DASHBOARD: rustcraft-net's single
+# port hosts the WebSocket (/ws), the dashboard (/dashboard) and the game
+# client (/); the embedded dioxus dashboard polls /api/status + /api/map
+# and renders a 2D minimap.
 #
 # - builds the rustcraft-net binary (release) if missing,
-# - starts it with a random WebSocket + HTTP port,
-# - curl-checks the HTTP endpoints (health, status JSON, map binary, assets),
+# - starts it on a random single port,
+# - curl-checks the HTTP endpoints (health, status JSON, map binary,
+#   dashboard + game assets, 404),
 # - runs headless Chromium on the dashboard page and checks the DOM shows a
 #   live server (seed, players count, startup event) and the screenshot
 #   shows the rendered minimap (not a blank pane).
@@ -14,8 +16,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# The server's single port: /ws + /dashboard + game client.
 WS_PORT="${WS_PORT:-$((40000 + RANDOM % 20000))}"
-HTTP_PORT="${HTTP_PORT:-$((20000 + RANDOM % 20000))}"
 SEED="${SEED:-1337}"
 LOG="${LOG:-${TMPDIR:-/tmp}/rustcraft-dashboard-chrome.log}"
 SHOT="${SHOT:-${TMPDIR:-/tmp}/rustcraft-dashboard-shot.png}"
@@ -46,9 +48,8 @@ PROF_DIR="${TMPDIR}/rustcraft-dashboard-chrome-prof"
 rm -rf "$PROF_DIR"
 mkdir -p "$PROF_DIR"
 
-echo "==> headless server (ws://127.0.0.1:${WS_PORT}, http://127.0.0.1:${HTTP_PORT}, seed ${SEED})"
-"$SRV_BIN" --seed "$SEED" --port "$WS_PORT" --bind 127.0.0.1 \
-  --http-port "$HTTP_PORT" >"$SRV_LOG" 2>&1 &
+echo "==> headless server (ws://127.0.0.1:${WS_PORT}/ws + /dashboard, seed ${SEED})"
+"$SRV_BIN" --seed "$SEED" --port "$WS_PORT" --bind 127.0.0.1 >"$SRV_LOG" 2>&1 &
 SRV=$!
 cleanup() { kill "$SRV" 2>/dev/null || true; }
 trap cleanup EXIT
@@ -74,7 +75,7 @@ check() {
   fi
 }
 
-BASE="http://127.0.0.1:${HTTP_PORT}"
+BASE="http://127.0.0.1:${WS_PORT}"
 
 # --- HTTP endpoint checks (curl) -------------------------------------------
 check "health probe"        bash -c "curl -sf '$BASE/healthz' | grep -q ok"
@@ -87,12 +88,14 @@ check "map: 64x64 is 8192 bytes" \
   bash -c "[ \$(curl -sf '$BASE/api/map?x=8&z=8&w=64&h=64' | wc -c) -eq 8192 ]"
 check "map: oversized clamps to 256" \
   bash -c "[ \$(curl -sf '$BASE/api/map?x=8&z=8&w=4096&h=4096' | wc -c) -eq \$((256*256*2)) ]"
-check "dashboard page"      bash -c "curl -sf '$BASE/' | grep -q 'RustCraft server'"
-check "dashboard js asset"  bash -c "curl -sf '$BASE/rustcraft_dashboard.js' | grep -q rustcraft"
+check "dashboard page"      bash -c "curl -sf '$BASE/dashboard/' | grep -q 'RustCraft server'"
+check "dashboard js asset"  bash -c "curl -sf '$BASE/dashboard/rustcraft_dashboard.js' | grep -q rustcraft"
 check "dashboard wasm asset" \
-  bash -c "[ \$(curl -sf '$BASE/rustcraft_dashboard_bg.wasm' | wc -c) -gt 10000 ]"
+  bash -c "[ \$(curl -sf '$BASE/dashboard/rustcraft_dashboard_bg.wasm' | wc -c) -gt 10000 ]"
 check "dashboard css asset" \
-  bash -c "curl -s -o /dev/null -D - '$BASE/dashboard.css' | grep -qi 'Content-Type: text/css'"
+  bash -c "curl -s -o /dev/null -D - '$BASE/dashboard/dashboard.css' | grep -qi 'Content-Type: text/css'"
+check "game client at /"    bash -c "curl -sf '$BASE/' | grep -qi 'RustCraft'"
+check "ws endpoint over http" bash -c "[ \$(curl -s -o /dev/null -w '%{http_code}' '$BASE/ws') -eq 426 ]"
 check "unknown path 404s"   bash -c "[ \$(curl -s -o /dev/null -w '%{http_code}' '$BASE/nope') -eq 404 ]"
 
 # --- Headless Chromium on the dashboard page --------------------------------
@@ -109,7 +112,7 @@ chromium \
   --enable-logging=stderr --v=0 \
   --virtual-time-budget="$BUDGET" \
   --screenshot="$SHOT" \
-  "$BASE/" \
+  "$BASE/dashboard/" \
   >"$LOG" 2>&1 || true
 
 check "no uncaught JS errors" \
@@ -122,7 +125,7 @@ chromium --headless --no-sandbox --enable-unsafe-webgpu --use-angle=swiftshader 
   --enable-unsafe-swiftshader \
   --user-data-dir="$PROF_DIR" \
   --window-size=1280,720 --virtual-time-budget="$BUDGET" \
-  --dump-dom "$BASE/" >"$DOM" 2>/dev/null || true
+  --dump-dom "$BASE/dashboard/" >"$DOM" 2>/dev/null || true
 
 check "app title rendered"        grep -q "RustCraft server" "$DOM"
 check "seed shown in the top bar" grep -q "${SEED} seed" "$DOM"

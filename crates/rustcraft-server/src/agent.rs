@@ -42,10 +42,12 @@ const EPS: f32 = 1e-4;
 const MOUSE_SENS: f32 = 0.0024;
 
 /// Snapshot of an agent for the client (rendering).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AgentState {
     pub id: u32,
     pub is_player: bool,
+    /// Display name (players: the name they chose, NPCs: empty).
+    pub name: String,
     /// Feet position (world space).
     pub pos: Vec3,
     pub yaw: f32,
@@ -71,6 +73,7 @@ impl Default for AgentState {
         AgentState {
             id: 0,
             is_player: true,
+            name: "Player".to_string(),
             pos: crate::Vec3::new(0.0, 0.0, 0.0),
             yaw: 0.7,
             pitch: -0.15,
@@ -99,6 +102,8 @@ const NPC_COLORS: [[u8; 3]; 8] = [
 pub struct Agent {
     pub id: u32,
     pub kind: AgentKind,
+    /// Display name (players: the name they chose, NPCs: empty).
+    pub name: String,
     /// Feet position.
     pub pos: Vec3,
     pub vel: Vec3,
@@ -116,14 +121,15 @@ pub struct Agent {
     npc_dir: f32,
     npc_timer: f64,
     rng: u64,
-    color: [u8; 3],
+    pub color: [u8; 3],
 }
 
 impl Agent {
-    pub fn player(id: u32, pos: Vec3) -> Self {
+    pub fn player(id: u32, pos: Vec3, name: &str, color: [u8; 3]) -> Self {
         Agent {
             id,
             kind: AgentKind::Player,
+            name: name.to_string(),
             pos,
             vel: Vec3::default(),
             yaw: 0.7,
@@ -135,7 +141,7 @@ impl Agent {
             npc_dir: 0.0,
             npc_timer: 0.0,
             rng: 0x9E37_79B9u64 ^ (id as u64 * 0x1000_0000_01B3),
-            color: [255, 255, 255],
+            color,
         }
     }
 
@@ -143,6 +149,7 @@ impl Agent {
         Agent {
             id,
             kind: AgentKind::Npc,
+            name: String::new(),
             pos,
             vel: Vec3::default(),
             yaw: 0.0,
@@ -172,6 +179,7 @@ impl Agent {
         AgentState {
             id: self.id,
             is_player: self.kind == AgentKind::Player,
+            name: self.name.clone(),
             pos: self.pos,
             yaw: self.yaw,
             pitch: self.pitch,

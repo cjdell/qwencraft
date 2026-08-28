@@ -37,5 +37,8 @@ web-sys = { version = "=0.3.77", features = [
     "MouseEvent",
     "Event",
     "Location",
+    "DomTokenList",
+    "Node",
+    "HtmlCollection",
     "console",
 ] }

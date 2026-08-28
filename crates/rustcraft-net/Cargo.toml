@@ -13,7 +13,7 @@ rustcraft-world = { path = "../rustcraft-world" }
 # keeps the shared workspace's `--target wasm32-unknown-unknown` build green:
 # on wasm this crate compiles to an empty lib + a stub bin (see src/main.rs).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util"] }
 tokio-tungstenite = "0.30"
 futures-util = { version = "0.3", features = ["sink"] }
 rustls = "0.23"

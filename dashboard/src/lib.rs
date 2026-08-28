@@ -36,6 +36,10 @@ struct Status {
 struct Agent {
     id: u32,
     player: bool,
+    /// Display name (players only; empty for NPCs). `default` keeps older
+    /// server payloads (without the field) decodable.
+    #[serde(default)]
+    name: String,
     x: f32,
     y: f32,
     z: f32,
@@ -43,6 +47,17 @@ struct Agent {
     fly: bool,
     ground: bool,
     color: [u8; 3],
+}
+
+impl Agent {
+    /// Name for display (players have one; fall back to the id tag).
+    fn label(&self) -> String {
+        if self.player && !self.name.is_empty() {
+            self.name.clone()
+        } else {
+            format!("P{}", self.id)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -443,7 +458,7 @@ fn draw(
         ctx.stroke();
         ctx.set_fill_style_str("#ffffff");
         ctx.set_font("11px ui-monospace, monospace");
-        let _ = ctx.fill_text(&format!("P{}", a.id), px + 7.0, py - 7.0);
+        let _ = ctx.fill_text(&a.label(), px + 7.0, py - 7.0);
     }
 }
 
@@ -687,7 +702,7 @@ fn App() -> Element {
                         }
                         for a in players {
                             div { class: "player-row",
-                                span { class: "pid", "P{a.id}" }
+                                span { class: "pid", title: format!("player id {}", a.id), {a.label()} }
                                 span { class: "pos",
                                     "{a.x.round() as i32}, {a.z.round() as i32} · y{a.y.round() as i32}"
                                 }

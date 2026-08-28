@@ -19,10 +19,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
-    HtmlCanvasElement, HtmlDivElement, HtmlInputElement, KeyboardEvent, MessageEvent, MouseEvent,
-    Window,
+    Element, HtmlCanvasElement, HtmlDivElement, HtmlElement, HtmlInputElement, KeyboardEvent,
+    MessageEvent, MouseEvent, Window,
 };
 
 use rustcraft_client::Renderer;
@@ -30,6 +31,7 @@ use rustcraft_server::protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
 use rustcraft_server::{
     Action, AgentState, Input, Key, KeySet, Server, ServerStats, Streamer, WorldUpdate,
 };
+use rustcraft_world::camera::view_projection;
 use rustcraft_world::ChunkPos;
 
 fn log(msg: &str) {
@@ -44,6 +46,28 @@ enum Backend {
 }
 
 impl Backend {
+    /// This page's own player id (the renderer skips it: first person).
+    fn own_id(&self) -> u32 {
+        match self {
+            Backend::Builtin { .. } => 0,
+            Backend::Remote(r) => r.player_id,
+        }
+    }
+
+    /// Apply the player's identity (name + sphere colour). Built-in: set
+    /// locally; remote: send to the server, which broadcasts it to every
+    /// other client via the agent list.
+    fn set_profile(&mut self, name: String, color: [u8; 3]) {
+        match self {
+            Backend::Builtin { server, .. } => server.set_profile(0, name, color),
+            Backend::Remote(r) => {
+                if r.connected {
+                    r.send(ClientMsg::Profile { name, color });
+                }
+            }
+        }
+    }
+
     fn set_input(&mut self, input: Input) {
         match self {
             Backend::Builtin { server, .. } => server.set_input(input),
@@ -97,7 +121,7 @@ impl Backend {
     fn player_state(&self) -> AgentState {
         match self {
             Backend::Builtin { server, .. } => server.player_state(),
-            Backend::Remote(r) => r.player,
+            Backend::Remote(r) => r.player.clone(),
         }
     }
 
@@ -151,6 +175,9 @@ struct RemoteLink {
     url: String,
     /// True once the server's Hello has arrived (input flows from then on).
     connected: bool,
+    /// This page's player id in the shared world (from Hello); u32::MAX
+    /// until it arrives.
+    player_id: u32,
     seed: Option<u64>,
     /// Chunk updates received, waiting for the frame loop.
     inbound: Vec<WorldUpdate>,
@@ -253,6 +280,16 @@ struct App {
     pending_npcs: Option<(u32, f32)>,
     /// Status line of the overlay's server-connect panel.
     server_status: HtmlDivElement,
+    // ---- Options panel (player identity + server connection) -----------
+    /// The player's display name (sanitised fallback "Player").
+    player_name: String,
+    /// The player's sphere colour (options palette).
+    player_color: [u8; 3],
+    /// Container for other players' name tags (one div per remote player).
+    tags: HtmlDivElement,
+    /// Live name-tag elements by agent id (created lazily, removed when the
+    /// player leaves).
+    tag_els: std::collections::HashMap<u32, HtmlDivElement>,
     // Keep event closures alive for the life of the page.
     _closures: Vec<*mut std::ffi::c_void>,
 }
@@ -263,6 +300,7 @@ impl App {
         hud: HtmlDivElement,
         overlay: HtmlDivElement,
         server_status: HtmlDivElement,
+        tags: HtmlDivElement,
         verify_mode: bool,
         walk_mode: bool,
         npcs: Option<(u32, f32)>,
@@ -318,8 +356,121 @@ impl App {
             next_link_id: 0,
             pending_npcs: npcs,
             server_status,
+            player_name: "Player".to_string(),
+            player_color: [255, 255, 255],
+            tags,
+            tag_els: std::collections::HashMap::new(),
             _closures: Vec::new(),
         }
+    }
+
+    /// This page's own player id (the renderer skips it: first person).
+    fn own_id(&self) -> u32 {
+        self.backend.own_id()
+    }
+
+    /// Send the current identity (name + colour) to the active backend.
+    fn apply_profile(&mut self) {
+        self.backend
+            .set_profile(self.player_name.clone(), self.player_color);
+    }
+
+    /// Create (once per remote player) a name-tag element in the container.
+    fn make_tag(&mut self) -> HtmlDivElement {
+        let doc = web_sys::window().expect("window").document().expect("document");
+        let el: HtmlDivElement = doc
+            .create_element("div")
+            .expect("div")
+            .dyn_into()
+            .expect("div");
+        el.set_class_name("tag");
+        el.style().set_property("display", "none").ok();
+        self.tags.append_child(&el).expect("append tag");
+        el
+    }
+
+    /// Position (or hide) the other players' name tags above their spheres.
+    /// Only players get tags (NPCs stay plain spheres); own player is the
+    /// camera and is skipped. The projection mirrors the renderer's exactly
+    /// (same fov/near/far), so tags sit where the spheres are drawn.
+    fn update_name_tags(
+        &mut self,
+        agents: &[AgentState],
+        cam: [f32; 3],
+        yaw: f32,
+        pitch: f32,
+        w: u32,
+        h: u32,
+    ) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let own_id = self.own_id();
+        let aspect = w as f32 / h as f32;
+        // Same parameters as the renderer's view-projection (fov 1.15,
+        // near 0.1, far 300).
+        let vp = view_projection(cam, yaw, pitch, aspect, 1.15, 0.1, 300.0);
+        let mut seen = std::collections::HashSet::new();
+        for s in agents.iter().filter(|s| s.is_player && s.id != own_id) {
+            seen.insert(s.id);
+            let el = match self.tag_els.get(&s.id) {
+                Some(e) => e.clone(),
+                None => {
+                    let e = self.make_tag();
+                    self.tag_els.insert(s.id, e.clone());
+                    e
+                }
+            };
+            let label = if s.name.is_empty() {
+                format!("P{}", s.id)
+            } else {
+                s.name.clone()
+            };
+            if el.text_content().unwrap_or_default() != label {
+                el.set_text_content(Some(&label));
+            }
+            // Project the point just above the sphere's top.
+            let top = [s.pos.x, s.pos.y + 2.0 * s.radius + 0.35, s.pos.z];
+            let Some((sx, sy)) = Self::project_to_screen(&vp, top, w, h) else {
+                el.style().set_property("display", "none").ok();
+                continue;
+            };
+            el.style().set_property("display", "block").ok();
+            el.style().set_property("left", &format!("{sx:.1}px")).ok();
+            el.style().set_property("top", &format!("{sy:.1}px")).ok();
+        }
+        // Drop tags of players that left the shared world.
+        let stale: Vec<u32> = self
+            .tag_els
+            .keys()
+            .copied()
+            .filter(|id| !seen.contains(id))
+            .collect();
+        for id in stale {
+            if let Some(el) = self.tag_els.remove(&id) {
+                el.remove();
+            }
+        }
+    }
+
+    /// World point → CSS pixels (None when behind the camera or far off
+    /// screen). Column-major view-projection, WebGPU clip space (y up,
+    /// z in [0,1]).
+    fn project_to_screen(vp: &[f32; 16], p: [f32; 3], w: u32, h: u32) -> Option<(f32, f32)> {
+        let x = vp[0] * p[0] + vp[4] * p[1] + vp[8] * p[2] + vp[12];
+        let y = vp[1] * p[0] + vp[5] * p[1] + vp[9] * p[2] + vp[13];
+        let cw = vp[3] * p[0] + vp[7] * p[1] + vp[11] * p[2] + vp[15];
+        if cw <= 1e-4 {
+            return None; // behind the camera
+        }
+        let (nx, ny) = (x / cw, y / cw);
+        if nx.abs() > 1.2 || ny.abs() > 1.2 {
+            return None; // well off screen
+        }
+        Some((
+            (nx * 0.5 + 0.5) * w as f32,
+            (0.5 - ny * 0.5) * h as f32,
+        ))
     }
 
     /// The live remote link's id (u32::MAX when not in remote mode).
@@ -358,7 +509,7 @@ impl App {
             }
             for m in msgs {
                 match m {
-                    ServerMsg::Hello { version, seed } => {
+                    ServerMsg::Hello { version, seed, player_id } => {
                         if version != PROTOCOL_VERSION {
                             log(&format!(
                                 "RustCraft: server speaks protocol {version}, client has {PROTOCOL_VERSION} — closing"
@@ -368,8 +519,18 @@ impl App {
                         }
                         r.connected = true;
                         r.seed = Some(seed);
+                        r.player_id = player_id;
                         hello_seed = Some(seed);
-                        log(&format!("RustCraft: remote server connected (seed {seed})"));
+                        // Announce our identity right away: the shared
+                        // world broadcasts it so other clients can render
+                        // us (sphere + name tag) from the first tick.
+                        r.send(ClientMsg::Profile {
+                            name: self.player_name.clone(),
+                            color: self.player_color,
+                        });
+                        log(&format!(
+                            "RustCraft: remote server connected (seed {seed}, player {player_id})"
+                        ));
                     }
                     ServerMsg::PlayerState(s) => r.player = s,
                     ServerMsg::Agents(v) => r.agents = v,
@@ -590,6 +751,20 @@ impl App {
             }
         }
 
+        // The rendered camera (eye position); shared by the name-tag
+        // projection and the render pass.
+        let cam = [
+            player.pos.x,
+            player.pos.y + rustcraft_server::agent::EYE_HEIGHT,
+            player.pos.z,
+        ];
+        // Other players' name tags (DOM overlay, projected with the same
+        // view-projection as the render). Done before `agents` moves into
+        // the renderer; own player is skipped (first person).
+        let (w, h) = self.renderer.as_ref().map(|r| r.size()).unwrap_or((0, 0));
+        let own_id = self.own_id();
+        self.update_name_tags(&agents, cam, player.yaw, player.pitch, w, h);
+
         if let Some(r) = &mut self.renderer {
             r.apply_updates(updates);
             // Report every chunk the pool evicted (visible or fog-bound).
@@ -603,13 +778,10 @@ impl App {
                 self.backend.report_evicted(evicted);
             }
             let t_render = js_sys::Date::now();
-            r.set_agents(agents);
+            // All agents except our own (rendered first person): other
+            // players are spheres like NPCs.
+            r.set_agents(agents, own_id);
             r.set_highlight(player.target.map(|t| [t.x, t.y, t.z]));
-            let cam = [
-                player.pos.x,
-                player.pos.y + rustcraft_server::agent::EYE_HEIGHT,
-                player.pos.z,
-            ];
             r.render(cam, player.yaw, player.pitch);
             let t_done = js_sys::Date::now();
             self.perf_tick_ms += t_mesh - t_tick;
@@ -716,9 +888,10 @@ impl App {
                 if let Some(r) = &self.renderer {
                     let missing = r.missing_visible(6).len();
                     log(&format!(
-                        "POOL chunks={} missing={}",
+                        "POOL chunks={} missing={} agents={}",
                         r.chunk_count(),
-                        missing
+                        missing,
+                        stats.agents
                     ));
                 }
             }
@@ -759,6 +932,7 @@ fn connect_remote(app: &Rc<RefCell<App>>, raw_url: &str) {
             ws: ws.clone(),
             url: url.clone(),
             connected: false,
+            player_id: u32::MAX,
             seed: None,
             inbound: Vec::new(),
             player: AgentState::default(),
@@ -927,21 +1101,63 @@ fn params_from_url() -> (u64, bool, bool, Option<(u32, f32)>, Option<String>) {
 }
 
 /// Accept `ws://…`, `wss://…`, or bare `host:port` (ws:// implied).
-/// Returns None for empty input or foreign schemes.
+/// Returns None for empty input or foreign schemes. The server speaks
+/// WebSocket at `/ws` on its single port, so a bare `host[:port]` (or
+/// `host[:port]/`) is upgraded to `…/ws`.
 fn normalize_ws_url(raw: &str) -> Option<String> {
     let s = raw.trim();
     if s.is_empty() {
         return None;
     }
-    if let Some(rest) = s.strip_prefix("ws://") {
-        (!rest.is_empty()).then(|| s.to_string())
-    } else if let Some(rest) = s.strip_prefix("wss://") {
-        (!rest.is_empty()).then(|| s.to_string())
+    let with_scheme = if s.starts_with("ws://") || s.starts_with("wss://") {
+        s.to_string()
     } else if s.contains("://") {
-        None
+        return None;
     } else {
-        Some(format!("ws://{s}"))
+        format!("ws://{s}")
+    };
+    let (scheme_host, rest) = with_scheme.split_once("://")?;
+    // Everything before the first '/', '?' or '#' is the authority.
+    let cut = rest
+        .as_bytes()
+        .iter()
+        .position(|&b| b == b'/' || b == b'?' || b == b'#')
+        .unwrap_or(rest.len());
+    let host = &rest[..cut];
+    if host.is_empty() {
+        return None;
     }
+    let tail = &rest[cut..];
+    // Bare host[:port] (or host[:port]/) means the /ws endpoint.
+    if tail.is_empty() || tail == "/" {
+        return Some(format!("{scheme_host}://{host}/ws"));
+    }
+    Some(format!("{scheme_host}://{host}{tail}"))
+}
+
+/// True when `target` is `ancestor` or nested inside it (the options panel
+/// is the pointer-lock exclusion zone).
+fn is_inside(target: &Element, ancestor: &Element) -> bool {
+    let mut cur: Option<Element> = Some(target.clone());
+    while let Some(el) = cur {
+        if el == *ancestor {
+            return true;
+        }
+        cur = el.parent_element();
+    }
+    false
+}
+
+/// `"r,g,b"` → `[u8; 3]` (each part 0..=255).
+fn parse_color_triple(s: &str) -> Option<[u8; 3]> {
+    let parts: Vec<u8> = s
+        .split(',')
+        .map(|p| p.trim().parse::<u8>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if parts.len() != 3 {
+        return None;
+    }
+    Some([parts[0], parts[1], parts[2]])
 }
 
 #[wasm_bindgen(start)]
@@ -977,6 +1193,30 @@ pub fn start() -> Result<(), JsValue> {
         .get_element_by_id("server-status")
         .and_then(|e| e.dyn_into::<HtmlDivElement>().ok())
         .expect("missing #server-status");
+    let options = document
+        .get_element_by_id("options")
+        .and_then(|e| e.dyn_into::<HtmlElement>().ok())
+        .expect("missing #options");
+    let options_button = document
+        .get_element_by_id("options-btn")
+        .and_then(|e| e.dyn_into::<HtmlElement>().ok())
+        .expect("missing #options-btn");
+    let name_input = document
+        .get_element_by_id("player-name")
+        .and_then(|e| e.dyn_into::<HtmlInputElement>().ok())
+        .expect("missing #player-name");
+    let palette = document
+        .get_element_by_id("palette")
+        .and_then(|e| e.dyn_into::<HtmlElement>().ok())
+        .expect("missing #palette");
+    let builtin_button = document
+        .get_element_by_id("server-builtin")
+        .and_then(|e| e.dyn_into::<HtmlElement>().ok())
+        .expect("missing #server-builtin");
+    let tags = document
+        .get_element_by_id("tags")
+        .and_then(|e| e.dyn_into::<HtmlDivElement>().ok())
+        .expect("missing #tags");
 
     // In verify mode the headless test never gets pointer lock, so hide the
     // "click to play" overlay to let screenshots show the rendered canvas.
@@ -995,6 +1235,7 @@ pub fn start() -> Result<(), JsValue> {
         hud.clone(),
         overlay.clone(),
         server_status.clone(),
+        tags.clone(),
         verify_mode,
         walk_mode,
         npcs,
@@ -1130,17 +1371,19 @@ pub fn start() -> Result<(), JsValue> {
         // Click anywhere to (re)enter pointer lock. The listener is on
         // `document`, not the canvas, because the click-to-play overlay
         // covers the canvas — a canvas-only listener would never fire while
-        // the menu is up. Clicks on the server-connect controls are exempt
-        // (they need a focused input / a real button click, not a lock).
+        // the menu is up. Clicks inside the options panel (name/colour/
+        // server controls) are exempt: they need focused inputs and real
+        // button clicks, not a pointer lock.
         let cb = Closure::<dyn FnMut(web_sys::Event)>::new({
             let app = app.clone();
             let canvas_for_lock = canvas.clone();
+            let options_ref = options.clone();
             move |e: web_sys::Event| {
-                let in_controls = e
+                if e
                     .target()
-                    .and_then(|t| t.dyn_ref::<web_sys::HtmlElement>().map(|el| el.id()))
-                    .is_some_and(|id| id == "server-url" || id == "server-connect");
-                if in_controls {
+                    .and_then(|t| t.dyn_ref::<Element>().cloned())
+                    .is_some_and(|t| is_inside(&t, &options_ref))
+                {
                     return;
                 }
                 let a = app.borrow();
@@ -1198,6 +1441,116 @@ pub fn start() -> Result<(), JsValue> {
         server_button
             .add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
             .expect("server-connect click listener");
+        app.borrow_mut()
+            ._closures
+            .push(Box::into_raw(Box::new(cb)) as *mut _);
+
+        // Options panel: the "Options" button toggles its open state.
+        let cb = Closure::<dyn FnMut()>::new({
+            let options_ref = options.clone();
+            move || {
+                let _ = options_ref.class_list().toggle("open");
+            }
+        });
+        options_button
+            .add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
+            .expect("options button click listener");
+        app.borrow_mut()
+            ._closures
+            .push(Box::into_raw(Box::new(cb)) as *mut _);
+
+        // Player name: typing never feeds game input (stop propagation),
+        // and every change is pushed to the backend (the shared world
+        // broadcasts it to the other players' name tags).
+        let cb = Closure::<dyn FnMut(KeyboardEvent)>::new({
+            let app = app.clone();
+            let input_el = name_input.clone();
+            move |e: KeyboardEvent| {
+                e.stop_propagation();
+                let mut a = app.borrow_mut();
+                let raw = input_el.value().trim().to_string();
+                a.player_name = if raw.is_empty() { "Player".to_string() } else { raw };
+                a.apply_profile();
+            }
+        });
+        name_input
+            .add_event_listener_with_callback("input", cb.as_ref().unchecked_ref())
+            .expect("player-name input listener");
+        app.borrow_mut()
+            ._closures
+            .push(Box::into_raw(Box::new(cb)) as *mut _);
+
+        // Colour palette: one swatch per fixed colour; clicking picks it
+        // (selection ring) and pushes the profile to the backend.
+        {
+            let kids = palette.children();
+            let mut swatches: Vec<HtmlElement> = Vec::new();
+            let mut i = 0;
+            while i < kids.length() {
+                if let Some(c) = kids.item(i) {
+                    if let Ok(h) = c.dyn_into::<HtmlElement>() {
+                        swatches.push(h);
+                    }
+                }
+                i += 1;
+            }
+            for s in &swatches {
+                if s
+                    .get_attribute("data-color")
+                    .as_deref()
+                    .is_some_and(|v| v == "255,255,255")
+                {
+                    let _ = s.class_list().add_1("selected"); // default white
+                }
+            }
+            let cb = Closure::<dyn FnMut(MouseEvent)>::new({
+                let app = app.clone();
+                let swatches = swatches.clone();
+                move |e: MouseEvent| {
+                    let Some(swatch) = e
+                        .target()
+                        .and_then(|t| t.dyn_ref::<Element>().cloned())
+                        .and_then(|el| el.closest(".swatch").ok().flatten())
+                    else {
+                        return;
+                    };
+                    let Some(color) = swatch
+                        .get_attribute("data-color")
+                        .and_then(|v| parse_color_triple(&v))
+                    else {
+                        return;
+                    };
+                    for s in &swatches {
+                        let _ = s.class_list().remove_1("selected");
+                    }
+                    let _ = swatch.class_list().add_1("selected");
+                    let mut a = app.borrow_mut();
+                    a.player_color = color;
+                    a.apply_profile();
+                }
+            });
+            palette
+                .add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
+                .expect("palette click listener");
+            app.borrow_mut()
+                ._closures
+                .push(Box::into_raw(Box::new(cb)) as *mut _);
+        }
+
+        // "Use built-in server": drop any remote link and return to a
+        // fresh embedded world (same as Connect with an empty URL).
+        let cb = Closure::<dyn FnMut()>::new({
+            let app = app.clone();
+            move || {
+                let mut a = app.borrow_mut();
+                let seed = a.builtin_seed;
+                a.fallback_to_builtin();
+                a.set_server_status(&format!("built-in server (seed {seed})"));
+            }
+        });
+        builtin_button
+            .add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
+            .expect("built-in button click listener");
         app.borrow_mut()
             ._closures
             .push(Box::into_raw(Box::new(cb)) as *mut _);

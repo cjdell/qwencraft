@@ -1,24 +1,29 @@
-//! Minimal HTTP/1.1 front end for the server dashboard (only `include_dir`
-//! as a dependency): serves the embedded dioxus dashboard build (the whole
-//! `dashboard/dist` tree — the app's JS imports a `snippets/` subtree) plus
-//! two status endpoints:
+//! Minimal HTTP/1.1 front end for the headless server (only `include_dir`
+//! as a dependency). Served on the SAME port as the WebSocket (the
+//! dispatcher routes `GET /ws` to the WebSocket upgrade and everything else
+//! here), so the whole server — game WebSocket, dashboard, game client —
+//! lives on one authority:
 //!
+//! - `GET /healthz` → `ok`;
 //! - `GET /api/status` → JSON: seed, uptime, agents (players + NPCs),
 //!   event log;
 //! - `GET /api/map?x=&z=&w=&h=` → binary: topmost block per column for a
-//!   region (2 bytes/column, row-major; see `crate::map`).
+//!   region (2 bytes/column, row-major; see `crate::map`);
+//! - `GET /dashboard/…` → the embedded dioxus dashboard build (the whole
+//!   `dashboard/dist` tree — the app's JS imports a `snippets/` subtree);
+//! - `GET /…` → the embedded game client build (`web/dist`, if present at
+//!   build time — run `./scripts/build.sh` before building the server) or a
+//!   fallback page pointing at the dashboard.
 //!
 //! Deliberately small: GET only, one request per connection
 //! (`Connection: close`), bounded request reads. It is a LAN debugging
 //! tool, not a public web server.
 
-use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use include_dir::Dir;
 use include_dir::include_dir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::map::MapState;
 use crate::WorldState;
@@ -27,52 +32,46 @@ use crate::WorldState;
 /// embedded so the server has no filesystem dependencies at runtime. The
 /// built assets are committed; rerun the script (and this crate) after
 /// changing the dashboard sources.
-static DIST: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../dashboard/dist");
+static DASH: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../dashboard/dist");
 
-/// Bind the HTTP listener and spawn the accept loop. Returns the bound
-/// address.
-pub async fn run_http(
-    bind: IpAddr,
-    port: u16,
-    world: Arc<Mutex<WorldState>>,
-    map: Arc<Mutex<MapState>>,
-) -> Result<SocketAddr, String> {
-    let listener = TcpListener::bind((bind, port))
-        .await
-        .map_err(|e| format!("bind {bind}:{port} (dashboard http): {e}"))?;
-    let addr = listener.local_addr().map_err(|e| format!("local_addr: {e}"))?;
-    eprintln!("[rustcraft-net] dashboard on http://{addr}");
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((tcp, peer)) => {
-                    let world = world.clone();
-                    let map = map.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_conn(tcp, world, map).await {
-                            eprintln!("[rustcraft-net] {peer}: http: {e}");
-                        }
-                    });
-                }
-                Err(e) => eprintln!("[rustcraft-net] http accept failed: {e}"),
-            }
-        }
-    });
-    Ok(addr)
-}
+/// The game client build output (`scripts/build.sh`), embedded so the game
+/// itself can be hosted on the same authority as the WebSocket. `web/dist`
+/// is a build artifact (not committed); when it is absent, `build.rs`
+/// materializes a fallback index page there so the root still answers.
+static WEB: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../web/dist");
 
+/// Serve one HTTP request on an already-open stream. The dispatcher has
+/// already sniffed the first bytes to decide WebSocket vs. HTTP and has
+/// re-prepended them to this stream, so a plain read-to-head gives the
+/// request.
+///
 /// One request per connection (we always reply `Connection: close`).
-async fn handle_conn(
-    mut tcp: TcpStream,
+pub async fn handle_http<S>(
+    mut stream: S,
     world: Arc<Mutex<WorldState>>,
     map: Arc<Mutex<MapState>>,
-) -> Result<(), String> {
-    let mut buf = [0u8; 8192];
-    let n = tcp.read(&mut buf).await.map_err(|e| format!("read: {e}"))?;
-    if n == 0 {
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Read up to the header terminator (bounded: a request line + headers
+    // for our tiny front end never come close to 16 KB).
+    let mut buf: Vec<u8> = Vec::with_capacity(512);
+    loop {
+        let mut tmp = [0u8; 4096];
+        match stream.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e) => return Err(format!("read: {e}")),
+        }
+        if head_complete(&buf) || buf.len() >= 16_384 {
+            break;
+        }
+    }
+    if buf.is_empty() {
         return Ok(());
     }
-    let req = String::from_utf8_lossy(&buf[..n]);
+    let req = String::from_utf8_lossy(&buf).into_owned();
     let (first, query) = match req.lines().next().and_then(|l| l.split_whitespace().nth(1)) {
         Some(p) => {
             let (path, q) = match p.split_once('?') {
@@ -82,15 +81,23 @@ async fn handle_conn(
             (path, q)
         }
         None => {
-            respond(&mut tcp, 400, "text/plain; charset=utf-8", b"bad request").await?;
+            respond(&mut stream, 400, "text/plain; charset=utf-8", b"bad request").await?;
             return Ok(());
         }
     };
     let (status, body, content_type) = route(first, query.as_deref(), &world, &map).await;
-    respond(&mut tcp, status, content_type, &body).await
+    respond(&mut stream, status, content_type, &body).await
 }
 
-/// Route a request: API endpoints, then the embedded dashboard assets.
+/// True when the buffer holds a complete HTTP request head.
+fn head_complete(buf: &[u8]) -> bool {
+    buf.windows(4).any(|w| w == b"\r\n\r\n")
+}
+
+/// Route a request: API endpoints, then the dashboard, then the game
+/// client. Everything is path-based (no virtual hosts): the dashboard owns
+/// `/dashboard`, the API owns `/api` + `/healthz`, and the rest is the game
+/// client.
 async fn route(
     path: &str,
     query: Option<&str>,
@@ -117,18 +124,50 @@ async fn route(
             }
             Err(()) => (400, b"bad ?x=&z=&w=&h=".to_vec(), "text/plain; charset=utf-8"),
         },
-        _ => serve_static(path),
+        "/ws" => (
+            426,
+            b"this endpoint speaks WebSocket - connect with ws://host:port/ws".to_vec(),
+            "text/plain; charset=utf-8",
+        ),
+        "/dashboard" | "/dashboard/" => {
+            dashboard_file("index.html")
+        }
+        p if p.starts_with("/dashboard/") => {
+            dashboard_file(p.strip_prefix("/dashboard/").unwrap_or(p))
+        }
+        "/" => game_file("index.html"),
+        p => game_file(p.strip_prefix('/').unwrap_or(p)),
     }
 }
 
-/// Look up `path` in the embedded dashboard build.
-fn serve_static(path: &str) -> (u16, Vec<u8>, &'static str) {
-    let rel = path.strip_prefix('/').unwrap_or(path);
+/// Look up `rel` in the embedded dashboard build.
+fn dashboard_file(rel: &str) -> (u16, Vec<u8>, &'static str) {
     let rel = if rel.is_empty() { "index.html" } else { rel };
-    let Some(file) = DIST.get_file(rel) else {
+    let Some(file) = DASH.get_file(rel) else {
         return (404, b"not found".to_vec(), "text/plain; charset=utf-8");
     };
-    let mime = match rel.rsplit('.').next().unwrap_or("") {
+    (
+        200,
+        file.contents().to_vec(),
+        mime_for(rel),
+    )
+}
+
+/// Look up `rel` in the embedded game-client build.
+fn game_file(rel: &str) -> (u16, Vec<u8>, &'static str) {
+    let rel = if rel.is_empty() { "index.html" } else { rel };
+    let Some(file) = WEB.get_file(rel) else {
+        return (404, b"not found".to_vec(), "text/plain; charset=utf-8");
+    };
+    (
+        200,
+        file.contents().to_vec(),
+        mime_for(rel),
+    )
+}
+
+fn mime_for(rel: &str) -> &'static str {
+    match rel.rsplit('.').next().unwrap_or("") {
         "html" => "text/html; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "wasm" => "application/wasm",
@@ -138,12 +177,7 @@ fn serve_static(path: &str) -> (u16, Vec<u8>, &'static str) {
         "png" => "image/png",
         "ico" => "image/x-icon",
         _ => "application/octet-stream",
-    };
-    (
-        200,
-        file.contents().to_vec(),
-        mime,
-    )
+    }
 }
 
 /// `?x=&z=&w=&h=` → (centre x, centre z, width, height) in blocks.
@@ -197,6 +231,8 @@ fn status_json(w: &WorldState) -> String {
         json.push_str(&a.id.to_string());
         json.push_str(",\"player\":");
         json.push_str(if a.is_player { "true" } else { "false" });
+        json.push_str(",\"name\":");
+        json.push_str(&json_escape(&a.name));
         json.push_str(",\"x\":");
         json.push_str(&a.pos.x.to_string());
         json.push_str(",\"y\":");
@@ -251,16 +287,20 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-async fn respond(
-    tcp: &mut TcpStream,
+async fn respond<S>(
+    tcp: &mut S,
     status: u16,
     content_type: &str,
     body: &[u8],
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    S: AsyncWrite + Unpin,
+{
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        426 => "Upgrade Required",
         _ => "Internal Server Error",
     };
     let head = format!(

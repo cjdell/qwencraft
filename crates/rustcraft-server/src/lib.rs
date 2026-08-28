@@ -48,6 +48,43 @@ pub const NPC_COUNT_DEFAULT: u32 = 64;
 pub const NPC_SPACING_DEFAULT: f32 = 16.0;
 /// Golden angle (radians): successive phyllotaxis points are ~spacing apart.
 const GOLDEN_ANGLE: f32 = 2.3999632;
+/// Display-name cap (bytes on the wire are far smaller; this is what a
+/// name tag should show at most).
+pub const NAME_MAX_CHARS: usize = 24;
+
+/// Sanitise a player-supplied display name: trim, drop control characters
+/// (including whole ANSI escape sequences — a bare ESC drop would leave the
+/// `[31m` tail behind), cap at [`NAME_MAX_CHARS`], and fall back to
+/// "Player" when empty.
+pub fn sanitize_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Skip a CSI sequence: ESC '[' <params> <intermediates> <final
+            // byte 0x40..=0x7E> (a truncated one skips to the end).
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c2 in chars.by_ref() {
+                    if (0x40..=0x7e).contains(&(c2 as u32)) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if c.is_control() {
+            continue;
+        }
+        out.push(c);
+    }
+    let s: String = out.chars().take(NAME_MAX_CHARS).collect();
+    if s.is_empty() {
+        "Player".to_string()
+    } else {
+        s
+    }
+}
 /// Max region payloads emitted per tick.
 const STREAM_PER_TICK: usize = 4;
 /// Max chunks generated per tick by the streamer.
@@ -169,10 +206,25 @@ impl Server {
         let k = self.agents.iter().filter(|a| a.kind == AgentKind::Player).count() as f32;
         let off = k * 1.6;
         let pos = Vec3::new(sx as f32 + 0.5 + off, (surface + 2) as f32, sz as f32 + 0.5);
-        self.agents.push(Agent::player(id, pos));
+        self.agents.push(Agent::player(id, pos, "Player", [255, 255, 255]));
         self.inputs.insert(id, Input::default());
         self.prev_inputs.insert(id, Input::default());
         id
+    }
+
+    /// Set player `id`'s display name and sphere colour (no-op when the id
+    /// is not a live player). The name is sanitised (trimmed, control
+    /// chars dropped, 24-char cap, "Player" when empty) so whatever a
+    /// client types renders safely as a name tag.
+    pub fn set_profile(&mut self, id: u32, name: String, color: [u8; 3]) {
+        if let Some(idx) = self
+            .agents
+            .iter()
+            .position(|a| a.id == id && a.kind == AgentKind::Player)
+        {
+            self.agents[idx].name = sanitize_name(&name);
+            self.agents[idx].color = color;
+        }
     }
 
     /// Remove a player agent (and its per-player state). NPCs are kept.
@@ -1469,6 +1521,35 @@ mod tests {
         // The remaining player still simulates (no dangling per-player state).
         s.tick(1.0 / 60.0);
         assert!(s.agent_state(b).is_player);
+    }
+
+    #[test]
+    fn set_profile_renames_and_recolors_only_that_player() {
+        let mut s = Server::new_world(1337);
+        let a = s.add_player();
+        let b = s.add_player();
+        s.set_profile(a, "  Alice\u{1b}[31m ".to_string(), [10, 200, 255]);
+        let sa = s.agent_state(a);
+        assert_eq!(sa.name, "Alice", "control chars dropped, trimmed");
+        assert_eq!(sa.color, [10, 200, 255]);
+        // The other player is untouched.
+        let sb = s.agent_state(b);
+        assert_eq!(sb.name, "Player");
+        assert_eq!(sb.color, [255, 255, 255]);
+        // Unknown / removed ids are no-ops (no panic).
+        s.set_profile(999, "Ghost".to_string(), [1, 2, 3]);
+        s.remove_player(b);
+        s.set_profile(b, "Gone".to_string(), [1, 2, 3]);
+        assert_eq!(s.agent_state(a).name, "Alice");
+    }
+
+    #[test]
+    fn sanitize_name_clamps_and_falls_back() {
+        assert_eq!(sanitize_name("  hi  "), "hi");
+        assert_eq!(sanitize_name(""), "Player");
+        assert_eq!(sanitize_name("   \t\n  "), "Player");
+        let long = "a".repeat(100);
+        assert_eq!(sanitize_name(&long).chars().count(), NAME_MAX_CHARS);
     }
 
     #[test]

@@ -3,8 +3,9 @@
 # headless server (rustcraft-net) over WebSocket and renders its world.
 #
 # - builds the rustcraft-net binary (release) if missing,
-# - starts the headless server + a static server for web/dist,
-# - runs headless Chromium with ?server=ws://127.0.0.1:PORT&verify=1,
+# - starts the headless server (single port: ws://…/ws + dashboard + game)
+#   + a static server for web/dist,
+# - runs headless Chromium with ?server=ws://127.0.0.1:PORT/ws&verify=1,
 # - checks: app started, remote connection established, renderer ready,
 #   first frame rendered, GPU pixel readback (sky + terrain — the scene is
 #   rendered from server-streamed chunks), no uncaught JS errors, and the
@@ -15,6 +16,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 PORT="${PORT:-$((20000 + RANDOM % 20000))}"
+# The server's single port (WebSocket at /ws, dashboard at /dashboard).
 WS_PORT="${WS_PORT:-$((40000 + RANDOM % 20000))}"
 SEED="${SEED:-1337}"
 LOG="${LOG:-${TMPDIR:-/tmp}/rustcraft-remote-chrome.log}"
@@ -63,7 +65,7 @@ PROF_DIR="${TMPDIR}/rustcraft-remote-chrome-prof"
 rm -rf "$PROF_DIR"
 mkdir -p "$PROF_DIR"
 
-echo "==> headless server on ws://127.0.0.1:${WS_PORT} (seed ${SEED})"
+echo "==> headless server on ws://127.0.0.1:${WS_PORT}/ws (seed ${SEED})"
 "$SRV_BIN" --seed "$SEED" --port "$WS_PORT" --bind 127.0.0.1 >"$WS_LOG" 2>&1 &
 SRV=$!
 python3 -m http.server "$PORT" --directory web/dist --bind 127.0.0.1 >/dev/null 2>&1 &
@@ -98,11 +100,11 @@ timeout "$SECOND_SECS" chromium \
   --user-data-dir="$PROF_DIR2" \
   --window-size=1280,720 \
   --enable-logging=stderr --v=0 \
-  "http://127.0.0.1:${PORT}/?seed=${SEED}&server=ws://127.0.0.1:${WS_PORT}" \
+  "http://127.0.0.1:${PORT}/?seed=${SEED}&server=ws://127.0.0.1:${WS_PORT}/ws" \
   >"$LOG2" 2>&1 &
 SECOND=$!
 
-echo "==> headless chromium (remote mode, ?server=ws://127.0.0.1:${WS_PORT}, ${RUN_SECS}s real time)"
+echo "==> headless chromium (remote mode, ?server=ws://127.0.0.1:${WS_PORT}/ws, ${RUN_SECS}s real time)"
 timeout "$RUN_SECS" chromium \
   --headless \
   --no-sandbox \
@@ -113,7 +115,7 @@ timeout "$RUN_SECS" chromium \
   --user-data-dir="$PROF_DIR" \
   --window-size=1280,720 \
   --enable-logging=stderr --v=0 \
-  "http://127.0.0.1:${PORT}/?seed=${SEED}&server=ws://127.0.0.1:${WS_PORT}&verify=1" \
+  "http://127.0.0.1:${PORT}/?seed=${SEED}&server=ws://127.0.0.1:${WS_PORT}/ws&verify=1" \
   >"$LOG" 2>&1 || true
 
 # Let the second browser finish (it runs shorter than the first).
@@ -131,15 +133,19 @@ check() {
 }
 
 check "app started"                    grep -q "RustCraft: app started" "$LOG"
-check "remote server connected"        grep -q "RustCraft: remote server connected (seed ${SEED})" "$LOG"
+check "remote server connected"        grep -q "RustCraft: remote server connected (seed ${SEED}, player" "$LOG"
 check "renderer ready (WebGPU)"        grep -q "RustCraft: renderer ready" "$LOG"
 check "first frame rendered"           grep -q "RustCraft: first frame rendered" "$LOG"
 check "no uncaught JS errors"          bash -c "! grep -E 'Uncaught|TypeError|ReferenceError' '$LOG' | grep -v 'favicon' | grep -q ."
-check "server saw the client"          grep -q "player 0 joined" "$WS_LOG"
+check "server saw the client"          grep -q "joined (shared world seed ${SEED}, 1 online)" "$WS_LOG"
 # The second browser must have joined the SAME shared world while the first
-# was connected (the server reports the online count on each join).
-check "second browser connected"       grep -q "RustCraft: remote server connected (seed ${SEED})" "$LOG2"
-check "shared world saw two players"   grep -q "2 online" "$WS_LOG"
+# was connected (the server reports the online count on each join), and the
+# first browser must have RENDERED both players (the POOL telemetry counts
+# the agents the server streamed to it: player 0 + player 1, no ambient
+# NPCs in net mode).
+check "second browser connected"       grep -q "RustCraft: remote server connected (seed ${SEED}, player" "$LOG2"
+check "shared world saw two players"   grep -q ", 2 online)" "$WS_LOG"
+check "first browser rendered 2 players" grep -q "POOL chunks=[0-9]* missing=[0-9]* agents=2" "$LOG"
 
 # GPU readback: the shadow renderer re-renders the scene built from the
 # server-streamed chunk regions; the 4x3 grid must show sky + terrain.

@@ -4,11 +4,15 @@
 //! rustcraft-net [--seed N] [--port N] [--bind IP] [--cert FILE --key FILE]
 //! ```
 //!
-//! Serves one **shared world** for all WebSocket connections: every client
-//! that connects joins the same world and can see the other players and
-//! their edits (see `rustcraft-net` lib docs). Browser clients point at it
-//! with `?server=ws://host:port` (or the in-page connect panel); open two
-//! browsers at the same URL to play together.
+//! One port hosts everything: the game WebSocket at `/ws`, the operator
+//! dashboard at `/dashboard`, and (when `web/dist` was present at build
+//! time) the game client itself at `/` — so the whole game can be hosted on
+//! a single authority. Serves one **shared world** for all WebSocket
+//! connections: every client that connects joins the same world and can see
+//! the other players and their edits (see `rustcraft-net` lib docs).
+//! Browser clients point at it with `?server=ws://host:port/ws` (or the
+//! in-page options panel); open two browsers at the same URL to play
+//! together.
 //!
 //! The server is host-only (tokio/mio don't support wasm); the wasm stub at
 //! the bottom keeps the shared workspace's wasm build green.
@@ -17,12 +21,13 @@
 const USAGE: &str = "\
 usage: rustcraft-net [options]
   --seed N       world seed (default 1337)
-  --port N       WebSocket listen port (default 9000; 0 = let the OS pick)
+  --port N       listen port (default 9000; 0 = let the OS pick). One port
+                 hosts everything: WebSocket at /ws, dashboard at /dashboard,
+                 game client at /
   --bind IP      interface to bind (default 0.0.0.0)
-  --cert FILE    TLS certificate (PEM) — with --key, serves wss://
+  --cert FILE    TLS certificate (PEM) — with --key, the port speaks
+                 wss:// + https://
   --key FILE     TLS private key (PEM, RSA or PKCS#8)
-  --http-port N  dashboard HTTP port (default 9001; 0 = let the OS pick)
-  --no-http      disable the dashboard HTTP server
   -h, --help     this help";
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -67,14 +72,6 @@ fn parse_opts(args: &[String]) -> Result<rustcraft_net::ServerOptions, String> {
             "--key" => {
                 opts.key = Some(std::path::PathBuf::from(next_value(args, &mut i, "--key")?))
             }
-            "--http-port" => {
-                opts.http_port = Some(
-                    next_value(args, &mut i, "--http-port")?
-                        .parse()
-                        .map_err(|e| format!("--http-port: {e}"))?,
-                )
-            }
-            "--no-http" => opts.http_port = None,
             other => return Err(format!("unknown option {other:?} (see --help)")),
         }
     }
@@ -92,12 +89,13 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    let tls = opts.cert.is_some();
     match rustcraft_net::serve(opts).await {
         Ok(endpoints) => {
-            eprintln!("rustcraft-net: ready (connect a browser to ws://{})", endpoints.ws);
-            if let Some(h) = endpoints.http {
-                eprintln!("rustcraft-net: dashboard at http://{h}");
-            }
+            let a = endpoints.addr;
+            let (ws, http) = if tls { ("wss", "https") } else { ("ws", "http") };
+            eprintln!("rustcraft-net: ready (connect a browser to {ws}://{a}{})", rustcraft_net::WS_PATH);
+            eprintln!("rustcraft-net: dashboard at {http}://{a}/dashboard/ · game client at {http}://{a}/");
             let _ = tokio::signal::ctrl_c().await;
             eprintln!("rustcraft-net: shutting down");
         }

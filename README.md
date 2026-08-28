@@ -41,19 +41,24 @@ cargo test             # host unit tests (worldgen, physics, streaming, …)
 
 # headless server (separate process, one shared world for all connections):
 cargo run -p rustcraft-net --release -- --seed 1337 --port 9000
-# then open http://localhost:8080/?server=ws://localhost:9000
-# — or type the ws:// URL into the connect panel on the start screen.
+# then open http://localhost:8080/?server=ws://localhost:9000/ws
+# — or type the ws:// URL into the start screen's Options panel.
 # Every browser that connects joins the SAME world: players see each other
-# and one player's block edits appear in everyone else's world.
+# (spheres with name tags, using the name + colour from Options) and one
+# player's block edits appear in everyone else's world.
+# The server listens on ONE port only: the WebSocket lives at /ws on it,
+# the dashboard under /dashboard, and it even serves the game page itself
+# at / (so the server can host the whole experience by itself).
 ```
 
 > **Headless server.** `rustcraft-net` runs the authoritative game server
 > standalone (tokio, WebSocket). All connections share *one* world (one
 > `Server` for the configured seed), ticked at a fixed 60 Hz on the server;
 > the browser only renders and forwards input. Open two browsers at the same
-> URL to play together — each sees the others and their edits. `?server=`
-> (or the connect panel) points the client at it; without it, the embedded
-> in-browser server is used exactly as before. See [Headless server](#headless-server-remote-play).
+> URL to play together — each sees the others (as named, coloured spheres)
+> and their edits. `?server=` (or the start screen's **Options** panel) points
+> the client at it; without it, the embedded in-browser server is used
+> exactly as before. See [Headless server](#headless-server-remote-play).
 
 > **Playing from another device on your network:** browsers only enable
 > WebGPU in *secure contexts* (`https://` or `localhost`), so
@@ -62,6 +67,21 @@ cargo run -p rustcraft-net --release -- --seed 1337 --port 9000
 > `https://<machine-LAN-IP>:8080` on the other device, accepting the
 > browser's certificate warning. The app detects the missing WebGPU on
 > plain HTTP and shows an explanatory message instead of crashing.
+
+## Start screen & options
+
+The start screen shows one big instruction — **click anywhere to play** —
+and an **Options** button that opens the identity/connection panel:
+
+- **Name** — your display name (sent to the server on connect; other
+  players see it as a floating name tag above your sphere, and on the
+  server dashboard).
+- **Colour** — the colour of your player sphere (a small palette).
+- **Server** — the headless-server URL + **Connect**; **Disconnect** drops
+  the remote server and falls back to the embedded in-browser one.
+
+The panel is inert until you're in a game (it needs a live backend), and
+clicking inside it never starts pointer lock.
 
 ## Controls
 
@@ -107,7 +127,7 @@ against — even while you're turning fast.
 | ------------------- | ----------------------------------------------------------------------- |
 | `rustcraft-world`   | Block types, seeded noise/terrain, 16³ chunks with 26³ region payloads, chunk meshing (voxel lighting + AO), shared WGSL shader + view-projection math |
 | `rustcraft-server`  | The authoritative game server: infinite lazy world (chunks generated on demand), agent simulation (player + NPCs) with a per-agent local block window, fixed-tick physics, delta-based world updates, NPC load test. Plus the wire `protocol` module (binary codec shared by both transports). Runs in-process in the browser *and* inside the headless server |
-| `rustcraft-net`     | Headless server: tokio + WebSocket front end over the game server (`ws://`, `wss://` with `--cert`/`--key`); one shared world for all connections, 60 Hz tick loop, per-connection streaming |
+| `rustcraft-net`     | Headless server, single port: WebSocket at `/ws` (`ws://`, `wss://` with `--cert`/`--key`), dashboard at `/dashboard/`, game page at `/`, plus `/api/*` + `/healthz`; one shared world for all connections, 60 Hz tick loop, per-connection streaming |
 | `rustcraft-client`  | WebGPU (wgpu 27) renderer: shared terrain-mesh buffer pool, sphere agents, fog, first-person camera |
 | `rustcraft-web`     | wasm glue: input (keyboard/pointer lock), HUD, main loop, backend abstraction (embedded server or remote over WebSocket) |
 | `web/`              | `index.html` page hosting the wasm app                                  |
@@ -125,13 +145,21 @@ cargo run -p rustcraft-net --release -- --seed 1337 --port 9000 --bind 0.0.0.0
 cargo run -p rustcraft-net --release -- --cert .certs/cert.pem --key .certs/key.pem
 ```
 
+**One port only.** The WebSocket endpoint is `ws://<host>:<port>/ws`; the
+same port also serves the [dashboard](#server-dashboard) under
+`/dashboard/`, the game page at `/` (so a single server can host
+everything), and the API endpoints (`/healthz`, `/api/status`,
+`/api/map`). A plain HTTP request to `/ws` gets a 426 telling it to use a
+WebSocket upgrade.
+
 - **One shared world for all connections.** Every socket joins the *same*
   `Server` for the configured seed. Each connection gets its own streaming
   window (the chunks around *its* player) but all players live in one world:
   everyone's block edits are re-sent to every viewer that holds the chunk,
-  and each client receives the full agent list (itself **and the other
-  players**), so players can see each other. Disconnecting removes that
-  player from the world; the world lives on for the others.
+  and each client receives the full agent list (the other **players**, each
+  with their chosen name and colour — rendered as spheres with a floating
+  name tag; you see yourself as an NPC-like sphere too). Disconnecting
+  removes that player from the world; the world lives on for the others.
 - **Server is authoritative, as before.** The browser renders server state
   and forwards input (keys, mouse deltas, aim-stamped clicks, the NPC load
   dial); it never mutates world state. The server ticks at a fixed 60 Hz
@@ -139,16 +167,19 @@ cargo run -p rustcraft-net --release -- --cert .certs/cert.pem --key .certs/key.
   client renders the latest snapshot it holds (at 60 Hz the difference is
   one tick, which reads as smooth).
 - **Wire protocol** (`rustcraft-server/src/protocol.rs`): little-endian
-  binary frames, versioned (currently 1). Server → client: `Hello`,
-  player/agent state, chunk regions, world stats, NPC load echo. Client →
-  server: input snapshots, actions (break/place with stamped aim), chunk
-  re-send requests (terrain-pool eviction), NPC load changes.
+  binary frames, versioned (currently 3). Server → client: `Hello` (seed +
+  your player id), player/agent state (agents carry name + colour), chunk
+  regions, world stats, NPC load echo. Client → server: the player profile
+  (name + colour, sent right after connect), input snapshots, actions
+  (break/place with stamped aim), chunk re-send requests (terrain-pool
+  eviction), NPC load changes.
 
-**Connecting the browser:** type the server URL into the panel on the start
-screen (or press Enter in the field), or launch with the query param:
+**Connecting the browser:** open **Options** on the start screen and type
+the server URL into the field (a bare `host[:port]` is fine — `/ws` is
+appended), then press **Connect**; or launch with the query param:
 
 ```
-http://localhost:8080/?server=ws://192.168.49.50:9000
+http://localhost:8080/?server=ws://192.168.49.50:9000/ws
 ```
 
 `ws://` works from `localhost` pages; from a non-localhost (https) page the
@@ -161,13 +192,13 @@ players, the world streams, and a GPU pixel readback of the rendered scene.
 
 ## Server dashboard
 
-`rustcraft-net` also runs a small **HTTP dashboard** (separate port, default
-**9001**; `--http-port N`, `--no-http` to disable) so you can jump onto a
-server and see what's going on without launching a game client:
+`rustcraft-net` also runs a small **dashboard** on the *same* port as the
+WebSocket, under **`/dashboard/`**, so you can jump onto a server and see
+what's going on without launching a game client:
 
 ```
-cargo run -p rustcraft-net --release -- --seed 1337 --port 9000 --http-port 9001
-# → http://192.168.49.50:9001
+cargo run -p rustcraft-net --release -- --seed 1337 --port 9000
+# → http://192.168.49.50:9000/dashboard/   (WebSocket at :9000/ws)
 ```
 
 It shows the **live connection count** (players + NPCs), an **event log**

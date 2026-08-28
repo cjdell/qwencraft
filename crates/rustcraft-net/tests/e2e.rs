@@ -28,6 +28,9 @@ struct Sample {
     /// Max number of player agents seen in an `Agents` message (a shared
     /// world with N connected clients reports N players to each of them).
     players: u32,
+    /// Player display names seen in `Agents` messages (shared world: each
+    /// client sees every player's name).
+    player_names: Vec<String>,
     npc_load: Option<(u32, f32)>,
 }
 
@@ -39,6 +42,7 @@ impl Default for Sample {
             chunk_positions: Vec::new(),
             npcs: 0,
             players: 0,
+            player_names: Vec::new(),
             npc_load: None,
         }
     }
@@ -64,6 +68,11 @@ fn sample(sock: &mut Sock, secs: f32) -> Sample {
                         ServerMsg::Agents(v) => {
                             let np = v.iter().filter(|x| x.is_player).count() as u32;
                             s.players = s.players.max(np);
+                            for a in v.iter().filter(|x| x.is_player) {
+                                if !s.player_names.contains(&a.name) {
+                                    s.player_names.push(a.name.clone());
+                                }
+                            }
                         }
                         ServerMsg::Hello { .. } => {}
                     }
@@ -84,16 +93,18 @@ fn send(sock: &mut Sock, msg: &ClientMsg) {
         .expect("send");
 }
 
-/// First frame must be the binary Hello; return it.
-fn expect_hello(sock: &mut Sock, name: &str) {
+/// First frame must be the binary Hello; return the player id it carries
+/// (the client uses it to skip rendering its own sphere).
+fn expect_hello(sock: &mut Sock, name: &str) -> u32 {
     let hello = match sock.read().expect("read") {
         Message::Binary(data) => ServerMsg::decode_stream(&data).0,
         other => panic!("first frame must be binary, got {other:?}"),
     };
     match hello.into_iter().next().expect("hello present") {
-        ServerMsg::Hello { version, seed } => {
+        ServerMsg::Hello { version, seed, player_id } => {
             assert_eq!(version, PROTOCOL_VERSION, "protocol version on {name}");
             assert_eq!(seed, SEED, "seed on {name}");
+            player_id
         }
         other => panic!("first message must be Hello, got {other:?}"),
     }
@@ -132,17 +143,17 @@ fn break_under_feet(sock: &mut Sock, p: &rustcraft_server::AgentState) {
 async fn end_to_end_single_player() {
     let ep = serve(ServerOptions {
         seed: SEED,
-        port: 0,
-        http_port: None, // keep the fixed default (9001) free for other tests
+        port: 0, // single port: /ws + /dashboard + game client
         ..Default::default()
     })
     .await
     .expect("serve");
-    let addr = ep.ws;
-    let (mut sock, _) = connect(&format!("ws://{addr}")).expect("connect");
+    let addr = ep.addr;
+    let (mut sock, _) = connect(&format!("ws://{addr}/ws")).expect("connect");
 
     // 1) Hello with our protocol version and seed.
-    expect_hello(&mut sock, "conn");
+    let player_id = expect_hello(&mut sock, "conn");
+    assert_eq!(player_id, 0, "first connection is player 0");
 
     // 2) The world streams in: at least one chunk and a live player state.
     let s = sample(&mut sock, 2.0);
@@ -226,18 +237,18 @@ async fn end_to_end_single_player() {
 async fn two_connections_share_one_world() {
     let ep = serve(ServerOptions {
         seed: SEED,
-        port: 0,
-        http_port: None, // keep the fixed default (9001) free for other tests
+        port: 0, // single port: /ws + /dashboard + game client
         ..Default::default()
     })
     .await
     .expect("serve");
-    let url = format!("ws://{}", ep.ws);
+    let url = format!("ws://{}/ws", ep.addr);
     let (mut a, _) = connect(&url).expect("connect A");
     let (mut b, _) = connect(&url).expect("connect B");
 
-    expect_hello(&mut a, "A");
-    expect_hello(&mut b, "B");
+    let pid_a = expect_hello(&mut a, "A");
+    let pid_b = expect_hello(&mut b, "B");
+    assert_ne!(pid_a, pid_b, "each connection gets its own player id");
 
     // Let both players' views stream in.
     let sa = sample(&mut a, 4.0);
@@ -268,6 +279,23 @@ async fn two_connections_share_one_world() {
         sb2.chunk_positions.contains(&edited),
         "B must receive A's edited chunk (shared world) — got {} chunks",
         sb2.chunks
+    );
+
+    // A announces a profile (name + sphere colour); B must see it in the
+    // agent list — this is what lets players see each other (sphere +
+    // name tag).
+    send(
+        &mut a,
+        &ClientMsg::Profile {
+            name: "Alice".to_string(),
+            color: [10, 200, 255],
+        },
+    );
+    let sb3 = sample(&mut b, 1.5);
+    assert!(
+        sb3.player_names.contains(&"Alice".to_string()),
+        "B must see A's name in the shared agent list (saw {:?})",
+        sb3.player_names
     );
 
     drop(a);
@@ -320,12 +348,10 @@ async fn wss_serves_encrypted_sessions() {
         bind: "127.0.0.1".parse().unwrap(),
         cert: Some(cert.clone()),
         key: Some(key.clone()),
-        http_port: None, // TLS test: no dashboard needed
     })
     .await
     .expect("serve wss");
-    let addr = ep.ws;
-    assert!(ep.http.is_none());
+    let addr = ep.addr;
 
     // Client trusting only the self-signed cert above.
     let cert_pem = std::fs::read_to_string(&cert).unwrap();
@@ -340,7 +366,7 @@ async fn wss_serves_encrypted_sessions() {
 
     let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp connect");
     let (mut ws, _resp) = tokio_tungstenite::client_async_tls_with_config(
-        &format!("wss://{addr}"),
+        &format!("wss://{addr}/ws"),
         tcp,
         None,
         Some(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(cfg))),
@@ -353,9 +379,10 @@ async fn wss_serves_encrypted_sessions() {
         other => panic!("first frame must be binary, got {other:?}"),
     };
     match hello.into_iter().next().expect("hello present") {
-        ServerMsg::Hello { version, seed } => {
+        ServerMsg::Hello { version, seed, player_id } => {
             assert_eq!(version, PROTOCOL_VERSION);
             assert_eq!(seed, SEED);
+            assert_eq!(player_id, 0);
         }
         other => panic!("first message must be Hello, got {other:?}"),
     }
@@ -413,21 +440,20 @@ async fn http_get(addr: &SocketAddr, target: &str) -> (u16, String, Vec<u8>) {
 async fn dashboard_http_serves_status_map_and_assets() {
     let ep = serve(ServerOptions {
         seed: SEED,
-        port: 0,
-        http_port: Some(0),
+        port: 0, // single port: /ws + /dashboard + game client
         ..Default::default()
     })
     .await
     .expect("serve");
-    let http = ep.http.expect("http enabled by default in this test");
+    let addr = ep.addr;
 
     // Health probe.
-    let (code, _ct, body) = http_get(&http, "/healthz").await;
+    let (code, _ct, body) = http_get(&addr, "/healthz").await;
     assert_eq!(code, 200);
     assert_eq!(body, b"ok");
 
     // Status before any client: no players, seed present, startup logged.
-    let (code, ct, body) = http_get(&http, "/api/status").await;
+    let (code, ct, body) = http_get(&addr, "/api/status").await;
     assert_eq!(code, 200);
     assert!(ct.contains("application/json"), "{ct}");
     let s = String::from_utf8_lossy(&body).into_owned();
@@ -435,34 +461,53 @@ async fn dashboard_http_serves_status_map_and_assets() {
     assert!(s.contains("\"players\":0"), "status: {s}");
     assert!(s.contains("server started"), "event log: {s}");
 
-    // The dashboard page + its assets (the embedded dioxus build).
-    let (code, ct, body) = http_get(&http, "/").await;
+    // The dashboard page + its assets (the embedded dioxus build), under
+    // the /dashboard path on the same port as the WebSocket.
+    let (code, ct, body) = http_get(&addr, "/dashboard/").await;
     assert_eq!(code, 200);
     assert!(ct.contains("text/html"));
     assert!(String::from_utf8_lossy(&body).contains("RustCraft"));
-    let (code, ct, _) = http_get(&http, "/rustcraft_dashboard.js").await;
+    let (code, ct, _) = http_get(&addr, "/dashboard/rustcraft_dashboard.js").await;
     assert_eq!(code, 200);
     assert!(ct.contains("javascript"), "{ct}");
-    let (code, ct, body) = http_get(&http, "/rustcraft_dashboard_bg.wasm").await;
+    let (code, ct, body) = http_get(&addr, "/dashboard/rustcraft_dashboard_bg.wasm").await;
     assert_eq!(code, 200);
     assert_eq!(ct, "application/wasm");
     assert!(body.len() > 10_000, "wasm asset looks empty: {} bytes", body.len());
-    let (code, _ct, _) = http_get(&http, "/dashboard.css").await;
+    let (code, _ct, _) = http_get(&addr, "/dashboard/dashboard.css").await;
     assert_eq!(code, 200);
 
+    // The root serves the game client (web/dist when built) or the fallback
+    // page — either way, an HTML page mentioning RustCraft.
+    let (code, ct, body) = http_get(&addr, "/").await;
+    assert_eq!(code, 200);
+    assert!(ct.contains("text/html"), "{ct}");
+    assert!(String::from_utf8_lossy(&body).contains("RustCraft"), "root page: {body:?}");
+
+    // /ws over plain HTTP answers an upgrade-required error (the WebSocket
+    // handshake itself is covered by the ws tests).
+    let (code, _, _) = http_get(&addr, "/ws").await;
+    assert_eq!(code, 426);
+
     // A player joins over ws: the status must reflect it (agent + event).
-    let (mut sock, _) = connect(&format!("ws://{}", ep.ws)).expect("connect");
-    expect_hello(&mut sock, "conn");
+    let (mut sock, _) = connect(&format!("ws://{addr}/ws")).expect("connect");
+    let pid = expect_hello(&mut sock, "conn");
+    // Announce a profile: the status JSON must carry the player's name.
+    send(&mut sock, &ClientMsg::Profile {
+        name: "MapReader".to_string(),
+        color: [9, 9, 9],
+    });
     let _ = sample(&mut sock, 0.5);
-    let (_, _, body) = http_get(&http, "/api/status").await;
+    let (_, _, body) = http_get(&addr, "/api/status").await;
     let s = String::from_utf8_lossy(&body).into_owned();
     assert!(s.contains("\"players\":1"), "status: {s}");
     assert!(s.contains("\"player\":true"), "agent present: {s}");
-    assert!(s.contains("joined"), "join event: {s}");
+    assert!(s.contains(&format!("\"name\":\"MapReader\"")), "player name: {s}");
+    assert!(s.contains(&format!("player {pid} joined")), "join event: {s}");
 
     // Map: 64x64 region = 64*64*2 bytes, mostly non-air near spawn, and
     // the origin header echoes the clamped region.
-    let (code, _ct, body) = http_get(&http, "/api/map?x=8&z=8&w=64&h=64").await;
+    let (code, _ct, body) = http_get(&addr, "/api/map?x=8&z=8&w=64&h=64").await;
     assert_eq!(code, 200);
     assert_eq!(body.len(), 64 * 64 * 2);
     let mut non_air = 0usize;
@@ -479,13 +524,13 @@ async fn dashboard_http_serves_status_map_and_assets() {
     );
 
     // Oversized requests clamp to the max side (256), tiny ones to the min.
-    let (_, _, body) = http_get(&http, "/api/map?x=8&z=8&w=4096&h=4096").await;
+    let (_, _, body) = http_get(&addr, "/api/map?x=8&z=8&w=4096&h=4096").await;
     assert_eq!(body.len(), 256 * 256 * 2);
-    let (_, _, body) = http_get(&http, "/api/map?x=8&z=8&w=1&h=1").await;
+    let (_, _, body) = http_get(&addr, "/api/map?x=8&z=8&w=1&h=1").await;
     assert_eq!(body.len(), 16 * 16 * 2);
 
     // Unknown paths 404.
-    let (code, _, _) = http_get(&http, "/nope").await;
+    let (code, _, _) = http_get(&addr, "/nope").await;
     assert_eq!(code, 404);
 
     drop(sock);

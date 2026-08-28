@@ -18,13 +18,15 @@ streaming window, and players see each other and each other's edits; `ws://`
 input; it never mutates world state (golden rule 4 holds for both
 transports). The wire codec lives in `rustcraft-server::protocol`.
 
-`rustcraft-net` additionally runs a small **dashboard** over HTTP (default
-port 9001): a dioxus (wasm) app — player/NPC counts, an event log, and a
-pan/zoom 2D minimap of the world with agents plotted — served from
-`dashboard/dist`, which is embedded into the server binary via
-`include_dir!` (the built assets are committed). The map is computed off
-the tick path from the pure terrain function + the world's edit history,
-never touching the authoritative world's lock.
+`rustcraft-net` additionally runs a small **dashboard** on the *same*
+port, under `/dashboard/`: a dioxus (wasm) app — player/NPC counts, an
+event log, and a pan/zoom 2D minimap of the world with agents plotted —
+served from `dashboard/dist`, which is embedded into the server binary
+via `include_dir!` (the built assets are committed). The same port hosts
+the WebSocket at `/ws`, the dashboard under `/dashboard/`, the game page
+at `/`, and `/api/*` + `/healthz` — one port, one authority. The map is
+computed off the tick path from the pure terrain function + the world's
+edit history, never touching the authoritative world's lock.
 
 ## Golden rules
 
@@ -65,7 +67,7 @@ writes temp files):
 
 | Command | What it does |
 |---|---|
-| `cargo test` | All host unit tests (67: world 23, server 36, net lib 4 — the dashboard map, net e2e 4 incl. a wss TLS round-trip, a two-client shared-world test, and a dashboard HTTP test). The only place Rust tests run — **wasm tests can't execute here**. |
+| `cargo test` | All host unit tests (69: world 23, server 38, net e2e 4 incl. a wss TLS round-trip, a two-client shared-world test, and a dashboard HTTP test, dashboard lib 4 — the map). The only place Rust tests run — **wasm tests can't execute here**. |
 | `./scripts/build.sh` | Release build → `web/dist` (wasm-bindgen 0.2.100). |
 | `./scripts/serve.sh` | Serve `web/dist` at `http://localhost:8080` (python3). |
 | `./scripts/serve.sh --https` | Same over TLS with a self-signed cert (`.certs/`, generated once via openssl). **Required for LAN play** — WebGPU needs a secure context. |
@@ -73,9 +75,9 @@ writes temp files):
 | `./scripts/walk_test.sh` | ~80s scripted walk→fly→return-walk in headless Chromium (`SEED=N` env, default 1337); the fly phase makes a long corridor so the pool evicts the walk endpoint as fog-bound trail, then the player walks back through that re-entered terrain. Asserts no *sustained* visible holes (3+ consecutive POOL samples > 15 missing meshed-but-evicted chunks) — catches a broken eviction→re-stream path; a single-sample transient (fast re-entry) is OK. |
 | `./scripts/npc_test.sh [COUNT] [SPACING]` | Headless NPC load test (`?npcs=COUNT:SPACING`); asserts boot with the load, live count in the HUD, and that steady-state physics runs on the per-agent local block window (hit rate ≥ 99%, solid fallbacks at spawn-tick scale). |
 | `./scripts/secure_context_test.sh` | LAN-HTTP (graceful "WebGPU unavailable" message, no panic) + HTTPS startup on localhost and LAN IP. |
-| `./scripts/remote_test.sh` | Headless-server e2e: standalone `rustcraft-net` + Chromium with `?server=ws://…`; asserts connect, streamed world, GPU pixel readback of the rendered scene. |
+| `./scripts/remote_test.sh` | Headless-server e2e: standalone `rustcraft-net` (single port, `?server=ws://…/ws`) + **two** Chromium browsers in the same shared world; asserts both connect, the server sees both, the first browser renders both players (`POOL … agents=2`), streamed world, GPU pixel readback. |
 | `./scripts/build_dashboard.sh` | Builds the dashboard (its own wasm workspace) → `dashboard/dist` (wasm-bindgen + html/css). The dist is **embedded into the `rustcraft-net` binary and committed** — after running it, rebuild `rustcraft-net` and commit `dashboard/dist`. |
-| `./scripts/dashboard_test.sh` | Dashboard e2e: curl checks on `/healthz`, `/api/status`, `/api/map`, assets + headless Chromium on the page (DOM shows the live server, screenshot shows the rendered minimap). |
+| `./scripts/dashboard_test.sh` | Dashboard e2e: single-port curl checks (`/healthz`, `/api/status`, `/api/map`, `/dashboard/*` assets, game at `/`, 426 on `/ws` over plain HTTP, 404) + headless Chromium on `/dashboard/` (DOM shows the live server, screenshot shows the rendered minimap). |
 
 ## Architecture map
 
@@ -96,43 +98,62 @@ crates/
                       target, spawn scan. Supports N players (add_player/
                       remove_player/player_ids; `new` = 1 player + ambient
                       NPCs for the builtin, `new_world` = 0 for the net
-                      server). Streamer = per-viewer chunk streaming state
-                      (sent set + queue + dirty-chunk re-sends) so the
-                      builtin (one viewer) and the net server (one per
+                      server). Agents carry a display name + colour
+                      (players choose both; `set_profile` sanitises the
+                      name — trim, strip control chars, 24-char cap).
+                      Streamer = per-viewer chunk streaming state (sent
+                      set + queue + dirty-chunk re-sends) so the builtin
+                      (one viewer) and the net server (one per
                       connection) share the logic. protocol.rs = versioned
                       little-endian binary wire codec (ClientMsg/ServerMsg,
-                      encode/decode/decode_stream) shared by both
-                      transports; pure + host-testable, no deps.
-  rustcraft-net/      HEADLESS server binary. tokio + tokio-tungstenite
-                      WebSocket front end (ws://, wss:// via --cert/--key).
-                      ONE SHARED WORLD: a single Server (Arc<Mutex<
-                      WorldState>>) for all connections; each connection
-                      registers a player (add_player) and gets its own
-                      Streamer (per-viewer chunks). A single 60Hz tick
-                      loop ticks the world once and streams/updates every
-                      player; block edits re-send to every viewer holding
-                      the chunk; each client gets the full Agents list so
-                      players see each other. Per-session reader task
-                      applies inbound msgs. DASHBOARD: http.rs = minimal
-                      dependency-free HTTP/1.1 (GET only, one request per
-                      connection) serving the embedded dashboard/dist +
-                      /api/status (JSON) + /api/map?x=&z=&w=&h= (binary
-                      2-bytes/column); map.rs = MapState (own lock, own
-                      WorldGen + height cache + last-wins edit overlay —
-                      never touches the world lock) computing the
-                      topmost block per column from pure terrain + the
-                      world's edit history (exact modulo flowers/canopy
-                      overhang — see its tests). The Server's event_sink
-                      (set by serve()) feeds the EventLog (own mutex, cap
-                      256 — must stay outside the world lock). HOST-ONLY:
+                      encode/decode/decode_stream, currently v3: Hello
+                      carries the player id, agents carry name + colour,
+                      ClientMsg::Profile sends the player's name/colour)
+                      shared by both transports; pure + host-testable, no
+                      deps.
+  rustcraft-net/      HEADLESS server binary. tokio + tokio-tungstenite.
+                      SINGLE PORT (one authority): dispatch_conn sniffs
+                      the first bytes — TLS ClientHello → accept TLS
+                      first; otherwise the request head is pre-read
+                      (10s timeout, 8KB cap) and replayed through a
+                      `Prepended<T>` adapter (replay buffer + proxied
+                      AsyncWrite — without the replay, consuming the head
+                      hangs tokio-tungstenite's accept_async). route:
+                      `/ws` + WebSocket-Upgrade header → the socket;
+                      `/ws` over plain HTTP → 426; `/dashboard/*` → the
+                      embedded dashboard/dist; `/` + `/*` → the embedded
+                      web/dist game page (build.rs materialises a
+                      placeholder index.html in gitignored web/dist when
+                      it's absent); `/healthz`, `/api/status` (JSON,
+                      agents include name), `/api/map?x=&z=&w=&h=`
+                      (binary 2-bytes/column). ONE SHARED WORLD: a single
+                      Server (Arc<Mutex<WorldState>>) for all
+                      connections; each connection registers a player
+                      (add_player) and gets its own Streamer (per-viewer
+                      chunks). A single 60Hz tick loop ticks the world
+                      once and streams/updates every player; block edits
+                      re-send to every viewer holding the chunk; each
+                      client gets the full Agents list (named, coloured)
+                      so players see each other. Per-session reader task
+                      applies inbound msgs. map.rs = MapState (own lock,
+                      own WorldGen + height cache + last-wins edit
+                      overlay — never touches the world lock) computing
+                      the topmost block per column from pure terrain +
+                      the world's edit history (exact modulo
+                      flowers/canopy overhang — see its tests). The
+                      Server's event_sink (set by serve()) feeds the
+                      EventLog (own mutex, cap 256 — must stay outside
+                      the world lock). examples/ws_probe.rs = tiny manual
+                      protocol probe (connect, decode Hello). HOST-ONLY:
                       deps are cfg(not(target_arch = "wasm32"))-gated so
                       the shared workspace wasm build stays green (empty
                       lib + stub bin on wasm). e2e tests (tests/e2e.rs)
                       run real sync WebSocket clients against serve():
-                      single player, two clients sharing one world (see
-                      each other + edit sync), a wss round-trip with an
+                      single player (incl. Profile name/colour broadcast),
+                      two clients sharing one world (see each other +
+                      edit sync), a wss round-trip with an
                       openssl-generated self-signed cert, and the
-                      dashboard HTTP endpoints.
+                      dashboard HTTP endpoints (single port, /dashboard/).
   rustcraft-client/   WebGPU renderer. Terrain buffer POOL (one 2M-vertex
                       vbo/ibo, chunks own index ranges, compaction when
                       full), opaque+water pipelines (translucent water
@@ -144,11 +165,22 @@ crates/
                       directly, remote decodes ServerMsg frames into the
                       same WorldUpdate/AgentState shapes and forwards
                       input/actions as ClientMsg (so the client renders
-                      whatever the world is — builtin or shared). Connect
-                      panel (start screen) + ?server=ws://… param; failed
-                      connect falls back to builtin. verify_gl.rs = WebGL2
-                      "shadow renderer" that re-renders the scene for headless
-                      pixel verification.
+                      whatever the world is — builtin or shared).
+                      Start screen: big "CLICK ANYWHERE TO PLAY" +
+                      Options panel (player name + colour palette, server
+                      URL + Connect, disconnect→builtin); clicking inside
+                      the panel never triggers pointer lock. RemoteLink
+                      sends ClientMsg::Profile on Hello (name/colour from
+                      the options state) and skips the player's OWN id
+                      when building the agent list (the local player is
+                      the camera; other players are rendered as spheres
+                      with floating DOM name tags — #tags container,
+                      projected with the same view-projection). ?server=
+                      accepts a bare host[:port] (normalise_ws_url
+                      appends /ws); failed connect falls back to builtin.
+                      verify_gl.rs = WebGL2 "shadow renderer" that
+                      re-renders the scene for headless pixel
+                      verification.
 web/                  index.html (HUD, overlay) + dist/ (build output).
 dashboard/            STANDALONE cargo workspace (its dep graph must not
                       touch the main workspace's exact pins). Dioxus 0.7

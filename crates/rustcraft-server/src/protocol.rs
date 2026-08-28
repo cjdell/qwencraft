@@ -29,13 +29,20 @@ use rustcraft_world::{BlockPos, ChunkPos};
 /// chunks and its normal stream re-sends the ones that are visible again,
 /// rate-limited and nearest-first — the client no longer has to track and
 /// re-request its own pool.
-pub const PROTOCOL_VERSION: u8 = 2;
+///
+/// v3: `Hello` carries the connection's own `player_id` (so the client can
+/// render the *other* players in the shared world without drawing its own
+/// first-person sphere), `AgentState` carries a `name` (rendered as a tag
+/// above other players' spheres), and clients send `Profile` (name +
+/// sphere colour) so the shared world shows who is who.
+pub const PROTOCOL_VERSION: u8 = 3;
 
 // ---- client -> server message types --------------------------------------
 const T_INPUT: u8 = 0x01;
 const T_ACTION: u8 = 0x02;
 const T_EVICTED: u8 = 0x03;
 const T_SET_NPC_LOAD: u8 = 0x04;
+const T_PROFILE: u8 = 0x05;
 
 // ---- server -> client message types --------------------------------------
 const T_HELLO: u8 = 0x10;
@@ -78,13 +85,19 @@ pub enum ClientMsg {
     /// the network form of `Server::set_npc_load` + `Action::NpcLoad`
     /// (armed via `?npcs=` for headless runs).
     SetNpcLoad { count: u32, spacing: f32 },
+    /// This player's identity: display name + sphere colour. Sent on
+    /// connect and on change; broadcast to everyone via the agent list so
+    /// players can see each other (sphere + name tag).
+    Profile { name: String, color: [u8; 3] },
 }
 
 /// Messages the server sends to the client.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ServerMsg {
-    /// First message on the connection: protocol version + world seed.
-    Hello { version: u8, seed: u64 },
+    /// First message on the connection: protocol version + world seed +
+    /// this connection's own player id (the client skips rendering it —
+    /// first person — and renders every other player as a sphere).
+    Hello { version: u8, seed: u64, player_id: u32 },
     /// The player's state (camera source of truth), every tick.
     PlayerState(AgentState),
     /// All agents (player first), every tick — the client renders them.
@@ -145,6 +158,14 @@ impl ClientMsg {
                 p.u32(*count);
                 p.f32(*spacing);
                 T_SET_NPC_LOAD
+            }
+            ClientMsg::Profile { name, color } => {
+                p.u16(name.len() as u16);
+                p.bytes(name.as_bytes());
+                for c in *color {
+                    p.u8(c);
+                }
+                T_PROFILE
             }
         };
         p.frame(ty)
@@ -207,6 +228,15 @@ impl ClientMsg {
                 let spacing = d.f32()?;
                 ClientMsg::SetNpcLoad { count, spacing }
             }
+            T_PROFILE => {
+                let len = d.u16()? as usize;
+                if len > 64 {
+                    return None; // names are clamped far below this
+                }
+                let name = String::from_utf8(d.bytes(len)?.to_vec()).ok()?;
+                let color = [d.u8()?, d.u8()?, d.u8()?];
+                ClientMsg::Profile { name, color }
+            }
             _ => return None,
         };
         if !d.exhausted() {
@@ -240,9 +270,10 @@ impl ServerMsg {
     pub fn encode(&self) -> Vec<u8> {
         let mut p = Enc::new();
         let ty = match self {
-            ServerMsg::Hello { version, seed } => {
+            ServerMsg::Hello { version, seed, player_id } => {
                 p.u8(*version);
                 p.u64(*seed);
+                p.u32(*player_id);
                 T_HELLO
             }
             ServerMsg::PlayerState(s) => {
@@ -294,7 +325,8 @@ impl ServerMsg {
             T_HELLO => {
                 let version = d.u8()?;
                 let seed = d.u64()?;
-                ServerMsg::Hello { version, seed }
+                let player_id = d.u32()?;
+                ServerMsg::Hello { version, seed, player_id }
             }
             T_PLAYER => {
                 let s = decode_agent(&mut d)?;
@@ -406,6 +438,8 @@ fn encode_agent(p: &mut Enc, s: &AgentState) {
         }
         None => p.u8(0),
     }
+    p.u16(s.name.len() as u16);
+    p.bytes(s.name.as_bytes());
 }
 
 fn decode_agent(d: &mut Dec) -> Option<AgentState> {
@@ -422,9 +456,15 @@ fn decode_agent(d: &mut Dec) -> Option<AgentState> {
     } else {
         None
     };
+    let name_len = d.u16()? as usize;
+    if name_len > 64 {
+        return None; // names are clamped far below this
+    }
+    let name = String::from_utf8(d.bytes(name_len)?.to_vec()).ok()?;
     Some(AgentState {
         id,
         is_player: flags & 0x1 != 0,
+        name,
         pos,
         yaw,
         pitch,
@@ -464,6 +504,9 @@ impl Enc {
     }
     fn u8(&mut self, v: u8) {
         self.0.push(v);
+    }
+    fn u16(&mut self, v: u16) {
+        self.0.extend_from_slice(&v.to_le_bytes());
     }
     fn u32(&mut self, v: u32) {
         self.0.extend_from_slice(&v.to_le_bytes());
@@ -511,6 +554,9 @@ impl<'a> Dec<'a> {
     fn u8(&mut self) -> Option<u8> {
         Some(*self.take(1)?.first()?)
     }
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
@@ -539,6 +585,7 @@ mod tests {
         AgentState {
             id: 7,
             is_player: true,
+            name: "Zörg".to_string(),
             pos: crate::Vec3::new(-12.5, 34.25, 99.125),
             yaw: 1.23,
             pitch: -0.45,
@@ -589,6 +636,14 @@ mod tests {
                 count: 128,
                 spacing: 24.0,
             },
+            ClientMsg::Profile {
+                name: "Alice".to_string(),
+                color: [10, 200, 255],
+            },
+            ClientMsg::Profile {
+                name: String::new(),
+                color: [0, 0, 0],
+            },
         ];
         for m in &msgs {
             let enc = m.encode();
@@ -619,9 +674,10 @@ mod tests {
             ServerMsg::Hello {
                 version: PROTOCOL_VERSION,
                 seed: 0xDEAD_BEEF_CAFE_F00D,
+                player_id: 3,
             },
-            ServerMsg::PlayerState(agent),
-            ServerMsg::Agents(vec![agent, AgentState::default()]),
+            ServerMsg::PlayerState(agent.clone()),
+            ServerMsg::Agents(vec![agent.clone(), AgentState::default()]),
             ServerMsg::Chunk {
                 pos: ChunkPos::new(-2, 1, 3),
                 data: chunk_data,
@@ -647,7 +703,7 @@ mod tests {
         no_target.on_ground = false;
         no_target.fly = false;
         for s in [full_agent(), no_target] {
-            let enc = ServerMsg::PlayerState(s).encode();
+            let enc = ServerMsg::PlayerState(s.clone()).encode();
             let ServerMsg::PlayerState(d) = ServerMsg::decode(&enc).unwrap() else {
                 panic!("wrong message type");
             };
@@ -682,6 +738,7 @@ mod tests {
         let s2 = ServerMsg::Hello {
             version: 1,
             seed: 9,
+            player_id: 0,
         };
         let mut sbuf = s1.encode();
         sbuf.extend_from_slice(&s2.encode());

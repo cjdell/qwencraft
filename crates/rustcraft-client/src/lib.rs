@@ -320,6 +320,12 @@ impl Renderer {
         self.terrain.len()
     }
 
+    /// Current viewport size in pixels (for screen-space overlays like the
+    /// other players' name tags).
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     /// First frame has been presented (for startup logging).
     pub fn take_first_frame(&mut self) -> bool {
         let f = self.first_frame;
@@ -610,13 +616,15 @@ impl Renderer {
         }
     }
 
-    /// Update agent spheres from the latest states.
-    pub fn set_agents(&mut self, states: Vec<AgentState>) {
+    /// Update agent spheres from the latest states. `own_id` is skipped:
+    /// in first person the camera *is* that sphere (other players are
+    /// rendered like NPCs, with name tags added by the web layer).
+    pub fn set_agents(&mut self, states: Vec<AgentState>, own_id: u32) {
         // Remove stale.
         let ids: std::collections::HashSet<u32> = states.iter().map(|s| s.id).collect();
         self.agents.retain(|id, _| ids.contains(id));
         for s in &states {
-            if s.is_player {
+            if s.id == own_id {
                 continue; // first person: the player is the camera
             }
             let (verts, indices) = rustcraft_server::sphere_mesh(s);

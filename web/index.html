@@ -18,51 +18,116 @@
       z-index: 10; color: rgba(255, 255, 255, 0.9); font: 20px ui-monospace, monospace;
       pointer-events: none; text-shadow: 0 0 2px rgba(0,0,0,0.8);
     }
+    /* Other players' name tags (positioned by the wasm layer). */
+    #tags { position: fixed; inset: 0; z-index: 5; overflow: hidden; pointer-events: none; }
+    #tags .tag {
+      position: absolute; transform: translate(-50%, -100%);
+      font: 600 13px/1.2 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      color: #fff; background: rgba(8, 10, 14, 0.62);
+      padding: 2px 8px; border-radius: 6px; white-space: nowrap;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.9);
+      border: 1px solid rgba(255,255,255,0.22);
+    }
     #overlay {
       position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center;
       background: rgba(0, 0, 0, 0.55); color: #fff;
       font: 15px/1.7 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
       text-align: center; cursor: pointer;
     }
-    #overlay .box { background: rgba(20, 24, 32, 0.92); padding: 24px 36px; border-radius: 12px; box-shadow: 0 8px 40px rgba(0,0,0,0.5); }
-    #overlay h1 { margin: 0 0 8px; font-size: 22px; letter-spacing: 2px; }
+    #overlay .box { background: rgba(20, 24, 32, 0.92); padding: 30px 44px; border-radius: 14px; box-shadow: 0 8px 40px rgba(0,0,0,0.5); }
+    #overlay h1 { margin: 0 0 4px; font-size: 30px; letter-spacing: 6px; }
+    #overlay .play {
+      margin: 14px 0 18px; font-size: 38px; font-weight: 700; letter-spacing: 3px;
+      color: #ffd54a; text-shadow: 0 0 24px rgba(255, 213, 74, 0.5);
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.55; transform: scale(1.03); } }
     #overlay p { margin: 4px 0; opacity: 0.85; }
-    #overlay .seed { opacity: 0.6; font-size: 12px; margin-top: 12px; }
-    #overlay .server-row { margin-top: 14px; display: flex; gap: 8px; justify-content: center; }
-    #overlay #server-url {
+    #overlay .seed { opacity: 0.6; font-size: 12px; margin-top: 16px; }
+    /* ---- Options panel (name / colour / server) ------------------------- */
+    #options { margin-top: 20px; cursor: default; user-select: none; }
+    #options-btn {
+      font: 600 15px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      background: rgba(48, 72, 116, 0.6); color: #eaf3ff; border: 1px solid rgba(120, 150, 200, 0.55);
+      border-radius: 8px; padding: 8px 26px; cursor: pointer; letter-spacing: 1px;
+    }
+    #options-btn:hover { background: rgba(66, 98, 152, 0.8); }
+    #options-body { display: none; margin-top: 14px; }
+    #options.open #options-body { display: block; }
+    #options .opt-row { display: flex; gap: 8px; align-items: center; justify-content: center; margin-top: 12px; }
+    #options .opt-row label { font-size: 12px; opacity: 0.8; text-align: right; width: 72px; }
+    #options input[type="text"] {
       font: 13px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
       background: rgba(10, 12, 18, 0.9); color: #cde3ff; border: 1px solid rgba(120, 150, 200, 0.4);
-      border-radius: 6px; padding: 6px 10px; width: 260px; text-align: left;
+      border-radius: 6px; padding: 7px 10px; text-align: left;
     }
-    #overlay #server-url:focus { outline: none; border-color: rgba(140, 180, 255, 0.9); }
-    #overlay #server-connect {
+    #options input[type="text"]:focus { outline: none; border-color: rgba(140, 180, 255, 0.9); }
+    #player-name { width: 150px; }
+    #server-url { width: 240px; }
+    #options .btn {
       font: 13px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
       background: rgba(60, 90, 150, 0.55); color: #fff; border: 1px solid rgba(120, 150, 200, 0.5);
-      border-radius: 6px; padding: 6px 14px; cursor: pointer;
+      border-radius: 6px; padding: 7px 14px; cursor: pointer;
     }
-    #overlay #server-connect:hover { background: rgba(80, 120, 190, 0.75); }
-    #overlay #server-status { margin-top: 6px; font-size: 12px; opacity: 0.7; min-height: 14px; }
+    #options .btn:hover { background: rgba(80, 120, 190, 0.75); }
+    #options .btn.danger { background: rgba(140, 70, 60, 0.55); border-color: rgba(220, 130, 110, 0.5); }
+    #options .btn.danger:hover { background: rgba(170, 90, 75, 0.7); }
+    #palette { display: flex; gap: 7px; }
+    #palette .swatch {
+      width: 26px; height: 26px; border-radius: 7px; cursor: pointer;
+      border: 2px solid rgba(255, 255, 255, 0.25);
+    }
+    #palette .swatch.selected { border-color: #fff; box-shadow: 0 0 10px rgba(255,255,255,0.65); }
+    #server-status { margin-top: 10px; font-size: 12px; opacity: 0.7; min-height: 14px; }
   </style>
 </head>
 <body>
   <canvas id="game"></canvas>
   <div id="hud">loading…</div>
   <div id="crosshair">+</div>
+  <div id="tags"></div>
   <div id="overlay">
     <div class="box">
       <h1>RUSTCRAFT</h1>
-      <p>Click to play</p>
+      <div class="play">CLICK ANYWHERE TO PLAY</div>
       <p>WASD move &nbsp;·&nbsp; Space jump / swim up &nbsp;·&nbsp; Shift sprint &nbsp;·&nbsp; Mouse look</p>
       <p>F fly (Space/Shift up/down) &nbsp;·&nbsp; Q/E fly speed</p>
       <p>Left click break &nbsp;·&nbsp; Right click place stone &nbsp;·&nbsp; Esc release mouse</p>
       <p>NPC load test: N spawn &nbsp;·&nbsp; C clear &nbsp;·&nbsp; I/U count ×2 ÷2 &nbsp;·&nbsp; [ ] spacing</p>
       <p>The black outline shows the block you'll break / place against</p>
-      <div class="server-row">
-        <input id="server-url" type="text" spellcheck="false" autocomplete="off"
-               placeholder="ws://host:port — blank = built-in server" />
-        <button id="server-connect" type="button">Connect</button>
+      <div id="options">
+        <button id="options-btn" type="button">Options</button>
+        <div id="options-body">
+          <div class="opt-row">
+            <label for="player-name">Player name</label>
+            <input id="player-name" type="text" maxlength="24" spellcheck="false"
+                   autocomplete="off" placeholder="Player" />
+          </div>
+          <div class="opt-row">
+            <label>Sphere colour</label>
+            <div id="palette">
+              <button class="swatch" type="button" data-color="255,255,255" style="background:#ffffff" title="white"></button>
+              <button class="swatch" type="button" data-color="214,60,60" style="background:#d63c3c" title="red"></button>
+              <button class="swatch" type="button" data-color="240,150,60" style="background:#f0963c" title="orange"></button>
+              <button class="swatch" type="button" data-color="235,200,60" style="background:#ebc83c" title="yellow"></button>
+              <button class="swatch" type="button" data-color="110,210,90" style="background:#6ed25a" title="green"></button>
+              <button class="swatch" type="button" data-color="80,210,200" style="background:#50d2c8" title="cyan"></button>
+              <button class="swatch" type="button" data-color="90,150,235" style="background:#5a96eb" title="blue"></button>
+              <button class="swatch" type="button" data-color="180,100,230" style="background:#b464e6" title="purple"></button>
+            </div>
+          </div>
+          <div class="opt-row">
+            <label for="server-url">Server</label>
+            <input id="server-url" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="ws://host:port — blank = built-in server" />
+            <button id="server-connect" class="btn" type="button">Connect</button>
+          </div>
+          <div class="opt-row">
+            <button id="server-builtin" class="btn danger" type="button">Disconnect · use built-in server</button>
+          </div>
+          <div id="server-status">built-in server</div>
+        </div>
       </div>
-      <div id="server-status">built-in server</div>
       <p class="seed" id="seedline"></p>
     </div>
   </div>
@@ -71,6 +136,12 @@
     // Show seed in the overlay (the Rust side reads it too).
     const seed = new URLSearchParams(location.search).get("seed") || "1337";
     document.getElementById("seedline").textContent = "world seed: " + seed;
+    // Hint the same-authority WebSocket URL in the connect field's
+    // placeholder (works when the game is hosted by rustcraft-net itself).
+    const sameHost =
+      (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+    const urlInput = document.getElementById("server-url");
+    urlInput.placeholder = sameHost + " — blank = built-in server";
     init().catch((e) => {
       console.error("RustCraft failed to load:", e);
       document.getElementById("overlay").textContent = "Failed to load RustCraft: " + e;

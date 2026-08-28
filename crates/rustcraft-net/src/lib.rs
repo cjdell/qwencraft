@@ -1,16 +1,24 @@
 //! Headless RustCraft server.
 //!
-//! Serves the authoritative [`rustcraft_server::Server`] over WebSocket
-//! (`ws://`, or `wss://` with `--cert/--key`). The wire protocol is
-//! [`rustcraft_server::protocol`]: the client sends input/actions, the server
-//! sends player/agent state, chunk regions and stats at a fixed 60 Hz.
+//! One TCP port hosts everything (one authority):
+//! - **`/ws`** — the authoritative game world over WebSocket (`ws://`, or
+//!   `wss://` with `--cert/--key`), one shared world for all connections;
+//! - **`/dashboard`** (+ `/api/status`, `/api/map`) — the operator
+//!   dashboard;
+//! - **`/`** — the embedded game client build (`web/dist`, when present at
+//!   build time), so the whole game can live on this one port.
+//!
+//! The wire protocol is [`rustcraft_server::protocol`]: the client sends
+//! input/actions, the server sends player/agent state, chunk regions and
+//! stats at a fixed 60 Hz.
 //!
 //! **One shared world per server process.** Every connection gets its own
-//! player agent in the *same* world, so clients see each other and every
-//! world edit: a single 60 Hz tick loop drives the shared [`Server`], and each
-//! connection owns a [`Streamer`] that streams the world around its own player
-//! and resends edited chunks. Disconnecting removes that player (the world and
-//! the other players remain).
+//! player agent in the *same* world, so clients see each other (sphere +
+//! name tag) and every world edit: a single 60 Hz tick loop drives the
+//! shared [`Server`], and each connection owns a [`Streamer`] that streams
+//! the world around its own player and resends edited chunks.
+//! Disconnecting removes that player (the world and the other players
+//! remain).
 //!
 //! Host-only (tokio/mio don't support wasm): the whole crate compiles away
 //! for wasm so the shared workspace's wasm build stays green.
@@ -22,10 +30,12 @@ pub mod map;
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::BufReader as StdBufReader;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures_util::stream::{SplitSink, SplitStream};
@@ -34,10 +44,14 @@ use rustcraft_server::protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
 use rustcraft_server::{
     Action, Input, KeySet, Server, Streamer, WorldUpdate, TICK_HZ,
 };
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+
+/// The WebSocket endpoint path on the server's single port.
+pub const WS_PATH: &str = "/ws";
 
 /// Server options (see [`serve`]).
 #[derive(Clone, Debug)]
@@ -46,15 +60,14 @@ pub struct ServerOptions {
     pub seed: u64,
     /// Interface to bind.
     pub bind: IpAddr,
-    /// WebSocket port (0 = let the OS pick; see [`serve`]).
+    /// TCP port: WebSocket at `/ws`, dashboard at `/dashboard`, game
+    /// client at `/` (0 = let the OS pick; see [`serve`]).
     pub port: u16,
-    /// TLS certificate (PEM). With [`Self::key`], the server speaks wss://.
+    /// TLS certificate (PEM). With [`Self::key`], the whole port speaks
+    /// `wss://` / `https://`.
     pub cert: Option<PathBuf>,
     /// TLS private key (PEM, RSA or PKCS#8).
     pub key: Option<PathBuf>,
-    /// Dashboard HTTP port (0 = let the OS pick). `None` disables the
-    /// dashboard entirely.
-    pub http_port: Option<u16>,
 }
 
 impl Default for ServerOptions {
@@ -65,17 +78,15 @@ impl Default for ServerOptions {
             port: 9000,
             cert: None,
             key: None,
-            http_port: Some(9001),
         }
     }
 }
 
-/// The actual bound addresses after [`serve`].
+/// The actual bound address after [`serve`].
 pub struct ServerEndpoints {
-    /// The WebSocket game server.
-    pub ws: SocketAddr,
-    /// The dashboard HTTP server (when enabled).
-    pub http: Option<SocketAddr>,
+    /// The single TCP port: `ws://addr/ws`, `http://addr/dashboard/`,
+    /// `http://addr/` (game client).
+    pub addr: SocketAddr,
 }
 
 /// Bounded, thread-safe event log for the dashboard (join/leave, world
@@ -131,13 +142,13 @@ struct Conn {
     streamer: Streamer,
 }
 
-/// Load the TLS acceptor, bind the listeners, and spawn the shared-world
-/// tick loop, the WebSocket accept loop, and (when enabled) the dashboard
-/// HTTP server.
+/// Load the TLS acceptor, bind the single listener, and spawn the shared
+/// world tick loop plus the accept/dispatch loop (WebSocket at `/ws`, HTTP
+/// everywhere else).
 ///
-/// Returns the actual bound addresses (pass `port: 0` / `http_port: Some(0)`
-/// to let the OS pick one — used by the end-to-end tests). The loops keep
-/// running for the life of the current tokio runtime.
+/// Returns the actual bound address (pass `port: 0` to let the OS pick one
+/// — used by the end-to-end tests). The loops keep running for the life of
+/// the current tokio runtime.
 pub async fn serve(opts: ServerOptions) -> Result<ServerEndpoints, String> {
     let tls = load_tls(&opts)?;
     let listener = TcpListener::bind((opts.bind, opts.port))
@@ -147,8 +158,9 @@ pub async fn serve(opts: ServerOptions) -> Result<ServerEndpoints, String> {
         .local_addr()
         .map_err(|e| format!("local_addr: {e}"))?;
     let scheme = if tls.is_some() { "wss" } else { "ws" };
+    let http_scheme = if tls.is_some() { "https" } else { "http" };
     eprintln!(
-        "[rustcraft-net] listening on {scheme}://{addr} (seed {}, shared world — one player per connection)",
+        "[rustcraft-net] listening on {scheme}://{addr}{WS_PATH} + {http_scheme}://{addr}/dashboard (seed {}, shared world — one player per connection)",
         opts.seed
     );
 
@@ -179,7 +191,10 @@ pub async fn serve(opts: ServerOptions) -> Result<ServerEndpoints, String> {
 
     events.push(
         0.0,
-        format!("server started (seed {}, {scheme}://{addr})", opts.seed),
+        format!(
+            "server started (seed {}, {scheme}://{addr}{WS_PATH})",
+            opts.seed
+        ),
     );
 
     // The single tick loop for the shared world.
@@ -189,8 +204,6 @@ pub async fn serve(opts: ServerOptions) -> Result<ServerEndpoints, String> {
         tokio::spawn(tick_loop(world, map));
     }
     let seed = opts.seed;
-    // The accept loop below moves its capture, but the dashboard HTTP
-    // server still needs a handle to the world — hand it its own clone.
     let world_accept = world.clone();
     tokio::spawn(async move {
         loop {
@@ -198,8 +211,9 @@ pub async fn serve(opts: ServerOptions) -> Result<ServerEndpoints, String> {
                 Ok((tcp, peer)) => {
                     let tls = tls.clone();
                     let world = world_accept.clone();
+                    let map = map.clone();
                     tokio::spawn(async move {
-                        match handle_conn(tcp, peer, world, seed, tls).await {
+                        match dispatch_conn(tcp, peer, world, map, seed, tls).await {
                             Ok(()) => {}
                             Err(e) => eprintln!("[rustcraft-net] {peer}: {e}"),
                         }
@@ -210,18 +224,206 @@ pub async fn serve(opts: ServerOptions) -> Result<ServerEndpoints, String> {
         }
     });
 
-    // Dashboard HTTP server (optional).
-    let http = match opts.http_port {
-        Some(p) => Some(http::run_http(opts.bind, p, world.clone(), map).await?),
-        None => None,
-    };
-    if let Some(h) = &http {
-        events.push(
-            started.elapsed().as_secs_f64(),
-            format!("dashboard enabled (http://{h})"),
-        );
+    Ok(ServerEndpoints { addr })
+}
+
+/// Route one accepted connection: read the first bytes, then
+/// - `/ws` → WebSocket handshake + game session,
+/// - anything else → the dashboard / game-client HTTP front end.
+///
+/// With TLS configured, every connection starts with a TLS handshake (the
+/// port speaks wss/https end to end); without it, a TLS client is detected
+/// by its record header and rejected with a hint.
+async fn dispatch_conn(
+    mut tcp: TcpStream,
+    peer: SocketAddr,
+    world: Arc<Mutex<WorldState>>,
+    map: Arc<Mutex<map::MapState>>,
+    seed: u64,
+    tls: Option<Arc<tokio_rustls::server::TlsAcceptor>>,
+) -> Result<(), String> {
+    match &tls {
+        Some(acceptor) => {
+            let mut stream = acceptor
+                .accept(tcp)
+                .await
+                .map_err(|e| format!("TLS handshake: {e}"))?;
+            let mut head = Vec::new();
+            read_head(&mut stream, &mut head).await?;
+            route_request(stream, head, peer, world, map, seed).await
+        }
+        None => {
+            // Read the first bytes and check for a TLS record header before
+            // committing to plaintext (a wss:// client against a ws://
+            // server gets a hint instead of a hung connection).
+            let mut lead = [0u8; 2];
+            let n = tcp.read(&mut lead).await.map_err(|e| format!("read: {e}"))?;
+            if n >= 2 && lead[0] == 0x16 && lead[1] == 0x03 {
+                return Err(
+                    "TLS client on a non-TLS port — restart with --cert/--key for wss://"
+                        .to_string(),
+                );
+            }
+            if n == 0 {
+                return Err("connection closed before any request".to_string());
+            }
+            let mut head = lead[..n].to_vec();
+            read_head(&mut tcp, &mut head).await?;
+            route_request(tcp, head, peer, world, map, seed).await
+        }
     }
-    Ok(ServerEndpoints { ws: addr, http })
+}
+
+/// Read an HTTP/WS request head (up to the header terminator or [`HEAD_MAX`]
+/// bytes) from `stream`, appending to `head` (which may already hold the
+/// first bytes). A 10 s deadline keeps a slow/idle connection from pinning
+/// a task.
+///
+/// The bytes are consumed from the stream on purpose: [`route_request`]
+/// re-prepends them (via `tokio::io::chain`) so the WebSocket/HTTP parser
+/// sees the exact same request it would have seen on the bare stream.
+const HEAD_MAX: usize = 8192;
+
+async fn read_head<S>(stream: &mut S, head: &mut Vec<u8>) -> Result<(), String>
+where
+    S: AsyncRead + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut tmp = [0u8; 2048];
+        let n = tokio::time::timeout_at(deadline, stream.read(&mut tmp))
+            .await
+            .map_err(|_| "timed out reading request head".to_string())?
+            .map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            if head.is_empty() {
+                return Err("connection closed before any request".to_string());
+            }
+            return Ok(());
+        }
+        head.extend_from_slice(&tmp[..n]);
+        if head.windows(4).any(|w| w == b"\r\n\r\n") || head.len() >= HEAD_MAX {
+            return Ok(());
+        }
+    }
+}
+
+/// True when the request head carries an `Upgrade: …websocket…` header
+/// (case-insensitive). Only the header section is inspected; the request
+/// line comes first.
+fn has_websocket_upgrade(head: &[u8]) -> bool {
+    let lower = head.to_ascii_lowercase();
+    let Some(line_end) = lower.iter().position(|&b| b == b'\n') else {
+        return false;
+    };
+    let headers = &lower[line_end..];
+    headers.split(|&b| b == b'\n').any(|line| {
+        line.starts_with(b"upgrade:")
+            && line.windows(9).any(|w| w == b"websocket")
+    })
+}
+
+/// The request target (second token of the first line), or None.
+fn request_target(head: &[u8]) -> Option<String> {
+    let line = head.split(|&b| b == b'\n').next()?;
+    let s = std::str::from_utf8(line).ok()?;
+    let target = s.split_whitespace().nth(1)?;
+    Some(target.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// A bidirectional stream that first replays `head` — the bytes the
+/// dispatcher pre-read to sniff the request — and then proxies to `inner`.
+/// Without the replay, the WebSocket handshake / HTTP parser would start
+/// mid-request and block forever (the client is waiting for the response).
+struct Prepended<T> {
+    head: std::io::Cursor<Vec<u8>>,
+    inner: T,
+}
+
+impl<T> Prepended<T> {
+    fn new(head: Vec<u8>, inner: T) -> Self {
+        Self {
+            head: std::io::Cursor::new(head),
+            inner,
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Prepended<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // The replayed bytes are always ready (no I/O involved).
+        let pos = self.head.position() as usize;
+        let end = self.head.get_ref().len();
+        if pos < end {
+            let n = (end - pos).min(buf.remaining());
+            buf.put_slice(&self.head.get_ref()[pos..pos + n]);
+            self.head.set_position((pos + n) as u64);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Prepended<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Split the dispatcher's pre-read into a game session or an HTTP request.
+///
+/// The pre-read head bytes are re-prepended to the stream (see
+/// [`Prepended`]) so the WebSocket handshake / HTTP parser sees the
+/// original request intact.
+async fn route_request<S>(
+    stream: S,
+    head: Vec<u8>,
+    peer: SocketAddr,
+    world: Arc<Mutex<WorldState>>,
+    map: Arc<Mutex<map::MapState>>,
+    seed: u64,
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let target = request_target(&head);
+    let wants_ws = target.as_deref().is_some_and(|t| {
+        t.strip_prefix(WS_PATH)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('?'))
+    });
+    // A real WebSocket upgrade carries the `Upgrade: websocket` header;
+    // anything else on /ws (e.g. a browser tab) goes to the HTTP front end,
+    // which answers a friendly 426 instead of a hung connection.
+    let is_ws = wants_ws && has_websocket_upgrade(&head);
+    let stream = Prepended::new(head, stream);
+    if is_ws {
+        let ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .map_err(|e| format!("WebSocket handshake: {e}"))?;
+        session(ws, peer, world, seed).await
+    } else {
+        http::handle_http(stream, world, map).await
+    }
 }
 
 /// The single 60 Hz tick loop for the shared world. Ticks the [`Server`],
@@ -293,37 +495,6 @@ async fn tick_loop(world: Arc<Mutex<WorldState>>, map: Arc<Mutex<map::MapState>>
     }
 }
 
-/// WebSocket handshake (optionally over TLS), then one player in the shared
-/// world.
-async fn handle_conn(
-    tcp: TcpStream,
-    peer: SocketAddr,
-    world: Arc<Mutex<WorldState>>,
-    seed: u64,
-    tls: Option<Arc<tokio_rustls::server::TlsAcceptor>>,
-) -> Result<(), String> {
-    // `session` is generic over the stream type, so each (plain / TLS) arm
-    // calls it directly rather than unifying the two stream types here.
-    match tls {
-        Some(acceptor) => {
-            let stream = acceptor
-                .accept(tcp)
-                .await
-                .map_err(|e| format!("TLS handshake: {e}"))?;
-            let ws = tokio_tungstenite::accept_async(stream)
-                .await
-                .map_err(|e| format!("WebSocket handshake: {e}"))?;
-            session(ws, peer, world, seed).await
-        }
-        None => {
-            let ws = tokio_tungstenite::accept_async(tcp)
-                .await
-                .map_err(|e| format!("WebSocket handshake: {e}"))?;
-            session(ws, peer, world, seed).await
-        }
-    }
-}
-
 /// Apply one decoded client message to the shared world (input/actions are
 /// stored per-player; the tick loop applies them on the next step).
 fn apply_inbound(world: &Mutex<WorldState>, player_id: u32, m: ClientMsg) {
@@ -350,6 +521,11 @@ fn apply_inbound(world: &Mutex<WorldState>, player_id: u32, m: ClientMsg) {
         ClientMsg::SetNpcLoad { count, spacing } => {
             server.set_npc_load(count, spacing);
             server.push_agent_action(player_id, Action::NpcLoad);
+        }
+        ClientMsg::Profile { name, color } => {
+            // Identity for the shared world: broadcast via the agent list
+            // so every other client sees this player's name + sphere colour.
+            server.set_profile(player_id, name, color);
         }
     }
 }
@@ -391,8 +567,14 @@ where
         world.lock().unwrap().players.len()
     );
 
-    // Hello first: the client waits for it before sending input.
-    let _ = tx.send(ServerMsg::Hello { version: PROTOCOL_VERSION, seed });
+    // Hello first (carries this connection's own player id so the client
+    // can render the *other* players): the client waits for it before
+    // sending input.
+    let _ = tx.send(ServerMsg::Hello {
+        version: PROTOCOL_VERSION,
+        seed,
+        player_id,
+    });
 
     // Reader: decode client messages and apply them to the shared world.
     let reader_world = world.clone();
@@ -454,7 +636,7 @@ where
 fn load_tls(opts: &ServerOptions) -> Result<Option<Arc<tokio_rustls::server::TlsAcceptor>>, String> {
     match (&opts.cert, &opts.key) {
         (Some(cert_path), Some(key_path)) => {
-            let mut cert_file = BufReader::new(
+            let mut cert_file = StdBufReader::new(
                 File::open(cert_path).map_err(|e| format!("open {}: {e}", cert_path.display()))?,
             );
             let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
@@ -464,7 +646,7 @@ fn load_tls(opts: &ServerOptions) -> Result<Option<Arc<tokio_rustls::server::Tls
             if certs.is_empty() {
                 return Err(format!("no certificates in {}", cert_path.display()));
             }
-            let mut key_file = BufReader::new(
+            let mut key_file = StdBufReader::new(
                 File::open(key_path).map_err(|e| format!("open {}: {e}", key_path.display()))?,
             );
             let key = rustls_pemfile::private_key(&mut key_file)
