@@ -11,11 +11,13 @@ pub mod mesh;
 pub mod noise;
 pub mod pool;
 pub mod terrain;
+pub mod vec3;
 
 pub use block::Block;
 pub use noise::Noise;
 pub use pool::{Slot, TerrainPool};
 pub use terrain::{SEA_LEVEL, SNOW_LEVEL, Tree, WorldGen};
+pub use vec3::Vec3;
 
 /// Edge length of a chunk in blocks.
 pub const CHUNK: i32 = 16;

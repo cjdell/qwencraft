@@ -28,6 +28,9 @@ pub use world::{Edit, World, WorldUpdate};
 use std::sync::Arc;
 
 use qwencraft_world::{Block, BlockPos, ChunkPos, WORLD_HEIGHT};
+/// Re-exported from the (pure) world crate, which owns the type now; the
+/// re-export keeps `qwencraft_server::Vec3` working for downstream importers.
+pub use qwencraft_world::Vec3;
 
 /// Fixed physics tick rate.
 pub const TICK_HZ: f32 = 60.0;
@@ -1721,40 +1724,5 @@ mod tests {
             rx.try_iter().any(|e| e == "player 0 switched to walk mode"),
             "expected a walk-mode event"
         );
-    }
-}
-
-/// Minimal 3D vector (avoids a glam dependency in the server).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Vec3 {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-}
-
-impl Vec3 {
-    pub const fn new(x: f32, y: f32, z: f32) -> Self {
-        Self { x, y, z }
-    }
-
-    pub fn add(self, o: Self) -> Self {
-        Self::new(self.x + o.x, self.y + o.y, self.z + o.z)
-    }
-
-    pub fn scale(self, s: f32) -> Self {
-        Self::new(self.x * s, self.y * s, self.z * s)
-    }
-
-    pub fn length(self) -> f32 {
-        (self.x * self.x + self.y * self.y + self.z * self.z).sqrt()
-    }
-
-    pub fn normalize(self) -> Self {
-        let l = self.length();
-        if l > 1e-6 {
-            self.scale(1.0 / l)
-        } else {
-            Self::new(0.0, 0.0, 0.0)
-        }
     }
 }
