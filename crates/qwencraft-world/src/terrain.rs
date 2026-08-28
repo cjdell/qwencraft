@@ -34,6 +34,28 @@ pub struct Tree {
     pub trunk: i32,
 }
 
+/// Surface block of a column of terrain height `surface`. Shared by chunk
+/// generation and the dashboard minimap (`column_top`) — one rule in one
+/// place.
+pub fn top_block(surface: i32) -> Block {
+    if surface < SEA_LEVEL {
+        Block::Sand // lakebed / underwater shore
+    } else if surface >= SNOW_LEVEL {
+        Block::SnowGrass
+    } else {
+        Block::Grass
+    }
+}
+
+/// Block just below the surface (sub-surface dirt, or sand under water).
+pub fn sub_top_block(surface: i32) -> Block {
+    if surface < SEA_LEVEL {
+        Block::Sand
+    } else {
+        Block::Dirt
+    }
+}
+
 /// Deterministic world generator.
 #[derive(Clone, Copy, Debug)]
 pub struct WorldGen {
@@ -93,26 +115,6 @@ impl WorldGen {
             z.wrapping_add(y.wrapping_mul(104_729)),
             salt,
         )
-    }
-
-    /// Surface block of a column.
-    fn top_block(&self, surface: i32) -> Block {
-        if surface < SEA_LEVEL {
-            Block::Sand // lakebed / underwater shore
-        } else if surface >= SNOW_LEVEL {
-            Block::SnowGrass
-        } else {
-            Block::Grass
-        }
-    }
-
-    /// Block just below the surface.
-    fn sub_top_block(&self, surface: i32) -> Block {
-        if surface < SEA_LEVEL {
-            Block::Sand
-        } else {
-            Block::Dirt
-        }
     }
 
     /// The tree rooted at column (x, z), if any. Trees grow on flat grass
@@ -250,10 +252,10 @@ impl WorldGen {
             return Block::Stone;
         }
         if y == surface {
-            return self.top_block(surface);
+            return top_block(surface);
         }
         if y >= surface - 3 {
-            return self.sub_top_block(surface);
+            return sub_top_block(surface);
         }
         Block::Stone
     }
@@ -311,9 +313,9 @@ impl WorldGen {
                     } else if wy == 0 {
                         Block::Stone
                     } else if wy == surface {
-                        self.top_block(surface)
+                        top_block(surface)
                     } else if wy >= surface - 3 {
-                        self.sub_top_block(surface)
+                        sub_top_block(surface)
                     } else {
                         Block::Stone
                     };

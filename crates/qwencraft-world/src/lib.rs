@@ -7,6 +7,7 @@
 
 pub mod block;
 pub mod camera;
+pub mod column_top;
 pub mod mesh;
 pub mod noise;
 pub mod pool;
@@ -14,9 +15,10 @@ pub mod terrain;
 pub mod vec3;
 
 pub use block::Block;
+pub use column_top::{column_top_base, column_top_edited};
 pub use noise::Noise;
 pub use pool::{Slot, TerrainPool};
-pub use terrain::{SEA_LEVEL, SNOW_LEVEL, Tree, WorldGen};
+pub use terrain::{SEA_LEVEL, SNOW_LEVEL, Tree, WorldGen, sub_top_block, top_block};
 pub use vec3::Vec3;
 
 /// Edge length of a chunk in blocks.

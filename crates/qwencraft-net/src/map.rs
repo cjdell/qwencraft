@@ -8,13 +8,8 @@
 //! have actually done — holes, towers, water removal.
 //!
 //! Per column the map reports the topmost non-air block as (y, block id).
-//! Deliberate approximations (all invisible at minimap scale):
-//! - caves below a broken surface read as stone (a cave can't be a column's
-//!   topmost block unless the surface is broken, in which case we'd need
-//!   per-cell noise — not worth it for a 1px/block map);
-//! - unedited columns only consider the tree rooted in that column, not
-//!   canopy overhang from neighbours (a few % of tree pixels);
-//! - flowers (passable ground decals) are not modelled.
+//! The per-column logic (and its deliberate approximations, all invisible
+//! at minimap scale) lives in `qwencraft_world::column_top`.
 //!
 //! The map is computed under its own lock in a separate task from the 60 Hz
 //! tick, so even a cold ~100 ms compute never stalls the game.
@@ -22,7 +17,7 @@
 use std::collections::HashMap;
 
 use qwencraft_server::Edit;
-use qwencraft_world::{Block, BlockPos, SEA_LEVEL, SNOW_LEVEL, WORLD_HEIGHT, WorldGen};
+use qwencraft_world::{Block, BlockPos, WorldGen, column_top_base, column_top_edited};
 
 /// Max side of a map region (256x256 = 65k columns ≈ a few ms warm,
 /// ~100 ms cold in the map task — never on the tick path).
@@ -97,10 +92,16 @@ impl MapState {
                     .or_insert_with(|| self.gen.height(x, z));
                 let top = match edit_cols.get(&(x, z)) {
                     // No edits in this column: O(1) terrain arithmetic.
-                    None => self.column_top_base(x, z, hgt),
+                    None => {
+                        let (y, b) = column_top_base(x, z, hgt, &self.gen, &mut self.heights);
+                        (y as u8, b.as_u8())
+                    }
                     // Edited column: exact top-down scan (edits override
                     // terrain cell by cell).
-                    Some(edits) => self.column_top_edited(x, z, hgt, edits),
+                    Some(edits) => column_top_edited(x, z, hgt, edits, &self.gen, &mut self.heights)
+                        // Unreachable in practice (y=0 bedrock is unbreakable)
+                        // — the dashboard renders 255 as "unknown".
+                        .map_or((255, 0), |(y, b)| (y as u8, b.as_u8())),
                 };
                 cols[col] = top.0;
                 cols[col + 1] = top.1;
@@ -110,133 +111,13 @@ impl MapState {
         MapRegion { x0, z0, w, h, cols }
     }
 
-    /// Top of an unedited column: water (low-lying), own-column tree
-    /// (trunk/canopy top), or the terrain surface.
-    fn column_top_base(&mut self, x: i32, z: i32, h: i32) -> (u8, u8) {
-        if h < SEA_LEVEL {
-            return (SEA_LEVEL as u8, Block::Water.as_u8());
-        }
-        // Trees only grow on grass between the waterline and the snowline.
-        if h < SNOW_LEVEL {
-            if let Some(t) = self.gen.tree_at_cached(x, z, &mut self.heights) {
-                // The column's own highest tree block is the 5x5 canopy
-                // layer at base + trunk (the 3x3 cap one above skips the
-                // centre).
-                return ((h + t.trunk) as u8, Block::Leaves.as_u8());
-            }
-        }
-        (h as u8, Self::surface_block(h).as_u8())
-    }
-
-    /// Top of an edited column: scan from the top of the world, edits
-    /// overriding terrain cell by cell.
-    fn column_top_edited(
-        &mut self,
-        x: i32,
-        z: i32,
-        h: i32,
-        edits: &[(i32, Block)],
-    ) -> (u8, u8) {
-        // Tree roots in the 5x5 neighbourhood: a canopy overhangs up to 2
-        // blocks, so a neighbour's leaves can be this column's topmost
-        // block (only relevant here — edited columns are the few that scan).
-        let mut trees: Vec<(i32, i32, i32, i32)> = Vec::new(); // (rx, rz, base, trunk)
-        for dz in -2..=2 {
-            for dx in -2..=2 {
-                let (nx, nz) = (x + dx, z + dz);
-                let nh = *self
-                    .heights
-                    .entry((nx, nz))
-                    .or_insert_with(|| self.gen.height(nx, nz));
-                if (SEA_LEVEL..SNOW_LEVEL).contains(&nh) {
-                    if let Some(t) = self.gen.tree_at_cached(nx, nz, &mut self.heights) {
-                        trees.push((nx, nz, nh, t.trunk));
-                    }
-                }
-            }
-        }
-        for y in (0..WORLD_HEIGHT).rev() {
-            let b = self.cell_block(x, y, z, h, &trees, edits);
-            if b != Block::Air {
-                return (y as u8, b.as_u8());
-            }
-        }
-        // Unreachable in practice (y=0 bedrock is unbreakable) — the
-        // dashboard renders 255 as "unknown".
-        (255, 0)
-    }
-
-    /// Current block at (x, y, z): an edit for that exact cell wins, else
-    /// pure terrain (caves below the surface are not modelled — see the
-    /// module docs).
-    fn cell_block(
-        &self,
-        x: i32,
-        y: i32,
-        z: i32,
-        h: i32,
-        trees: &[(i32, i32, i32, i32)],
-        edits: &[(i32, Block)],
-    ) -> Block {
-        if let Some(&(_, b)) = edits.iter().find(|&&(ey, _)| ey == y) {
-            return b;
-        }
-        if y < 0 || y >= WORLD_HEIGHT {
-            return Block::Air;
-        }
-        if y > h {
-            // Water fills low-lying columns up to the sea level.
-            if y <= SEA_LEVEL {
-                return Block::Water;
-            }
-            // Tree blocks (trunk / canopy) from the neighbourhood roots.
-            for &(rx, rz, base, trunk) in trees {
-                let ddx = x - rx;
-                let ddz = z - rz;
-                let dy = y - base;
-                if ddx == 0 && ddz == 0 && (1..=trunk).contains(&dy) {
-                    return Block::Log;
-                }
-                if dy == trunk && ddx.abs() <= 2 && ddz.abs() <= 2 {
-                    return Block::Leaves;
-                }
-                if dy == trunk + 1 && ddx.abs() <= 1 && ddz.abs() <= 1 && !(ddx == 0 && ddz == 0) {
-                    return Block::Leaves;
-                }
-            }
-            return Block::Air;
-        }
-        if y == 0 {
-            return Block::Stone;
-        }
-        if y == h {
-            return Self::surface_block(h);
-        }
-        if y >= h - 3 {
-            // Sub-surface: dirt (or sand under water).
-            return if h < SEA_LEVEL { Block::Sand } else { Block::Dirt };
-        }
-        Block::Stone
-    }
-
-    /// Terrain surface block for a column of height `h` (mirrors the world
-    /// generator's private `top_block`).
-    fn surface_block(h: i32) -> Block {
-        if h < SEA_LEVEL {
-            Block::Sand
-        } else if h >= SNOW_LEVEL {
-            Block::SnowGrass
-        } else {
-            Block::Grass
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use qwencraft_server::Server;
-    use qwencraft_world::{BlockPos, WORLD_HEIGHT};
+    use qwencraft_world::{Block, SEA_LEVEL, SNOW_LEVEL, WORLD_HEIGHT};
 
     /// Reference: the authoritative world's own topmost non-air block for a
     /// column (materialises the column's chunks; includes caves, flowers and
