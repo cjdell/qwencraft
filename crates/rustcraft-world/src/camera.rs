@@ -133,6 +133,34 @@ fn mul4(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
     out
 }
 
+/// Project a world point through a column-major view-projection matrix to
+/// screen coordinates, in pixels of a `w x h` viewport.
+///
+/// WebGPU clip space: NDC x right, y up, z in [0, 1]; screen y is flipped
+/// (CSS grows downward). `None` when the point is behind the camera or
+/// well outside the screen (±20% cull margin).
+///
+/// Screen-space DOM overlays (the other players' name tags) use this with
+/// the renderer's exact view-projection inputs — it must stay in lockstep
+/// with `view_projection` (same fov/near/far, same camera state), or the
+/// tags drift off their spheres.
+pub fn project_point(vp: &[f32; 16], p: [f32; 3], w: f32, h: f32) -> Option<(f32, f32)> {
+    let x = vp[0] * p[0] + vp[4] * p[1] + vp[8] * p[2] + vp[12];
+    let y = vp[1] * p[0] + vp[5] * p[1] + vp[9] * p[2] + vp[13];
+    let cw = vp[3] * p[0] + vp[7] * p[1] + vp[11] * p[2] + vp[15];
+    if cw <= 1e-4 {
+        return None; // behind the camera
+    }
+    let (nx, ny) = (x / cw, y / cw);
+    if nx.abs() > 1.2 || ny.abs() > 1.2 {
+        return None; // well off screen
+    }
+    Some((
+        (nx * 0.5 + 0.5) * w,
+        (0.5 - ny * 0.5) * h,
+    ))
+}
+
 /// Full view-projection matrix for a first-person camera.
 ///
 /// `fov_y` is the vertical field of view in radians.
@@ -218,6 +246,69 @@ mod tests {
         let zfar = (p[10] * -300.0 + p[14]) / 300.0;
         assert!((znear - 0.0).abs() < 1e-4, "near {znear}");
         assert!((zfar - 1.0).abs() < 1e-3, "far {zfar}");
+    }
+
+    #[test]
+    fn point_ahead_projects_to_screen_centre() {
+        // Camera at the origin, looking down -Z (yaw=0, pitch=0). The
+        // renderer's exact parameters (see `render_pass_into` in the
+        // client crate).
+        let m = view_projection([0.0, 0.0, 0.0], 0.0, 0.0, 16.0 / 9.0, 1.15, 0.1, 300.0);
+        let (sx, sy) = project_point(&m, [0.0, 0.0, -10.0], 1280.0, 720.0)
+            .expect("point 10 blocks ahead is on screen");
+        assert!((sx - 640.0).abs() < 1.0, "sx {sx}");
+        assert!((sy - 360.0).abs() < 1.0, "sy {sy}");
+    }
+
+    #[test]
+    fn right_is_right_and_up_is_up() {
+        // The classic name-tag bugs (tags "moving the other way") come
+        // from a flipped axis or a transposed matrix — pin all three.
+        let m = view_projection([0.0, 0.0, 0.0], 0.0, 0.0, 16.0 / 9.0, 1.15, 0.1, 300.0);
+        let (cx, cy) = project_point(&m, [0.0, 0.0, -10.0], 1280.0, 720.0).unwrap();
+        // +X is the camera's right (yaw=0, right = [1,0,0]). (45° off the
+        // view axis — inside the ±49° horizontal half-fov.)
+        let (rx, ry) = project_point(&m, [10.0, 0.0, -10.0], 1280.0, 720.0).unwrap();
+        assert!(rx > cx + 100.0, "right point must land right of centre: {rx} vs {cx}");
+        assert!((ry - cy).abs() < 20.0, "side point stays at the same height: {ry} vs {cy}");
+        // +Y is up on screen (smaller CSS y). (26.6° elevation — inside
+        // the ±32.9° vertical half-fov.)
+        let (ux, uy) = project_point(&m, [0.0, 5.0, -10.0], 1280.0, 720.0).unwrap();
+        assert!(uy < cy - 50.0, "up point must land above centre: {uy} vs {cy}");
+        assert!((ux - cx).abs() < 20.0, "up point stays centred horizontally: {ux} vs {cx}");
+        // A nearer point projects further from centre than a far one.
+        let (nx, _ny) = project_point(&m, [5.0, 0.0, -5.0], 1280.0, 720.0).unwrap();
+        let (fx, _fy) = project_point(&m, [5.0, 0.0, -10.0], 1280.0, 720.0).unwrap();
+        assert!(nx > fx, "nearer point projects further from centre: {nx} vs {fx}");
+    }
+
+    #[test]
+    fn behind_the_camera_is_culled() {
+        let m = view_projection([0.0, 0.0, 0.0], 0.0, 0.0, 16.0 / 9.0, 1.15, 0.1, 300.0);
+        assert!(project_point(&m, [0.0, 0.0, 10.0], 1280.0, 720.0).is_none());
+    }
+
+    #[test]
+    fn yaw_rotation_moves_the_scene_consistently() {
+        // Turn the camera 45° left (yaw = +pi/4 looks down -X-Z): +X is
+        // now 135° off the view axis (BEHIND the camera), and -Z is 45° to
+        // its right — the scene must move the same way the camera turns.
+        let m = view_projection(
+            [0.0, 0.0, 0.0],
+            std::f32::consts::FRAC_PI_4,
+            0.0,
+            16.0 / 9.0,
+            1.15,
+            0.1,
+            300.0,
+        );
+        assert!(
+            project_point(&m, [10.0, 0.0, 0.0], 1280.0, 720.0).is_none(),
+            "+X is behind the camera at yaw +45°"
+        );
+        let (sx, _sy) = project_point(&m, [0.0, 0.0, -10.0], 1280.0, 720.0)
+            .expect("-Z is now to the right (inside the ±49° half-fov)");
+        assert!(sx > 640.0, "sx {sx}");
     }
 
     #[test]

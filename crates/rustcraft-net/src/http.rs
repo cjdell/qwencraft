@@ -81,12 +81,13 @@ where
             (path, q)
         }
         None => {
-            respond(&mut stream, 400, "text/plain; charset=utf-8", b"bad request").await?;
+            respond(&mut stream, 400, "text/plain; charset=utf-8", None, b"bad request").await?;
             return Ok(());
         }
     };
-    let (status, body, content_type) = route(first, query.as_deref(), &world, &map).await;
-    respond(&mut stream, status, content_type, &body).await
+    let (status, body, content_type, location) =
+        route(first, query.as_deref(), &world, &map).await;
+    respond(&mut stream, status, content_type, location.as_deref(), &body).await
 }
 
 /// True when the buffer holds a complete HTTP request head.
@@ -98,20 +99,23 @@ fn head_complete(buf: &[u8]) -> bool {
 /// client. Everything is path-based (no virtual hosts): the dashboard owns
 /// `/dashboard`, the API owns `/api` + `/healthz`, and the rest is the game
 /// client.
+/// A routed response. The optional fourth field is a `Location` header
+/// (redirects).
 async fn route(
     path: &str,
     query: Option<&str>,
     world: &Arc<Mutex<WorldState>>,
     map: &Arc<Mutex<MapState>>,
-) -> (u16, Vec<u8>, &'static str) {
+) -> (u16, Vec<u8>, &'static str, Option<&'static str>) {
     match path {
-        "/healthz" => (200, b"ok".to_vec(), "text/plain; charset=utf-8"),
+        "/healthz" => (200, b"ok".to_vec(), "text/plain; charset=utf-8", None),
         "/api/status" => {
             let w = world.lock().unwrap();
             (
                 200,
                 status_json(&w).into_bytes(),
                 "application/json; charset=utf-8",
+                None,
             )
         }
         "/api/map" => match parse_map_query(query) {
@@ -120,18 +124,29 @@ async fn route(
                 // `top_map` clamps the side to MAP_MIN..=MAP_MAX itself.
                 let region = m.top_map(cx, cz, w, h);
                 // Flat 2-bytes-per-column payload ([y, block id], row-major).
-                (200, region.cols, "application/octet-stream")
+                (200, region.cols, "application/octet-stream", None)
             }
-            Err(()) => (400, b"bad ?x=&z=&w=&h=".to_vec(), "text/plain; charset=utf-8"),
+            Err(()) => {
+                (400, b"bad ?x=&z=&w=&h=".to_vec(), "text/plain; charset=utf-8", None)
+            }
         },
         "/ws" => (
             426,
             b"this endpoint speaks WebSocket - connect with ws://host:port/ws".to_vec(),
             "text/plain; charset=utf-8",
+            None,
         ),
-        "/dashboard" | "/dashboard/" => {
-            dashboard_file("index.html")
-        }
+        // The dashboard's index.html loads its assets with RELATIVE urls
+        // (./dashboard.css, ./rustcraft_dashboard.js), so it only resolves
+        // correctly under the trailing-slash form — redirect the bare path
+        // the way a normal web server redirects a directory.
+        "/dashboard" => (
+            302,
+            b"moved: the dashboard lives at /dashboard/".to_vec(),
+            "text/plain; charset=utf-8",
+            Some("/dashboard/"),
+        ),
+        "/dashboard/" => dashboard_file("index.html"),
         p if p.starts_with("/dashboard/") => {
             dashboard_file(p.strip_prefix("/dashboard/").unwrap_or(p))
         }
@@ -141,28 +156,30 @@ async fn route(
 }
 
 /// Look up `rel` in the embedded dashboard build.
-fn dashboard_file(rel: &str) -> (u16, Vec<u8>, &'static str) {
+fn dashboard_file(rel: &str) -> (u16, Vec<u8>, &'static str, Option<&'static str>) {
     let rel = if rel.is_empty() { "index.html" } else { rel };
     let Some(file) = DASH.get_file(rel) else {
-        return (404, b"not found".to_vec(), "text/plain; charset=utf-8");
+        return (404, b"not found".to_vec(), "text/plain; charset=utf-8", None);
     };
     (
         200,
         file.contents().to_vec(),
         mime_for(rel),
+        None,
     )
 }
 
 /// Look up `rel` in the embedded game-client build.
-fn game_file(rel: &str) -> (u16, Vec<u8>, &'static str) {
+fn game_file(rel: &str) -> (u16, Vec<u8>, &'static str, Option<&'static str>) {
     let rel = if rel.is_empty() { "index.html" } else { rel };
     let Some(file) = WEB.get_file(rel) else {
-        return (404, b"not found".to_vec(), "text/plain; charset=utf-8");
+        return (404, b"not found".to_vec(), "text/plain; charset=utf-8", None);
     };
     (
         200,
         file.contents().to_vec(),
         mime_for(rel),
+        None,
     )
 }
 
@@ -291,6 +308,7 @@ async fn respond<S>(
     tcp: &mut S,
     status: u16,
     content_type: &str,
+    location: Option<&str>,
     body: &[u8],
 ) -> Result<(), String>
 where
@@ -298,16 +316,22 @@ where
 {
     let reason = match status {
         200 => "OK",
+        302 => "Found",
         400 => "Bad Request",
         404 => "Not Found",
         426 => "Upgrade Required",
         _ => "Internal Server Error",
     };
+    let location_header = match location {
+        Some(loc) => format!("Location: {loc}\r\n"),
+        None => String::new(),
+    };
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
-         Content-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\
+         Content-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n{}\
          Connection: close\r\n\r\n",
-        body.len()
+        body.len(),
+        location_header
     );
     tcp.write_all(head.as_bytes())
         .await

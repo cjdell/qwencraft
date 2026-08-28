@@ -229,6 +229,11 @@ struct App {
     /// Headless stress test: hold W and walk (turning away when blocked by
     /// terrain), exercising terrain streaming + pool compaction.
     walk_mode: bool,
+    /// `?taglog=1`: log name-tag screen positions every 5 s (headless
+    /// verification that tags track their players).
+    tag_log: bool,
+    /// Wall-clock ms of the last TAGS telemetry line.
+    last_tag_log_at: f64,
     // Walk-mode steering state: if less than 1 block of horizontal progress
     // is made per 1s window (jitter against a slope/wall counts as stuck),
     // turn 90° — always the same way, so a full circle is covered within 4
@@ -303,6 +308,7 @@ impl App {
         tags: HtmlDivElement,
         verify_mode: bool,
         walk_mode: bool,
+        tag_log: bool,
         npcs: Option<(u32, f32)>,
     ) -> Self {
         let mut server = Server::new(seed);
@@ -318,6 +324,8 @@ impl App {
             backend: Backend::Builtin { server, streamer },
             builtin_seed: seed,
             walk_mode,
+            tag_log,
+            last_tag_log_at: 0.0,
             walk_anchor: [0.0; 2],
             walk_fly: false,
             walk_return: false,
@@ -413,18 +421,21 @@ impl App {
         let mut seen = std::collections::HashSet::new();
         for s in agents.iter().filter(|s| s.is_player && s.id != own_id) {
             seen.insert(s.id);
-            let el = match self.tag_els.get(&s.id) {
-                Some(e) => e.clone(),
-                None => {
-                    let e = self.make_tag();
-                    self.tag_els.insert(s.id, e.clone());
-                    e
-                }
-            };
             let label = if s.name.is_empty() {
                 format!("P{}", s.id)
             } else {
                 s.name.clone()
+            };
+            let el = match self.tag_els.get(&s.id) {
+                Some(e) => e.clone(),
+                None => {
+                    let e = self.make_tag();
+                    // Rare event (another player appeared): log it so
+                    // headless runs can assert players are being tagged.
+                    log(&format!("RustCraft: name tag created for player {} (\"{}\")", s.id, label));
+                    self.tag_els.insert(s.id, e.clone());
+                    e
+                }
             };
             if el.text_content().unwrap_or_default() != label {
                 el.set_text_content(Some(&label));
@@ -451,26 +462,35 @@ impl App {
                 el.remove();
             }
         }
+        // Telemetry (?taglog=1): sample visible tag positions on a wall-clock
+        // cadence — frame counts differ wildly between virtual time (~60 fps)
+        // and a slow SwiftShader machine (a few fps), so time is the common
+        // denominator.
+        if self.tag_log {
+            let now = js_sys::Date::now();
+            if now - self.last_tag_log_at > 5000.0 {
+                self.last_tag_log_at = now;
+                let mut parts = Vec::new();
+                for (id, el) in &self.tag_els {
+                    let display = el.style().get_property_value("display").unwrap_or_default();
+                    if display == "none" {
+                        continue;
+                    }
+                    let l = el.style().get_property_value("left").unwrap_or_default();
+                    let t = el.style().get_property_value("top").unwrap_or_default();
+                    parts.push(format!("{id}:{l}/{t}"));
+                }
+                if !parts.is_empty() {
+                    log(&format!("TAGS {}", parts.join(" ")));
+                }
+            }
+        }
     }
 
     /// World point → CSS pixels (None when behind the camera or far off
-    /// screen). Column-major view-projection, WebGPU clip space (y up,
-    /// z in [0,1]).
+    /// screen). Delegates to the pure [`project_point`].
     fn project_to_screen(vp: &[f32; 16], p: [f32; 3], w: u32, h: u32) -> Option<(f32, f32)> {
-        let x = vp[0] * p[0] + vp[4] * p[1] + vp[8] * p[2] + vp[12];
-        let y = vp[1] * p[0] + vp[5] * p[1] + vp[9] * p[2] + vp[13];
-        let cw = vp[3] * p[0] + vp[7] * p[1] + vp[11] * p[2] + vp[15];
-        if cw <= 1e-4 {
-            return None; // behind the camera
-        }
-        let (nx, ny) = (x / cw, y / cw);
-        if nx.abs() > 1.2 || ny.abs() > 1.2 {
-            return None; // well off screen
-        }
-        Some((
-            (nx * 0.5 + 0.5) * w as f32,
-            (0.5 - ny * 0.5) * h as f32,
-        ))
+        project_point(vp, p, w as f32, h as f32)
     }
 
     /// The live remote link's id (u32::MAX when not in remote mode).
@@ -760,8 +780,14 @@ impl App {
         ];
         // Other players' name tags (DOM overlay, projected with the same
         // view-projection as the render). Done before `agents` moves into
-        // the renderer; own player is skipped (first person).
-        let (w, h) = self.renderer.as_ref().map(|r| r.size()).unwrap_or((0, 0));
+        // the renderer; own player is skipped (first person). The
+        // projection must land in **CSS** pixels (DOM layout units) — the
+        // drawing buffer is devicePixelRatio× larger on high-DPI displays.
+        let (w, h) = self
+            .renderer
+            .as_ref()
+            .map(|r| r.css_size())
+            .unwrap_or((0, 0));
         let own_id = self.own_id();
         self.update_name_tags(&agents, cam, player.yaw, player.pitch, w, h);
 
@@ -1053,10 +1079,13 @@ fn key_from_code(code: &str) -> Option<Key> {
     }
 }
 
-fn params_from_url() -> (u64, bool, bool, Option<(u32, f32)>, Option<String>) {
+fn params_from_url() -> (u64, bool, bool, bool, Option<(u32, f32)>, Option<String>) {
     let mut seed = 1337u64;
     let mut verify = false;
     let mut walk = false;
+    // `taglog=1` makes the app log name-tag positions every 5 s (headless
+    // verification that tags track their players).
+    let mut tag_log = false;
     // `npcs=COUNT[:SPACING]` starts the app with an NPC load already
     // spawned (headless load testing without a keyboard).
     let mut npcs: Option<(u32, f32)> = None;
@@ -1074,6 +1103,8 @@ fn params_from_url() -> (u64, bool, bool, Option<(u32, f32)>, Option<String>) {
                 verify = true;
             } else if part.strip_prefix("walk=").is_some_and(|v| v != "0") {
                 walk = true;
+            } else if part.strip_prefix("taglog=").is_some_and(|v| v != "0") {
+                tag_log = true;
             } else if let Some(v) = part.strip_prefix("npcs=") {
                 if !v.is_empty() && v != "0" {
                     let (cs, ss) = match v.split_once(':') {
@@ -1097,7 +1128,7 @@ fn params_from_url() -> (u64, bool, bool, Option<(u32, f32)>, Option<String>) {
             }
         }
     }
-    (seed, verify, walk, npcs, server)
+    (seed, verify, walk, tag_log, npcs, server)
 }
 
 /// Accept `ws://…`, `wss://…`, or bare `host:port` (ws:// implied).
@@ -1133,6 +1164,20 @@ fn normalize_ws_url(raw: &str) -> Option<String> {
         return Some(format!("{scheme_host}://{host}/ws"));
     }
     Some(format!("{scheme_host}://{host}{tail}"))
+}
+
+// World point → screen pixels for the name tags. Lives in
+// `rustcraft_world::camera` (next to `view_projection`) so the exact math
+// the tags use is host-tested there (this crate is wasm-only).
+pub use rustcraft_world::camera::project_point;
+
+/// True when the keyboard event's target is a text field (the options
+/// panel's name/server-URL inputs). Game input must ignore such events
+/// entirely (see the keydown/keyup guards).
+fn event_target_is_text_input(e: &KeyboardEvent) -> bool {
+    e.target()
+        .and_then(|t| t.dyn_ref::<HtmlElement>().cloned())
+        .is_some_and(|t| matches!(t.tag_name().as_str(), "INPUT" | "TEXTAREA"))
 }
 
 /// True when `target` is `ancestor` or nested inside it (the options panel
@@ -1178,7 +1223,7 @@ pub fn start() -> Result<(), JsValue> {
         .and_then(|e| e.dyn_into::<HtmlDivElement>().ok())
         .expect("missing #overlay");
 
-    let (seed, verify_mode, walk_mode, npcs, server_url_param) = params_from_url();
+    let (seed, verify_mode, walk_mode, tag_log, npcs, server_url_param) = params_from_url();
     log(&format!("RustCraft: app started (seed {seed})"));
 
     let server_input = document
@@ -1238,6 +1283,7 @@ pub fn start() -> Result<(), JsValue> {
         tags.clone(),
         verify_mode,
         walk_mode,
+        tag_log,
         npcs,
     )));
     if let Some((c, s)) = npcs {
@@ -1258,6 +1304,13 @@ pub fn start() -> Result<(), JsValue> {
         let cb = Closure::<dyn FnMut(KeyboardEvent)>::new({
             let app = app.clone();
             move |e: KeyboardEvent| {
+                // Typing in a text field (player name, server URL) must
+                // never feed game input: no key capture, and — crucially —
+                // no preventDefault, which would swallow the character
+                // before it reaches the input (w/a/s/d are all game keys).
+                if event_target_is_text_input(&e) {
+                    return;
+                }
                 match key_from_code(e.code().as_str()) {
                     // One-shot fly actions (F must ignore key auto-repeat;
                     // E/Q may repeat so holding them ramps the speed).
@@ -1317,6 +1370,9 @@ pub fn start() -> Result<(), JsValue> {
         let cb = Closure::<dyn FnMut(KeyboardEvent)>::new({
             let app = app.clone();
             move |e: KeyboardEvent| {
+                if event_target_is_text_input(&e) {
+                    return; // the input's own handlers own these keys
+                }
                 if let Some(k) = key_from_code(e.code().as_str()) {
                     app.borrow_mut().keys.remove(k);
                 }

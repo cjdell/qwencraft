@@ -127,7 +127,7 @@ against — even while you're turning fast.
 | ------------------- | ----------------------------------------------------------------------- |
 | `rustcraft-world`   | Block types, seeded noise/terrain, 16³ chunks with 26³ region payloads, chunk meshing (voxel lighting + AO), shared WGSL shader + view-projection math |
 | `rustcraft-server`  | The authoritative game server: infinite lazy world (chunks generated on demand), agent simulation (player + NPCs) with a per-agent local block window, fixed-tick physics, delta-based world updates, NPC load test. Plus the wire `protocol` module (binary codec shared by both transports). Runs in-process in the browser *and* inside the headless server |
-| `rustcraft-net`     | Headless server, single port: WebSocket at `/ws` (`ws://`, `wss://` with `--cert`/`--key`), dashboard at `/dashboard/`, game page at `/`, plus `/api/*` + `/healthz`; one shared world for all connections, 60 Hz tick loop, per-connection streaming |
+| `rustcraft-net`     | Headless server, single port: WebSocket at `/ws` (`ws://`, `wss://` with `--cert`/`--key`), dashboard at `/dashboard/` (bare `/dashboard` 302-redirects to it), game page at `/`, plus `/api/*` + `/healthz`; one shared world for all connections, 60 Hz tick loop, per-connection streaming |
 | `rustcraft-client`  | WebGPU (wgpu 27) renderer: shared terrain-mesh buffer pool, sphere agents, fog, first-person camera |
 | `rustcraft-web`     | wasm glue: input (keyboard/pointer lock), HUD, main loop, backend abstraction (embedded server or remote over WebSocket) |
 | `web/`              | `index.html` page hosting the wasm app                                  |
@@ -208,10 +208,15 @@ surface (grass/water/sand/snow/stone, tree canopies; light from the
 upper-left, contour lines every 4 blocks, major every 16) with players and
 NPCs plotted on top (players labelled, with a “focus” button). Drag or
 two-finger scroll to pan; trackpad pinch or mouse wheel zooms smoothly from
-50% to 800% (0.5–8 px per block, anchored at the cursor). The fetchable
-region spans 16–256 blocks; zooming out beyond that letterboxes the map
-(the scale stays honest — 50% really means 0.5 px per block). The map is
-computed from the *pure* terrain function plus the world's edit history
+50% to 800% (0.5–8 px per block, anchored at the cursor). The server
+answers the map as 256×256-block **tiles** (each request clamps to
+16–256 blocks), and the dashboard fetches the tiles covering the visible
+area and stitches them into a mosaic — so at the 50% minimum zoom the
+whole pane is filled (up to ~2048 blocks per side, beyond which it
+letterboxes; the scale stays honest, 50% really means 0.5 px per block),
+with a per-tile cache so panning back is instant. `?zoom=N` (percent) sets
+the initial zoom. The map is computed from the *pure* terrain function
+plus the world's edit history
 (so it is exact modulo
 flowers and canopy overhang, invisible at 1 px/block), and it updates
 within a tick of any block edit made by a connected player.

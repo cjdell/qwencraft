@@ -401,8 +401,8 @@ fn which(bin: &str) -> Option<String> {
 
 /// Minimal synchronous HTTP GET against the dashboard server (the server
 /// answers `Connection: close`, so read-to-EOF gives the full response).
-/// Returns (status code, content-type, body).
-async fn http_get(addr: &SocketAddr, target: &str) -> (u16, String, Vec<u8>) {
+/// Returns (status code, content-type, location header, body).
+async fn http_get(addr: &SocketAddr, target: &str) -> (u16, String, String, Vec<u8>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut tcp = tokio::net::TcpStream::connect(addr)
         .await
@@ -428,12 +428,16 @@ async fn http_get(addr: &SocketAddr, target: &str) -> (u16, String, Vec<u8>) {
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
     let mut ctype = String::new();
+    let mut location = String::new();
     for l in lines {
         if let Some(v) = l.strip_prefix("Content-Type: ") {
             ctype = v.trim().to_string();
         }
+        if let Some(v) = l.strip_prefix("Location: ") {
+            location = v.trim().to_string();
+        }
     }
-    (code, ctype, body)
+    (code, ctype, location, body)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -448,12 +452,12 @@ async fn dashboard_http_serves_status_map_and_assets() {
     let addr = ep.addr;
 
     // Health probe.
-    let (code, _ct, body) = http_get(&addr, "/healthz").await;
+    let (code, _ct, _loc, body) = http_get(&addr, "/healthz").await;
     assert_eq!(code, 200);
     assert_eq!(body, b"ok");
 
     // Status before any client: no players, seed present, startup logged.
-    let (code, ct, body) = http_get(&addr, "/api/status").await;
+    let (code, ct, _loc, body) = http_get(&addr, "/api/status").await;
     assert_eq!(code, 200);
     assert!(ct.contains("application/json"), "{ct}");
     let s = String::from_utf8_lossy(&body).into_owned();
@@ -463,30 +467,37 @@ async fn dashboard_http_serves_status_map_and_assets() {
 
     // The dashboard page + its assets (the embedded dioxus build), under
     // the /dashboard path on the same port as the WebSocket.
-    let (code, ct, body) = http_get(&addr, "/dashboard/").await;
+    let (code, ct, _loc, body) = http_get(&addr, "/dashboard/").await;
     assert_eq!(code, 200);
     assert!(ct.contains("text/html"));
     assert!(String::from_utf8_lossy(&body).contains("RustCraft"));
-    let (code, ct, _) = http_get(&addr, "/dashboard/rustcraft_dashboard.js").await;
+    // The bare /dashboard path redirects to the trailing-slash form: the
+    // dashboard's index.html loads its assets with RELATIVE urls, so it
+    // only resolves under /dashboard/ — the redirect keeps bare links
+    // (and bookmarks) working.
+    let (code, _ct, loc, _) = http_get(&addr, "/dashboard").await;
+    assert_eq!(code, 302);
+    assert_eq!(loc, "/dashboard/", "redirect target");
+    let (code, ct, _loc, _) = http_get(&addr, "/dashboard/rustcraft_dashboard.js").await;
     assert_eq!(code, 200);
     assert!(ct.contains("javascript"), "{ct}");
-    let (code, ct, body) = http_get(&addr, "/dashboard/rustcraft_dashboard_bg.wasm").await;
+    let (code, ct, _loc, body) = http_get(&addr, "/dashboard/rustcraft_dashboard_bg.wasm").await;
     assert_eq!(code, 200);
     assert_eq!(ct, "application/wasm");
     assert!(body.len() > 10_000, "wasm asset looks empty: {} bytes", body.len());
-    let (code, _ct, _) = http_get(&addr, "/dashboard/dashboard.css").await;
+    let (code, _ct, _loc, _) = http_get(&addr, "/dashboard/dashboard.css").await;
     assert_eq!(code, 200);
 
     // The root serves the game client (web/dist when built) or the fallback
     // page — either way, an HTML page mentioning RustCraft.
-    let (code, ct, body) = http_get(&addr, "/").await;
+    let (code, ct, _loc, body) = http_get(&addr, "/").await;
     assert_eq!(code, 200);
     assert!(ct.contains("text/html"), "{ct}");
     assert!(String::from_utf8_lossy(&body).contains("RustCraft"), "root page: {body:?}");
 
     // /ws over plain HTTP answers an upgrade-required error (the WebSocket
     // handshake itself is covered by the ws tests).
-    let (code, _, _) = http_get(&addr, "/ws").await;
+    let (code, _ct, _loc, _) = http_get(&addr, "/ws").await;
     assert_eq!(code, 426);
 
     // A player joins over ws: the status must reflect it (agent + event).
@@ -498,7 +509,7 @@ async fn dashboard_http_serves_status_map_and_assets() {
         color: [9, 9, 9],
     });
     let _ = sample(&mut sock, 0.5);
-    let (_, _, body) = http_get(&addr, "/api/status").await;
+    let (_, _ct, _loc, body) = http_get(&addr, "/api/status").await;
     let s = String::from_utf8_lossy(&body).into_owned();
     assert!(s.contains("\"players\":1"), "status: {s}");
     assert!(s.contains("\"player\":true"), "agent present: {s}");
@@ -507,7 +518,7 @@ async fn dashboard_http_serves_status_map_and_assets() {
 
     // Map: 64x64 region = 64*64*2 bytes, mostly non-air near spawn, and
     // the origin header echoes the clamped region.
-    let (code, _ct, body) = http_get(&addr, "/api/map?x=8&z=8&w=64&h=64").await;
+    let (code, _ct, _loc, body) = http_get(&addr, "/api/map?x=8&z=8&w=64&h=64").await;
     assert_eq!(code, 200);
     assert_eq!(body.len(), 64 * 64 * 2);
     let mut non_air = 0usize;
@@ -524,13 +535,13 @@ async fn dashboard_http_serves_status_map_and_assets() {
     );
 
     // Oversized requests clamp to the max side (256), tiny ones to the min.
-    let (_, _, body) = http_get(&addr, "/api/map?x=8&z=8&w=4096&h=4096").await;
+    let (_c, _ct, _loc, body) = http_get(&addr, "/api/map?x=8&z=8&w=4096&h=4096").await;
     assert_eq!(body.len(), 256 * 256 * 2);
-    let (_, _, body) = http_get(&addr, "/api/map?x=8&z=8&w=1&h=1").await;
+    let (_c, _ct, _loc, body) = http_get(&addr, "/api/map?x=8&z=8&w=1&h=1").await;
     assert_eq!(body.len(), 16 * 16 * 2);
 
     // Unknown paths 404.
-    let (code, _, _) = http_get(&addr, "/nope").await;
+    let (code, _ct, _loc, _) = http_get(&addr, "/nope").await;
     assert_eq!(code, 404);
 
     drop(sock);

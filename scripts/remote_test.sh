@@ -100,7 +100,7 @@ timeout "$SECOND_SECS" chromium \
   --user-data-dir="$PROF_DIR2" \
   --window-size=1280,720 \
   --enable-logging=stderr --v=0 \
-  "http://127.0.0.1:${PORT}/?seed=${SEED}&server=ws://127.0.0.1:${WS_PORT}/ws" \
+  "http://127.0.0.1:${PORT}/?seed=${SEED}&server=ws://127.0.0.1:${WS_PORT}/ws&taglog=1" \
   >"$LOG2" 2>&1 &
 SECOND=$!
 
@@ -115,7 +115,7 @@ timeout "$RUN_SECS" chromium \
   --user-data-dir="$PROF_DIR" \
   --window-size=1280,720 \
   --enable-logging=stderr --v=0 \
-  "http://127.0.0.1:${PORT}/?seed=${SEED}&server=ws://127.0.0.1:${WS_PORT}/ws&verify=1" \
+  "http://127.0.0.1:${PORT}/?seed=${SEED}&server=ws://127.0.0.1:${WS_PORT}/ws&verify=1&taglog=1" \
   >"$LOG" 2>&1 || true
 
 # Let the second browser finish (it runs shorter than the first).
@@ -146,6 +146,12 @@ check "server saw the client"          grep -q "joined (shared world seed ${SEED
 check "second browser connected"       grep -q "RustCraft: remote server connected (seed ${SEED}, player" "$LOG2"
 check "shared world saw two players"   grep -q ", 2 online)" "$WS_LOG"
 check "first browser rendered 2 players" grep -q "POOL chunks=[0-9]* missing=[0-9]* agents=2" "$LOG"
+# Name tags: each browser must create a tag for the OTHER player (the shared
+# world streams the full agent list to both) and position it on screen
+# (TAGS telemetry, ?taglog=1 — the position must be finite CSS pixels).
+check "first browser tagged the other player"  grep -q "RustCraft: name tag created for player" "$LOG"
+check "first browser positioned the tag"  grep -Eq "TAGS [0-9]+:[0-9.]+px/[0-9.]+px" "$LOG"
+check "second browser tagged the other player"  grep -q "RustCraft: name tag created for player" "$LOG2"
 
 # GPU readback: the shadow renderer re-renders the scene built from the
 # server-streamed chunk regions; the 4x3 grid must show sky + terrain.

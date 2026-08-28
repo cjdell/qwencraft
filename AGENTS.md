@@ -120,8 +120,9 @@ crates/
                       AsyncWrite — without the replay, consuming the head
                       hangs tokio-tungstenite's accept_async). route:
                       `/ws` + WebSocket-Upgrade header → the socket;
-                      `/ws` over plain HTTP → 426; `/dashboard/*` → the
-                      embedded dashboard/dist; `/` + `/*` → the embedded
+                      `/ws` over plain HTTP → 426; `/dashboard` → 302 to
+                      `/dashboard/`; `/dashboard/*` → the embedded
+                      dashboard/dist; `/` + `/*` → the embedded
                       web/dist game page (build.rs materialises a
                       placeholder index.html in gitignored web/dist when
                       it's absent); `/healthz`, `/api/status` (JSON,
@@ -186,8 +187,11 @@ dashboard/            STANDALONE cargo workspace (its dep graph must not
                       touch the main workspace's exact pins). Dioxus 0.7
                       wasm app: top bar (players/npcs/seed/uptime), event
                       log, PLAYERS list (focus button), 2D minimap canvas
-                      (drag-pan, wheel-zoom; terrain colours mirror
-                      Block::color_top). Built by
+                      (drag-pan, wheel-zoom 50–800%; terrain colours
+                      mirror Block::color_top; the pane is a mosaic of
+                      cached 256×256-block tiles fetched from
+                      /api/map — max zoom-out fills the pane; ?zoom=N
+                      sets the initial zoom). Built by
                       scripts/build_dashboard.sh into dist/ (COMMITTED —
                       embedded into the rustcraft-net binary via
                       include_dir!; the cdylib exposes #[wasm_bindgen]

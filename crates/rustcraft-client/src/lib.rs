@@ -108,6 +108,10 @@ pub struct Renderer {
     backlog: Vec<WorldUpdate>,
     width: u32,
     height: u32,
+    /// CSS-pixel size (the drawing buffer is scaled by devicePixelRatio —
+    /// screen-space DOM overlays must be positioned in CSS pixels).
+    css_width: u32,
+    css_height: u32,
     camera: [f32; 3],
     yaw: f32,
     pitch: f32,
@@ -171,7 +175,7 @@ impl Renderer {
             .first()
             .ok_or_else(|| "surface has no formats".to_string())?;
 
-        let (width, height) = canvas_size(canvas);
+        let (width, height, css_width, css_height) = canvas_size(canvas);
         configure_surface(&surface, &device, surface_format, width, height);
 
         // Pipeline: pos(3f) + color(3f) vertices, one uniform buffer.
@@ -309,6 +313,8 @@ impl Renderer {
             backlog: Vec::new(),
             width,
             height,
+            css_width,
+            css_height,
             camera: [0.0, 40.0, 0.0],
             yaw: 0.7,
             pitch: -0.15,
@@ -320,10 +326,18 @@ impl Renderer {
         self.terrain.len()
     }
 
-    /// Current viewport size in pixels (for screen-space overlays like the
-    /// other players' name tags).
+    /// Current drawing-buffer size in device pixels.
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Current viewport size in **CSS pixels** (what `left`/`top` on a
+    /// positioned DOM element are measured in). On a high-DPI display the
+    /// drawing buffer is `devicePixelRatio`× the CSS size — projecting
+    /// world points into buffer pixels and using them for CSS offsets
+    /// scatters screen-space overlays (name tags) everywhere.
+    pub fn css_size(&self) -> (u32, u32) {
+        (self.css_width, self.css_height)
     }
 
     /// First frame has been presented (for startup logging).
@@ -335,12 +349,14 @@ impl Renderer {
 
     /// Resize the viewport.
     pub fn resize(&mut self, canvas: &web_sys::HtmlCanvasElement) {
-        let (w, h) = canvas_size(canvas);
+        let (w, h, cw, ch) = canvas_size(canvas);
         if w == self.width && h == self.height {
             return;
         }
         self.width = w;
         self.height = h;
+        self.css_width = cw;
+        self.css_height = ch;
         configure_surface(&self.surface, &self.device, self.surface_format, w, h);
     }
 
@@ -906,16 +922,21 @@ fn log_or_panic_adapter(adapter: &wgpu::Adapter) {
     eprintln!("RustCraft: using adapter {:?}", info.name);
 }
 
-fn canvas_size(canvas: &web_sys::HtmlCanvasElement) -> (u32, u32) {
+/// The canvas' drawing-buffer size (CSS size × devicePixelRatio) plus the
+/// CSS size. Buffer pixels are what the GPU renders into; CSS pixels are
+/// what positioned DOM overlays (name tags) use.
+fn canvas_size(canvas: &web_sys::HtmlCanvasElement) -> (u32, u32, u32, u32) {
     let dpr = web_sys::window()
         .map(|w| w.device_pixel_ratio())
         .unwrap_or(1.0)
         .max(1.0) as f32;
-    let w = (canvas.client_width().max(1) as f32 * dpr) as u32;
-    let h = (canvas.client_height().max(1) as f32 * dpr) as u32;
+    let cw = canvas.client_width().max(1) as u32;
+    let ch = canvas.client_height().max(1) as u32;
+    let w = (cw as f32 * dpr).round() as u32;
+    let h = (ch as f32 * dpr).round() as u32;
     canvas.set_width(w);
     canvas.set_height(h);
-    (w, h)
+    (w, h, cw, ch)
 }
 
 fn configure_surface(

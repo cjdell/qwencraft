@@ -11,6 +11,12 @@
 //! continuous at any fractional scale (0.5–8 px per block): drag or
 //! two-finger scroll pans, trackpad pinch / mouse wheel zooms at the
 //! cursor.
+//!
+//! The server serves map regions of at most 256×256 blocks, so the
+//! dashboard fetches the visible area as a mosaic of 256-aligned **tiles**
+//! (cached, centre-first, a few per tick) and draws them all — deep
+//! zoom-out fills the whole canvas instead of a small central square.
+//! Beyond `MAX_SPAN` blocks of world per side the canvas letterboxes.
 
 
 use dioxus::prelude::*;
@@ -77,12 +83,33 @@ struct MapData {
     cols: Vec<u8>,
 }
 
+/// One cached map tile: the region's bounds + its painted pixels (a hidden
+/// offscreen canvas, 1 px per block) + fetch time (for the refresh cycle).
+/// The raw column bytes live only in the fetch task (they're consumed by
+/// `paint_offscreen`); this struct is cheap to clone (small ints + one JS
+/// handle), which keeps it signal-friendly.
+#[derive(Clone)]
+struct Tile {
+    x0: i32,
+    z0: i32,
+    w: i32,
+    h: i32,
+    off: web_sys::HtmlCanvasElement,
+    /// `js_sys::Date::now()` ms when fetched.
+    at: f64,
+}
+
 // ---------------------------------------------------------------------------
 // Constants (mirror the server's clamps)
 // ---------------------------------------------------------------------------
 
-const MAP_MIN: i32 = 16;
-const MAP_MAX: i32 = 256;
+/// The server's max region side (256) — also the dashboard's tile size
+/// (a tile request is exactly one 256×256 region, so it never clamps).
+const TILE: i32 = 256;
+/// Max world span (blocks per side) the dashboard fetches at once. At the
+/// minimum zoom (0.5 px/block) a 1280-px-wide pane would want 2560 blocks;
+/// beyond this cap the canvas letterboxes (the scale stays honest).
+const MAX_SPAN: i32 = 2048;
 const MIN_SCALE: f64 = 0.5; // px per block (zoomed out)
 const MAX_SCALE: f64 = 8.0; // px per block (zoomed in)
 /// `Block::Water` id (mirrors `rustcraft_world::Block`).
@@ -90,10 +117,17 @@ const WATER: u8 = 5;
 /// Contour spacing in blocks: minor lines, and major lines.
 const CONTOUR_MINOR: i32 = 4;
 const CONTOUR_MAJOR: i32 = 16;
-/// Blocks of slack fetched around the visible rect (hillshading samples
-/// one block past the region edge; a fast pan outruns the refetch by a few
-/// blocks before the new region lands).
+/// Blocks of slack fetched around the visible rect (a fast pan outruns
+/// the refetch by a few blocks before the new tiles land).
 const MAP_MARGIN: f64 = 4.0;
+/// Tiles (of `TILE` blocks) re-fetched this often so block edits made by
+/// players appear on the map without interaction.
+const TILE_REFRESH_MS: f64 = 3_000.0;
+/// Cap on the number of cached tiles (memory + refresh traffic bound).
+const MAX_TILES: usize = 100;
+/// Tiles fetched per poll tick (a fresh deep-zoom view fills in smoothly
+/// over ~1 s instead of bursting 40+ requests at once).
+const TILES_PER_TICK: usize = 6;
 
 /// Top-face colour per block id (mirrors `rustcraft_world::Block::color_top`).
 fn block_color(b: u8) -> [u8; 3] {
@@ -234,20 +268,86 @@ struct View {
     scale: f64,
 }
 
-/// The map region the dashboard should fetch for a view + canvas size.
+/// Floor division for possibly-negative block coordinates (Rust's `/`
+/// truncates toward zero, which would misalign tiles on the negative side).
+fn floor_div(a: i32, b: i32) -> i32 {
+    let q = a / b;
+    if a % b < 0 {
+        q - 1
+    } else {
+        q
+    }
+}
+
+/// The `TILE`-aligned tiles covering the visible rect (plus `MAP_MARGIN`
+/// blocks of slack on every side), span-capped to `MAX_SPAN` blocks per
+/// side and ordered nearest-to-centre first (the middle of the view fills
+/// in before the edges do).
 ///
-/// The region covers the visible rect plus `MAP_MARGIN` blocks on every
-/// side (see its doc), clamped the same way the server does. When the
-/// visible rect is larger than the max region (deep zoom-out), the region
-/// is centred on the view centre and the image only covers the middle of
-/// the canvas — the zoom level itself stays honest (50% really means
-/// 0.5 px per block).
-fn map_request(cx: f64, cz: f64, scale: f64, cw: u32, ch: u32) -> (i32, i32, i32, i32) {
+/// Each tile is one 256×256 fetch (the server's max region), so the deep
+/// zoom-out that used to letterbox a small square in the middle now draws
+/// the whole canvas as a mosaic.
+fn tiles_for_view(cx: f64, cz: f64, scale: f64, cw: u32, ch: u32) -> Vec<(i32, i32)> {
     let vw = (cw as f64) / scale;
     let vh = (ch as f64) / scale;
-    let w = ((vw + 2.0 * MAP_MARGIN).ceil() as i32).clamp(MAP_MIN, MAP_MAX);
-    let h = ((vh + 2.0 * MAP_MARGIN).ceil() as i32).clamp(MAP_MIN, MAP_MAX);
-    (cx.round() as i32, cz.round() as i32, w, h)
+    let mut x0 = (cx - vw / 2.0 - MAP_MARGIN).floor();
+    let mut x1 = (cx + vw / 2.0 + MAP_MARGIN).ceil();
+    let mut z0 = (cz - vh / 2.0 - MAP_MARGIN).floor();
+    let mut z1 = (cz + vh / 2.0 + MAP_MARGIN).ceil();
+    // Span cap: centre the fetchable span on the view centre.
+    if x1 - x0 > MAX_SPAN as f64 {
+        let c = (x0 + x1) / 2.0;
+        x0 = c - (MAX_SPAN as f64) / 2.0;
+        x1 = c + (MAX_SPAN as f64) / 2.0;
+    }
+    if z1 - z0 > MAX_SPAN as f64 {
+        let c = (z0 + z1) / 2.0;
+        z0 = c - (MAX_SPAN as f64) / 2.0;
+        z1 = c + (MAX_SPAN as f64) / 2.0;
+    }
+    let (ix0, ix1) = (floor_div(x0 as i32, TILE), floor_div(x1 as i32 - 1, TILE));
+    let (iz0, iz1) = (floor_div(z0 as i32, TILE), floor_div(z1 as i32 - 1, TILE));
+    let mut list = Vec::with_capacity((ix1 - ix0 + 1) as usize * (iz1 - iz0 + 1) as usize);
+    for tz in iz0..=iz1 {
+        for tx in ix0..=ix1 {
+            list.push((tx, tz));
+        }
+    }
+    // Nearest to the view centre first (the tile centres are tile*256+128).
+    list.sort_by(|a, b| {
+        let da = ((a.0 as f64 * (TILE as f64) + (TILE as f64) / 2.0) - cx)
+            .abs()
+            .max(((a.1 as f64 * (TILE as f64) + (TILE as f64) / 2.0) - cz).abs());
+        let db = ((b.0 as f64 * (TILE as f64) + (TILE as f64) / 2.0) - cx)
+            .abs()
+            .max(((b.1 as f64 * (TILE as f64) + (TILE as f64) / 2.0) - cz).abs());
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    list
+}
+
+/// The initial zoom for a pane of `pane_w` CSS px: a view that fills it
+/// (~240 blocks wide), unless `?zoom=N` (percent) says otherwise — clamped
+/// to the supported range.
+fn initial_scale(pane_w: f64) -> f64 {
+    let default = (pane_w / 240.0).clamp(MIN_SCALE, MAX_SCALE);
+    let Some(window) = web_sys::window() else {
+        return default;
+    };
+    let Ok(search) = window.location().search() else {
+        return default;
+    };
+    let Some(query) = search.strip_prefix('?') else {
+        return default;
+    };
+    for kv in query.split('&') {
+        if let Some(v) = kv.strip_prefix("zoom=") {
+            if let Ok(pct) = v.parse::<f64>() {
+                return (pct / 100.0).clamp(MIN_SCALE, MAX_SCALE);
+            }
+        }
+    }
+    default
 }
 
 /// Zoom anchored at the cursor: the world point under the mouse stays under
@@ -355,15 +455,17 @@ fn paint_offscreen(off: &web_sys::HtmlCanvasElement, m: &MapData) {
     }
 }
 
-/// Draw one frame: the map image (bilinear-scaled from its 1px-per-block
-/// offscreen buffer at a fractional offset, so pan and zoom are smooth at
-/// any scale), the 16-block chunk grid, and the agents on top.
+/// Draw one frame: the map tiles (each bilinear-scaled from its
+/// 1px-per-block offscreen buffer at a fractional offset, so pan and zoom
+/// are smooth at any scale), the 16-block chunk grid, and the agents on
+/// top. Tiles arrive centre-first over the first poll ticks, so a fresh
+/// deep-zoom view fills in smoothly; the grid and agents render even
+/// before the first tile lands.
 fn draw(
     ctx: &web_sys::CanvasRenderingContext2d,
     canvas: &web_sys::HtmlCanvasElement,
     v: &View,
-    m: Option<&MapData>,
-    off: Option<&web_sys::HtmlCanvasElement>,
+    tiles: &std::collections::HashMap<(i32, i32), Tile>,
     agents: &[Agent],
 ) {
     let w = canvas.width() as f64;
@@ -382,26 +484,32 @@ fn draw(
     let sx = |wx: f64| (wx - wx0) * s;
     let sy = |wz: f64| (wz - wz0) * s;
 
-    if let (Some(m), Some(off)) = (m, off) {
-        // The offscreen buffer is 1px per block; bilinear scaling is what
-        // makes fractional zoom smooth ("texture zoom"). When the view is
-        // wider than the fetched region (deep zoom-out), the image covers
-        // only the centre and the rest stays background — the scale shown
-        // in the HUD is still the real one.
-        ctx.set_image_smoothing_enabled(true);
+    // The map tiles (1px per block each). Bilinear scaling makes the
+    // fractional zoom smooth ("texture zoom"); tiles beyond the span cap
+    // simply aren't fetched, so the canvas letterboxes there — the scale
+    // shown in the HUD is still the real one.
+    ctx.set_image_smoothing_enabled(true);
+    for t in tiles.values() {
+        let dx = sx(t.x0 as f64);
+        let dy = sy(t.z0 as f64);
+        let dw = t.w as f64 * s;
+        let dh = t.h as f64 * s;
+        // Cull tiles fully outside the canvas (deep zoom-out fetches the
+        // whole span cap; only the ones intersecting the pane are drawn).
+        if dx + dw < 0.0 || dy + dh < 0.0 || dx > w || dy > h {
+            continue;
+        }
         let _ = ctx.draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
-            off,
+            &t.off,
             0.0,
             0.0,
-            m.w.max(1) as f64,
-            m.h.max(1) as f64,
-            sx(m.x0 as f64),
-            sy(m.z0 as f64),
-            m.w as f64 * s,
-            m.h as f64 * s,
+            t.w.max(1) as f64,
+            t.h.max(1) as f64,
+            dx,
+            dy,
+            dw,
+            dh,
         );
-    } else {
-        return;
     }
 
     // Chunk grid (16-block lines) across the visible rect.
@@ -469,7 +577,10 @@ fn draw(
 #[component]
 fn App() -> Element {
     let mut status: Signal<Option<Status>> = use_signal(|| None);
-    let mut map: Signal<Option<MapData>> = use_signal(|| None);
+    // Cached map tiles, keyed by tile origin (tile index × 256 blocks).
+    // The fetch task (below) is the only writer; the draw effect reads.
+    let mut tiles: Signal<std::collections::HashMap<(i32, i32), Tile>> =
+        use_signal(std::collections::HashMap::new);
     let mut view: Signal<View> = use_signal(|| View { cx: 8.0, cz: 8.0, scale: 3.0 });
     let mut online: Signal<bool> = use_signal(|| false);
     let mut csize: Signal<(u32, u32)> = use_signal(|| (0, 0));
@@ -493,14 +604,6 @@ fn App() -> Element {
             }
         }
     });
-    // Hidden canvas that holds the current map region as pixels.
-    let off: Signal<Option<web_sys::HtmlCanvasElement>> = use_signal(|| {
-        web_sys::window()
-            .and_then(|w| w.document())
-            .and_then(|d| d.create_element("canvas").ok())
-            .map(|c| c.unchecked_into::<web_sys::HtmlCanvasElement>())
-    });
-
     // Swallow browser-level wheel side effects everywhere in the app:
     // horizontal-dominant swipes (the trackpad back/forward gesture) and
     // ctrl+wheel (page zoom). The map canvas handles its own wheel events;
@@ -546,18 +649,15 @@ fn App() -> Element {
         });
     });
 
-    // Map poll (100 ms tick): refetch when the view/canvas changes, plus a
-    // slow 3 s refresh so block edits appear without interaction. The tick
-    // is short because sub-block pans do NOT change the request (the drawn
-    // offset moves continuously), so a fast pan only refetches when the
-    // integer region actually shifts.
+    // Map poll (100 ms tick): keeps the canvas sized, then fetches the
+    // tiles the view needs (centre-first, a few per tick) and refreshes
+    // in-view tiles every `TILE_REFRESH_MS` so block edits appear without
+    // interaction. Sub-block pans do NOT change the tile set (the drawn
+    // offset moves continuously), so panning only fetches when a new tile
+    // edge is crossed.
     use_effect(move || {
         spawn(async move {
-            let mut last_req: Option<(i32, i32, i32, i32)> = None;
             let mut fitted = false;
-            // js_sys::Date::now (ms): std::time::Instant panics on wasm32.
-            // Pre-expired so the first tick fetches immediately.
-            let mut last_fetch = js_sys::Date::now() - 10_000.0;
             loop {
                 // Keep the canvas sized to its pane (setting the size clears
                 // it; the draw effect repaints). clientWidth is the CSS size.
@@ -572,31 +672,88 @@ fn App() -> Element {
                     }
                     // First time we know the pane size: default to a view
                     // that fills it (~240 blocks wide) instead of an
-                    // arbitrary fixed scale.
+                    // arbitrary fixed scale. ?zoom=N (percent: 50 = 0.5
+                    // px/block, 800 = 8) overrides it — handy for
+                    // deep-linking a view and for the zoom-out test.
                     if !fitted && nw > 1 && nh > 1 {
                         fitted = true;
-                        *view.write() = View {
-                            cx: 8.0,
-                            cz: 8.0,
-                            scale: (nw as f64 / 240.0).clamp(MIN_SCALE, MAX_SCALE),
-                        };
+                        let scale = initial_scale(nw as f64);
+                        *view.write() = View { cx: 8.0, cz: 8.0, scale };
                     }
                 }
                 let v = *view.read();
                 let (cw, ch) = *csize.read();
                 if cw > 1 && ch > 1 {
-                    let req = map_request(v.cx, v.cz, v.scale, cw, ch);
+                    // Tiles the view needs, centre-first: fetch the missing
+                    // ones (and the stale ones) up to a per-tick budget, so
+                    // a fresh deep-zoom view fills in smoothly over ~1 s
+                    // instead of bursting 40+ requests at once.
+                    let needed = tiles_for_view(v.cx, v.cz, v.scale, cw, ch);
                     let now = js_sys::Date::now();
-                    let due = last_req != Some(req) || now - last_fetch > 3_000.0;
-                    if due {
-                        last_fetch = now;
-                        if let Ok(m) = fetch_map(req.0, req.1, req.2, req.3).await {
-                            last_req = Some(req);
-                            if let Some(o) = (*off.read()).clone() {
-                                paint_offscreen(&o, &m);
-                            }
-                            *map.write() = Some(m);
+                    let mut budget = TILES_PER_TICK;
+                    for &key in &needed {
+                        if budget == 0 {
+                            break;
                         }
+                        let due = match tiles.read().get(&key) {
+                            None => true,
+                            Some(t) => now - t.at >= TILE_REFRESH_MS,
+                        };
+                        if !due {
+                            continue;
+                        }
+                        budget -= 1;
+                        let (tx, tz) = key;
+                        // A tile is exactly one server-max region, so the
+                        // request never clamps.
+                        if let Ok(m) = fetch_map(tx * TILE + TILE / 2, tz * TILE + TILE / 2, TILE, TILE).await {
+                            let off = match tiles.read().get(&key) {
+                                Some(t) => t.off.clone(),
+                                None => match web_sys::window()
+                                    .and_then(|w| w.document())
+                                    .and_then(|d| d.create_element("canvas").ok())
+                                {
+                                    Some(c) => c.unchecked_into::<web_sys::HtmlCanvasElement>(),
+                                    None => continue,
+                                },
+                            };
+                            paint_offscreen(&off, &m);
+                            tiles.write().insert(
+                                key,
+                                Tile {
+                                    x0: m.x0,
+                                    z0: m.z0,
+                                    w: m.w,
+                                    h: m.h,
+                                    off,
+                                    at: js_sys::Date::now(),
+                                },
+                            );
+                        }
+                    }
+                    // Bound the cache: when over the cap, keep the tiles
+                    // nearest the view centre (deep zoom-out is the only
+                    // way to get there).
+                    if tiles.read().len() > MAX_TILES {
+                        let mut by_dist: Vec<_> = tiles
+                            .read()
+                            .keys()
+                            .map(|&(tx, tz)| {
+                                let d = ((tx * TILE + TILE / 2) as f64 - v.cx)
+                                    .abs()
+                                    .max(((tz * TILE + TILE / 2) as f64 - v.cz).abs());
+                                (d, (tx, tz))
+                            })
+                            .collect();
+                        by_dist.sort_by(
+                            |a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal),
+                        );
+                        let keep: std::collections::HashSet<(i32, i32)> = by_dist
+                            .iter()
+                            .take(MAX_TILES)
+                            .map(|&(_, k)| k)
+                            .collect();
+                        tiles.write().retain(|k, _| keep.contains(k));
                     }
                 }
                 sleep_ms(100.0).await;
@@ -613,11 +770,11 @@ fn App() -> Element {
         }
     });
 
-    // Redraw on any input change (map, agents, view, canvas size).
+    // Redraw on any input change (tiles, agents, view, canvas size).
     use_effect(move || {
         let v = *view.read();
         let csize = *csize.read();
-        let m = (*map.read()).clone();
+        let tiles_now = (*tiles.read()).clone();
         let agents: Vec<Agent> = status
             .read()
             .as_ref()
@@ -635,8 +792,7 @@ fn App() -> Element {
         else {
             return;
         };
-        let offc = (*off.read()).clone();
-        draw(&ctx, &canvas, &v, m.as_ref(), offc.as_ref(), &agents);
+        draw(&ctx, &canvas, &v, &tiles_now, &agents);
     });
 
     let st = (*status.read()).clone();
@@ -652,12 +808,12 @@ fn App() -> Element {
         Some(n) => format!("{n} players connected"),
         None => String::new(),
     };
-    // True when the visible rect is wider than the fetchable region, so
-    // the map image covers only the middle of the canvas (honest zoom-out
-    // beyond 256 blocks).
+    // True when the visible rect exceeds the fetchable span cap, so the
+    // tile mosaic covers only the middle of the canvas (honest zoom-out
+    // beyond MAX_SPAN blocks).
     let (cw_px, ch_px) = *csize.read();
-    let limited = cw_px as f64 / view_now.scale > (MAP_MAX as f64 - 2.0 * MAP_MARGIN)
-        || ch_px as f64 / view_now.scale > (MAP_MAX as f64 - 2.0 * MAP_MARGIN);
+    let limited = cw_px as f64 / view_now.scale + 2.0 * MAP_MARGIN > (MAX_SPAN as f64)
+        || ch_px as f64 / view_now.scale + 2.0 * MAP_MARGIN > (MAX_SPAN as f64);
     let hud = format!(
         "{}% · center ({}, {}){}",
         (view_now.scale * 100.0).round() as i32,
