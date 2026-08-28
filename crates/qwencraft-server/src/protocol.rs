@@ -593,7 +593,7 @@ mod tests {
             fly: true,
             fly_speed: 42.0,
             color: [10, 200, 255],
-            radius: 0.42,
+            radius: crate::agent::AGENT_RADIUS,
             target: Some(BlockPos::new(-3, 12, 77)),
         }
     }

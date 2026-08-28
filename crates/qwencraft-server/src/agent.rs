@@ -37,6 +37,10 @@ pub const SWIM_UP_SPEED: f32 = 4.2;
 pub const HALF_W: f32 = 0.3;
 pub const HEIGHT: f32 = 1.8;
 pub const EYE_HEIGHT: f32 = 1.62;
+/// Agent sphere radius (rendering: the client draws each agent as a sphere
+/// of this radius centred on `pos + (0, radius, 0)`; the name tag sits
+/// just above it).
+pub const AGENT_RADIUS: f32 = 0.42;
 const MAX_FALL: f32 = -40.0;
 const EPS: f32 = 1e-4;
 const MOUSE_SENS: f32 = 0.0024;
@@ -81,7 +85,7 @@ impl Default for AgentState {
             fly: false,
             fly_speed: FLY_BASE_SPEED,
             color: [255, 255, 255],
-            radius: 0.42,
+            radius: AGENT_RADIUS,
             target: None,
         }
     }
@@ -187,7 +191,7 @@ impl Agent {
             fly: self.fly,
             fly_speed: self.fly_speed,
             color: self.color,
-            radius: 0.42,
+            radius: AGENT_RADIUS,
             target: None,
         }
     }
