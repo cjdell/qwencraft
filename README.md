@@ -172,13 +172,18 @@ cargo run -p rustcraft-net --release -- --seed 1337 --port 9000 --http-port 9001
 
 It shows the **live connection count** (players + NPCs), an **event log**
 (joins/leaves, block break/place, fly toggles, NPC loads — capped at 256
-entries), and a **2D minimap**: a top-down view of the world's surface
-(grass/water/sand/snow/stone, tree canopies) with players and NPCs plotted
-on top (players labelled, with a “focus” button). Drag to pan, wheel to
-zoom (16–256 block views). The map is computed from the *pure* terrain
-function plus the world's edit history (so it is exact modulo flowers and
-canopy overhang, invisible at 1 px/block), and it updates within a tick of
-any block edit made by a connected player.
+entries), and a **2D minimap**: a hillshaded top-down view of the world's
+surface (grass/water/sand/snow/stone, tree canopies; light from the
+upper-left, contour lines every 4 blocks, major every 16) with players and
+NPCs plotted on top (players labelled, with a “focus” button). Drag or
+two-finger scroll to pan; trackpad pinch or mouse wheel zooms smoothly from
+50% to 800% (0.5–8 px per block, anchored at the cursor). The fetchable
+region spans 16–256 blocks; zooming out beyond that letterboxes the map
+(the scale stays honest — 50% really means 0.5 px per block). The map is
+computed from the *pure* terrain function plus the world's edit history
+(so it is exact modulo
+flowers and canopy overhang, invisible at 1 px/block), and it updates
+within a tick of any block edit made by a connected player.
 
 The dashboard is a dioxus (wasm) app in its own workspace under
 `dashboard/` — built by `./scripts/build_dashboard.sh` into

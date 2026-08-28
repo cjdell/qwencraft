@@ -5,8 +5,12 @@
 //! Polls the same-origin status endpoints:
 //!   GET /api/status  → JSON: seed, uptime, agents, event log
 //!   GET /api/map     → binary: topmost block per column for a region
-//! and renders a pannable (drag) / zoomable (wheel) 2D minimap with
-//! players (squares) and NPCs (coloured dots) on top.
+//! and renders a 2D minimap with players (squares) and NPCs (coloured
+//! dots) on top. The map is hillshaded (light from the upper-left) with
+//! contour lines (minor every 4 blocks, major every 16), and pan/zoom are
+//! continuous at any fractional scale (0.5–8 px per block): drag or
+//! two-finger scroll pans, trackpad pinch / mouse wheel zooms at the
+//! cursor.
 
 
 use dioxus::prelude::*;
@@ -66,6 +70,15 @@ const MAP_MIN: i32 = 16;
 const MAP_MAX: i32 = 256;
 const MIN_SCALE: f64 = 0.5; // px per block (zoomed out)
 const MAX_SCALE: f64 = 8.0; // px per block (zoomed in)
+/// `Block::Water` id (mirrors `rustcraft_world::Block`).
+const WATER: u8 = 5;
+/// Contour spacing in blocks: minor lines, and major lines.
+const CONTOUR_MINOR: i32 = 4;
+const CONTOUR_MAJOR: i32 = 16;
+/// Blocks of slack fetched around the visible rect (hillshading samples
+/// one block past the region edge; a fast pan outruns the refetch by a few
+/// blocks before the new region lands).
+const MAP_MARGIN: f64 = 4.0;
 
 /// Top-face colour per block id (mirrors `rustcraft_world::Block::color_top`).
 fn block_color(b: u8) -> [u8; 3] {
@@ -206,32 +219,36 @@ struct View {
     scale: f64,
 }
 
-/// The map region the dashboard should fetch for a view + canvas size
-/// (clamped the same way the server does).
+/// The map region the dashboard should fetch for a view + canvas size.
+///
+/// The region covers the visible rect plus `MAP_MARGIN` blocks on every
+/// side (see its doc), clamped the same way the server does. When the
+/// visible rect is larger than the max region (deep zoom-out), the region
+/// is centred on the view centre and the image only covers the middle of
+/// the canvas — the zoom level itself stays honest (50% really means
+/// 0.5 px per block).
 fn map_request(cx: f64, cz: f64, scale: f64, cw: u32, ch: u32) -> (i32, i32, i32, i32) {
-    let w = ((cw as f64 / scale).ceil() as i32).clamp(MAP_MIN, MAP_MAX);
-    let h = ((ch as f64 / scale).ceil() as i32).clamp(MAP_MIN, MAP_MAX);
+    let vw = (cw as f64) / scale;
+    let vh = (ch as f64) / scale;
+    let w = ((vw + 2.0 * MAP_MARGIN).ceil() as i32).clamp(MAP_MIN, MAP_MAX);
+    let h = ((vh + 2.0 * MAP_MARGIN).ceil() as i32).clamp(MAP_MIN, MAP_MAX);
     (cx.round() as i32, cz.round() as i32, w, h)
 }
 
-/// Wheel zoom anchored at the cursor: the world point under the mouse stays
-/// under the mouse.
-fn zoom_around(v: View, px: f64, py: f64, cw: f64, ch: f64, delta: f64) -> View {
-    let factor = if delta < 0.0 { 1.25 } else { 1.0 / 1.25 };
+/// Zoom anchored at the cursor: the world point under the mouse stays under
+/// the mouse, at any fractional scale in `MIN_SCALE..=MAX_SCALE`.
+fn zoom_around(v: View, px: f64, py: f64, cw: f64, ch: f64, factor: f64) -> View {
     let scale = (v.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
-    if (scale - v.scale).abs() < 1e-9 {
+    if (scale - v.scale).abs() < 1e-12 {
         return v;
     }
-    let (cx_i, cz_i, w, h) = map_request(v.cx, v.cz, v.scale, cw as u32, ch as u32);
-    let x0 = (cx_i - w / 2) as f64;
-    let z0 = (cz_i - h / 2) as f64;
     // World point under the cursor, before the zoom.
-    let wx = x0 + (px / cw) * w as f64;
-    let wz = z0 + (py / ch) * h as f64;
-    let (_, _, nw, nh) = map_request(0.0, 0.0, scale, cw as u32, ch as u32);
+    let wx = v.cx - cw / (2.0 * v.scale) + px / v.scale;
+    let wz = v.cz - ch / (2.0 * v.scale) + py / v.scale;
+    // New centre that keeps that point under the cursor.
     View {
-        cx: (wx + nw as f64 / 2.0 - (px / cw) * nw as f64).round(),
-        cz: (wz + nh as f64 / 2.0 - (py / ch) * nh as f64).round(),
+        cx: wx + cw / (2.0 * scale) - px / scale,
+        cz: wz + ch / (2.0 * scale) - py / scale,
         scale,
     }
 }
@@ -241,10 +258,24 @@ fn zoom_around(v: View, px: f64, py: f64, cw: f64, ch: f64, delta: f64) -> View 
 // ---------------------------------------------------------------------------
 
 /// Paint the map region into the (hidden) offscreen canvas as raw pixels —
-/// done once per map fetch, never per frame.
+/// 1 px per block, done once per map fetch, never per frame.
+///
+/// Elevation is depicted two ways:
+/// - hillshading: each pixel's surface normal (central-difference
+///   gradient of the height field) is lit from the upper-left, so slopes
+///   facing away from the light read darker — relief is visible even at
+///   low zoom;
+/// - contour lines: a pixel at a surface height that is a multiple of
+///   `CONTOUR_MINOR` (resp. `CONTOUR_MAJOR`) blocks is darkened. The lines
+///   are 1 px wide in block space, so they fade out naturally below 100%
+///   zoom and read as a proper topo map zoomed in. Water is skipped (its
+///   surface is flat at the sea level, so a contour would darken whole
+///   lakes).
 fn paint_offscreen(off: &web_sys::HtmlCanvasElement, m: &MapData) {
-    off.set_width(m.w.max(1) as u32);
-    off.set_height(m.h.max(1) as u32);
+    let w = m.w.max(1) as usize;
+    let h = m.h.max(1) as usize;
+    off.set_width(w as u32);
+    off.set_height(h as u32);
     let Some(ctx) = off
         .get_context("2d")
         .ok()
@@ -253,33 +284,69 @@ fn paint_offscreen(off: &web_sys::HtmlCanvasElement, m: &MapData) {
     else {
         return;
     };
-    let n = (m.w * m.h) as usize;
+    // Height of a column, edge-clamped (the ±1 halo for the gradient uses
+    // repeated edge values; the visible rect starts MAP_MARGIN blocks in).
+    let hgt = |x: isize, z: isize| -> i32 {
+        let x = x.clamp(0, (w - 1) as isize);
+        let z = z.clamp(0, (h - 1) as isize);
+        m.cols[2 * (((z * w as isize) + x) as usize)] as i32
+    };
+    // Light from the upper-left (north-west), steep-ish.
+    let (lx, ly, lz) = {
+        let (a, b, c) = (-0.5f32, 0.8f32, -0.35f32);
+        let l = (a * a + b * b + c * c).sqrt();
+        (a / l, b / l, c / l)
+    };
+    let n = w * h;
     let mut px = vec![0u8; n * 4];
-    for i in 0..n {
-        let y = m.cols[2 * i] as i32;
-        let b = m.cols[2 * i + 1];
-        let [r, g, bl] = block_color(b);
-        // Subtle relief: higher = brighter.
-        let shade = (0.62 + 0.012 * y.clamp(0, 48) as f32).min(1.15);
-        let o = i * 4;
-        px[o] = (r as f32 * shade) as u8;
-        px[o + 1] = (g as f32 * shade) as u8;
-        px[o + 2] = (bl as f32 * shade) as u8;
-        px[o + 3] = 255;
+    for z in 0..h {
+        for x in 0..w {
+            let i = z * w + x;
+            let y = hgt(x as isize, z as isize);
+            let b = m.cols[2 * i + 1];
+            let [r, g, bl] = block_color(b);
+            // Hillshade: surface normal from the central-difference
+            // gradient (dh per block on each axis).
+            let gx = (hgt(x as isize + 1, z as isize) - hgt(x as isize - 1, z as isize)) as f32
+                * 0.5;
+            let gz =
+                (hgt(x as isize, z as isize + 1) - hgt(x as isize, z as isize - 1)) as f32 * 0.5;
+            let (nx, ny, nz) = {
+                let (a, b, c) = (-gx, 1.0f32, -gz);
+                let l = (a * a + b * b + c * c).sqrt();
+                (a / l, b / l, c / l)
+            };
+            let hill = (nx * lx + ny * ly + nz * lz).clamp(0.0, 1.0);
+            // Hillshade + a slight height ramp (high ground reads brighter).
+            let mut f = (0.55 + 0.45 * hill) * (0.92 + 0.004 * y.clamp(0, 64) as f32);
+            // Contour lines (see above).
+            if b != WATER && y != 255 {
+                if y % CONTOUR_MAJOR == 0 {
+                    f *= 0.60;
+                } else if y % CONTOUR_MINOR == 0 {
+                    f *= 0.84;
+                }
+            }
+            let o = i * 4;
+            px[o] = (r as f32 * f).min(255.0) as u8;
+            px[o + 1] = (g as f32 * f).min(255.0) as u8;
+            px[o + 2] = (bl as f32 * f).min(255.0) as u8;
+            px[o + 3] = 255;
+        }
     }
     let clamped = js_sys::Uint8ClampedArray::from(&px[..]);
-    if let Some(img) =
-        web_sys::ImageData::new_with_js_u8_clamped_array(&clamped, m.w.max(1) as u32).ok()
-    {
+    if let Some(img) = web_sys::ImageData::new_with_js_u8_clamped_array(&clamped, w as u32).ok() {
         let _ = ctx.put_image_data(&img, 0.0, 0.0);
     }
 }
 
-/// Draw one frame: the (stretched) map image, the 16-block chunk grid, and
-/// the agents on top.
+/// Draw one frame: the map image (bilinear-scaled from its 1px-per-block
+/// offscreen buffer at a fractional offset, so pan and zoom are smooth at
+/// any scale), the 16-block chunk grid, and the agents on top.
 fn draw(
     ctx: &web_sys::CanvasRenderingContext2d,
     canvas: &web_sys::HtmlCanvasElement,
+    v: &View,
     m: Option<&MapData>,
     off: Option<&web_sys::HtmlCanvasElement>,
     agents: &[Agent],
@@ -292,44 +359,58 @@ fn draw(
         return;
     }
 
-    let (x0, z0, mw, mh) = match (m, off) {
-        (Some(m), Some(off)) => {
-            ctx.set_image_smoothing_enabled(false);
-            let _ = ctx
-                .draw_image_with_html_canvas_element_and_dw_and_dh(off, 0.0, 0.0, w, h);
-            (m.x0 as f64, m.z0 as f64, m.w as f64, m.h as f64)
-        }
-        _ => return,
-    };
-    let sx = |wx: f64| (wx - x0) / mw * w;
-    let sy = |wz: f64| (wz - z0) / mh * h;
+    // Visible world rect at the current scale: 1 block = v.scale px, with
+    // fractional offsets (sub-block pan positions stay smooth).
+    let s = v.scale;
+    let wx0 = v.cx - w / (2.0 * s);
+    let wz0 = v.cz - h / (2.0 * s);
+    let sx = |wx: f64| (wx - wx0) * s;
+    let sy = |wz: f64| (wz - wz0) * s;
 
-    // Chunk grid (16-block lines).
+    if let (Some(m), Some(off)) = (m, off) {
+        // The offscreen buffer is 1px per block; bilinear scaling is what
+        // makes fractional zoom smooth ("texture zoom"). When the view is
+        // wider than the fetched region (deep zoom-out), the image covers
+        // only the centre and the rest stays background — the scale shown
+        // in the HUD is still the real one.
+        ctx.set_image_smoothing_enabled(true);
+        let _ = ctx.draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+            off,
+            0.0,
+            0.0,
+            m.w.max(1) as f64,
+            m.h.max(1) as f64,
+            sx(m.x0 as f64),
+            sy(m.z0 as f64),
+            m.w as f64 * s,
+            m.h as f64 * s,
+        );
+    } else {
+        return;
+    }
+
+    // Chunk grid (16-block lines) across the visible rect.
     ctx.set_stroke_style_str("rgba(255,255,255,0.08)");
     ctx.set_line_width(1.0);
-    let x1 = x0 + mw;
-    let z1 = z0 + mh;
-    let gx0 = ((x0 / 16.0).floor() * 16.0) as i32;
-    let gz0 = ((z0 / 16.0).floor() * 16.0) as i32;
-    for gx in (gx0..x1 as i32 + 16).step_by(16) {
-        if gx < x0 as i32 {
-            continue;
-        }
-        let px = sx(gx as f64);
+    let x1 = wx0 + w / s;
+    let z1 = wz0 + h / s;
+    let mut gx = (wx0 / 16.0).floor() * 16.0;
+    while gx <= x1 {
+        let px = sx(gx);
         ctx.begin_path();
         ctx.move_to(px, 0.0);
         ctx.line_to(px, h);
         ctx.stroke();
+        gx += 16.0;
     }
-    for gz in (gz0..z1 as i32 + 16).step_by(16) {
-        if gz < z0 as i32 {
-            continue;
-        }
-        let py = sy(gz as f64);
+    let mut gz = (wz0 / 16.0).floor() * 16.0;
+    while gz <= z1 {
+        let py = sy(gz);
         ctx.begin_path();
         ctx.move_to(0.0, py);
         ctx.line_to(w, py);
         ctx.stroke();
+        gz += 16.0;
     }
 
     // NPCs first (small), players on top (bigger, labelled).
@@ -405,6 +486,35 @@ fn App() -> Element {
             .map(|c| c.unchecked_into::<web_sys::HtmlCanvasElement>())
     });
 
+    // Swallow browser-level wheel side effects everywhere in the app:
+    // horizontal-dominant swipes (the trackpad back/forward gesture) and
+    // ctrl+wheel (page zoom). The map canvas handles its own wheel events;
+    // without this, an accidental left swipe over the top bar or the event
+    // log navigates the browser. Registered on window with `passive: false`
+    // — Chrome defaults window-level wheel listeners to passive, where
+    // preventDefault would be ignored.
+    use_effect(move || {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let closure = wasm_bindgen::closure::Closure::wrap(
+            Box::new(move |e: web_sys::WheelEvent| {
+                if e.ctrl_key() || e.delta_x().abs() > e.delta_y().abs() {
+                    e.prevent_default();
+                }
+            }) as Box<dyn FnMut(web_sys::WheelEvent)>,
+        );
+        let opts = web_sys::AddEventListenerOptions::new();
+        opts.set_passive(false);
+        let _ = window
+            .add_event_listener_with_callback_and_add_event_listener_options(
+                "wheel",
+                closure.as_ref().unchecked_ref::<js_sys::Function>(),
+                &opts,
+            );
+        closure.forget();
+    });
+
     // Status poll (1 s).
     use_effect(move || {
         spawn(async move {
@@ -421,11 +531,15 @@ fn App() -> Element {
         });
     });
 
-    // Map poll (250 ms tick): refetch when the view/canvas changes, plus a
-    // slow 3 s refresh so block edits appear without interaction.
+    // Map poll (100 ms tick): refetch when the view/canvas changes, plus a
+    // slow 3 s refresh so block edits appear without interaction. The tick
+    // is short because sub-block pans do NOT change the request (the drawn
+    // offset moves continuously), so a fast pan only refetches when the
+    // integer region actually shifts.
     use_effect(move || {
         spawn(async move {
             let mut last_req: Option<(i32, i32, i32, i32)> = None;
+            let mut fitted = false;
             // js_sys::Date::now (ms): std::time::Instant panics on wasm32.
             // Pre-expired so the first tick fetches immediately.
             let mut last_fetch = js_sys::Date::now() - 10_000.0;
@@ -440,6 +554,17 @@ fn App() -> Element {
                     }
                     if *csize.read() != (nw, nh) {
                         *csize.write() = (nw, nh);
+                    }
+                    // First time we know the pane size: default to a view
+                    // that fills it (~240 blocks wide) instead of an
+                    // arbitrary fixed scale.
+                    if !fitted && nw > 1 && nh > 1 {
+                        fitted = true;
+                        *view.write() = View {
+                            cx: 8.0,
+                            cz: 8.0,
+                            scale: (nw as f64 / 240.0).clamp(MIN_SCALE, MAX_SCALE),
+                        };
                     }
                 }
                 let v = *view.read();
@@ -459,7 +584,7 @@ fn App() -> Element {
                         }
                     }
                 }
-                sleep_ms(250.0).await;
+                sleep_ms(100.0).await;
             }
         });
     });
@@ -496,7 +621,7 @@ fn App() -> Element {
             return;
         };
         let offc = (*off.read()).clone();
-        draw(&ctx, &canvas, m.as_ref(), offc.as_ref(), &agents);
+        draw(&ctx, &canvas, &v, m.as_ref(), offc.as_ref(), &agents);
     });
 
     let st = (*status.read()).clone();
@@ -512,11 +637,18 @@ fn App() -> Element {
         Some(n) => format!("{n} players connected"),
         None => String::new(),
     };
+    // True when the visible rect is wider than the fetchable region, so
+    // the map image covers only the middle of the canvas (honest zoom-out
+    // beyond 256 blocks).
+    let (cw_px, ch_px) = *csize.read();
+    let limited = cw_px as f64 / view_now.scale > (MAP_MAX as f64 - 2.0 * MAP_MARGIN)
+        || ch_px as f64 / view_now.scale > (MAP_MAX as f64 - 2.0 * MAP_MARGIN);
     let hud = format!(
-        "{}% · center ({}, {})",
+        "{}% · center ({}, {}){}",
         (view_now.scale * 100.0).round() as i32,
         view_now.cx.round() as i32,
         view_now.cz.round() as i32,
+        if limited { " · max map extent" } else { "" },
     );
 
     rsx! {
@@ -599,21 +731,11 @@ fn App() -> Element {
                             let c = e.client_coordinates();
                             *drag.write() = Some((c.x, c.y));
                             let (dx, dy) = (c.x - lx, c.y - ly);
-                            let (cw, ch) = *csize.read();
-                            // Blocks per pixel per axis (the map is stretched
-                            // to the canvas; the axes match except when the
-                            // region is clamped at the max side).
-                            let (bx, bz) = match (*map.read()).clone() {
-                                Some(m) => (m.w as f64 / cw as f64, m.h as f64 / ch as f64),
-                                None => {
-                                    let s = view.read().scale;
-                                    (1.0 / s, 1.0 / s)
-                                }
-                            };
                             let v = *view.read();
+                            // 1:1 pan: pixels moved / px-per-block = blocks.
                             *view.write() = View {
-                                cx: v.cx - dx * bx,
-                                cz: v.cz - dy * bz,
+                                cx: v.cx - dx / v.scale,
+                                cz: v.cz - dy / v.scale,
                                 scale: v.scale,
                             };
                         },
@@ -624,24 +746,49 @@ fn App() -> Element {
                             let Some(canvas) = (*canvas_el.read()).clone() else {
                                 return;
                             };
-                            let delta_y = match e.delta() {
-                                dioxus::html::geometry::WheelDelta::Pixels(v) => v.y,
-                                _ => 0.0,
+                            // Normalise delta to pixels (mice mostly report
+                            // pixels; lines/pages are converted).
+                            let (dx, dy) = match e.delta() {
+                                dioxus::html::geometry::WheelDelta::Pixels(v) => (v.x, v.y),
+                                dioxus::html::geometry::WheelDelta::Lines(v) => {
+                                    (v.x * 16.0, v.y * 16.0)
+                                }
+                                dioxus::html::geometry::WheelDelta::Pages(v) => {
+                                    (v.x * 160.0, v.y * 160.0)
+                                }
                             };
-                            let p = e.element_coordinates();
                             let v = *view.read();
-                            *view.write() = zoom_around(
-                                v,
-                                p.x.max(0.0),
-                                p.y.max(0.0),
-                                canvas.width() as f64,
-                                canvas.height() as f64,
-                                delta_y,
-                            );
+                            // Trackpad pinch (Chrome reports it as ctrl+wheel)
+                            // and classic mouse-wheel notches (discrete
+                            // ±100 px steps) zoom, exponentially and anchored
+                            // at the cursor; everything else — two-finger
+                            // trackpad scroll — pans 1:1, so an accidental
+                            // left swipe pans the map instead of flying the
+                            // zoom (or navigating the browser).
+                            let pinch = e.modifiers().contains(Modifiers::CONTROL);
+                            let zoom = pinch || (dx == 0.0 && dy.abs() >= 40.0);
+                            if zoom {
+                                let p = e.element_coordinates();
+                                let k = if pinch { 0.012 } else { 0.005 };
+                                *view.write() = zoom_around(
+                                    v,
+                                    p.x.max(0.0),
+                                    p.y.max(0.0),
+                                    canvas.width() as f64,
+                                    canvas.height() as f64,
+                                    (-dy * k).exp(),
+                                );
+                            } else {
+                                *view.write() = View {
+                                    cx: v.cx - dx / v.scale,
+                                    cz: v.cz - dy / v.scale,
+                                    scale: v.scale,
+                                };
+                            }
                         },
                     }
                     div { class: "map-hud", { hud }
-                        span { class: "hint", "drag to pan · wheel to zoom" }
+                        span { class: "hint", "drag / scroll to pan · pinch / wheel to zoom" }
                     }
                 }
             }
