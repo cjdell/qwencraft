@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Headless WALK stress test for the RustCraft web app.
+# Headless WALK stress test for the Qwencraft web app.
 #
 # The app runs in ?walk=1 mode: it holds W and slowly turns for ~60 virtual
 # seconds, walking through fresh terrain. This is exactly the scenario that
@@ -20,8 +20,8 @@ cd "$(dirname "$0")/.."
 
 PORT="${PORT:-$((20000 + RANDOM % 20000))}"
 TMPDIR="${TMPDIR:-/tmp}"
-LOG="${LOG:-${TMPDIR}/rustcraft-walk.log}"
-DOM="${DOM:-${TMPDIR}/rustcraft-walk-dom.html}"
+LOG="${LOG:-${TMPDIR}/qwencraft-walk.log}"
+DOM="${DOM:-${TMPDIR}/qwencraft-walk-dom.html}"
 BUDGET="${BUDGET:-90000}"
 # World seed. The pool-capacity regression lives on dense-terrain seeds
 # (e.g. SEED=888 or 31337, the worst views per pool_measure) — an
@@ -46,7 +46,7 @@ done
 export VK_ICD_FILENAMES="${VK_ICD:-}"
 export TMPDIR
 
-PROF_DIR="${TMPDIR}/rustcraft-walk-prof"
+PROF_DIR="${TMPDIR}/qwencraft-walk-prof"
 rm -rf "$PROF_DIR"
 mkdir -p "$PROF_DIR"
 
@@ -56,7 +56,7 @@ cleanup() { kill "$SRV" 2>/dev/null || true; }
 trap cleanup EXIT
 sleep 1
 
-curl -sf "http://127.0.0.1:${PORT}/" | grep -q "rustcraft" || {
+curl -sf "http://127.0.0.1:${PORT}/" | grep -q "qwencraft" || {
   echo "FAIL: port ${PORT} is not serving our web/dist (port squatted? rerun)"
   exit 1
 }
@@ -86,8 +86,8 @@ check() {
   fi
 }
 
-check "app started"                grep -q "RustCraft: app started" "$LOG"
-check "first frame rendered"       grep -q "RustCraft: first frame rendered" "$LOG"
+check "app started"                grep -q "Qwencraft: app started" "$LOG"
+check "first frame rendered"       grep -q "Qwencraft: first frame rendered" "$LOG"
 check "no uncaught JS errors"      bash -c "! grep -E 'Uncaught|TypeError|ReferenceError' '$LOG' | grep -v 'favicon' | grep -q ."
 
 # The pool must not have lost chunks (the old bug).

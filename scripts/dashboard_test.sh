@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Headless-browser test for the SERVER DASHBOARD: rustcraft-net's single
+# Headless-browser test for the SERVER DASHBOARD: qwencraft-net's single
 # port hosts the WebSocket (/ws), the dashboard (/dashboard) and the game
 # client (/); the embedded dioxus dashboard polls /api/status + /api/map
 # and renders a 2D minimap.
 #
-# - builds the rustcraft-net binary (release) if missing,
+# - builds the qwencraft-net binary (release) if missing,
 # - starts it on a random single port,
 # - curl-checks the HTTP endpoints (health, status JSON, map binary,
 #   dashboard + game assets, 404),
@@ -19,17 +19,17 @@ cd "$(dirname "$0")/.."
 # The server's single port: /ws + /dashboard + game client.
 WS_PORT="${WS_PORT:-$((40000 + RANDOM % 20000))}"
 SEED="${SEED:-1337}"
-LOG="${LOG:-${TMPDIR:-/tmp}/rustcraft-dashboard-chrome.log}"
-SHOT="${SHOT:-${TMPDIR:-/tmp}/rustcraft-dashboard-shot.png}"
-DOM="${DOM:-${TMPDIR:-/tmp}/rustcraft-dashboard-dom.html}"
-SRV_LOG="${SRV_LOG:-${TMPDIR:-/tmp}/rustcraft-dashboard-server.log}"
+LOG="${LOG:-${TMPDIR:-/tmp}/qwencraft-dashboard-chrome.log}"
+SHOT="${SHOT:-${TMPDIR:-/tmp}/qwencraft-dashboard-shot.png}"
+DOM="${DOM:-${TMPDIR:-/tmp}/qwencraft-dashboard-dom.html}"
+SRV_LOG="${SRV_LOG:-${TMPDIR:-/tmp}/qwencraft-dashboard-server.log}"
 BUDGET="${BUDGET:-20000}"
 
 # Headless server binary (built once, reused afterwards).
-SRV_BIN=target/release/rustcraft-net
+SRV_BIN=target/release/qwencraft-net
 if [ ! -x "$SRV_BIN" ]; then
-  echo "==> building rustcraft-net (release)"
-  cargo build --release -p rustcraft-net || exit 1
+  echo "==> building qwencraft-net (release)"
+  cargo build --release -p qwencraft-net || exit 1
 fi
 
 # Find a lavapipe (software Vulkan) ICD — see verify.sh for the rationale.
@@ -44,7 +44,7 @@ for d in /nix/store/*/share/vulkan/icd.d; do
 done
 export VK_ICD_FILENAMES="${VK_ICD:-}"
 export TMPDIR="${TMPDIR:-/tmp}"
-PROF_DIR="${TMPDIR}/rustcraft-dashboard-chrome-prof"
+PROF_DIR="${TMPDIR}/qwencraft-dashboard-chrome-prof"
 rm -rf "$PROF_DIR"
 mkdir -p "$PROF_DIR"
 
@@ -55,10 +55,10 @@ cleanup() { kill "$SRV" 2>/dev/null || true; }
 trap cleanup EXIT
 
 for _ in $(seq 1 50); do
-  grep -q "rustcraft-net: ready" "$SRV_LOG" 2>/dev/null && break
+  grep -q "qwencraft-net: ready" "$SRV_LOG" 2>/dev/null && break
   sleep 0.2
 done
-if ! grep -q "rustcraft-net: ready" "$SRV_LOG" 2>/dev/null; then
+if ! grep -q "qwencraft-net: ready" "$SRV_LOG" 2>/dev/null; then
   echo "FAIL: headless server did not start" >&2
   tail -5 "$SRV_LOG" >&2
   exit 1
@@ -88,17 +88,17 @@ check "map: 64x64 is 8192 bytes" \
   bash -c "[ \$(curl -sf '$BASE/api/map?x=8&z=8&w=64&h=64' | wc -c) -eq 8192 ]"
 check "map: oversized clamps to 256" \
   bash -c "[ \$(curl -sf '$BASE/api/map?x=8&z=8&w=4096&h=4096' | wc -c) -eq \$((256*256*2)) ]"
-check "dashboard page"      bash -c "curl -sf '$BASE/dashboard/' | grep -q 'RustCraft server'"
+check "dashboard page"      bash -c "curl -sf '$BASE/dashboard/' | grep -q 'Qwencraft server'"
 check "bare /dashboard redirects" \
   bash -c "[ \$(curl -s -o /dev/null -w '%{http_code}' '$BASE/dashboard') -eq 302 ]"
 check "redirect points at /dashboard/" \
   bash -c "curl -s -D - -o /dev/null '$BASE/dashboard' | grep -qi 'Location: /dashboard/'"
-check "dashboard js asset"  bash -c "curl -sf '$BASE/dashboard/rustcraft_dashboard.js' | grep -q rustcraft"
+check "dashboard js asset"  bash -c "curl -sf '$BASE/dashboard/qwencraft_dashboard.js' | grep -q qwencraft"
 check "dashboard wasm asset" \
-  bash -c "[ \$(curl -sf '$BASE/dashboard/rustcraft_dashboard_bg.wasm' | wc -c) -gt 10000 ]"
+  bash -c "[ \$(curl -sf '$BASE/dashboard/qwencraft_dashboard_bg.wasm' | wc -c) -gt 10000 ]"
 check "dashboard css asset" \
   bash -c "curl -s -o /dev/null -D - '$BASE/dashboard/dashboard.css' | grep -qi 'Content-Type: text/css'"
-check "game client at /"    bash -c "curl -sf '$BASE/' | grep -qi 'RustCraft'"
+check "game client at /"    bash -c "curl -sf '$BASE/' | grep -qi 'Qwencraft'"
 check "ws endpoint over http" bash -c "[ \$(curl -s -o /dev/null -w '%{http_code}' '$BASE/ws') -eq 426 ]"
 check "unknown path 404s"   bash -c "[ \$(curl -s -o /dev/null -w '%{http_code}' '$BASE/nope') -eq 404 ]"
 
@@ -131,7 +131,7 @@ chromium --headless --no-sandbox --enable-unsafe-webgpu --use-angle=swiftshader 
   --window-size=1280,720 --virtual-time-budget="$BUDGET" \
   --dump-dom "$BASE/dashboard/" >"$DOM" 2>/dev/null || true
 
-check "app title rendered"        grep -q "RustCraft server" "$DOM"
+check "app title rendered"        grep -q "Qwencraft server" "$DOM"
 check "seed shown in the top bar" grep -q "${SEED} seed" "$DOM"
 check "players stat rendered"     grep -q "players connected" "$DOM"
 check "startup event in the log"  grep -q "server started" "$DOM"
@@ -212,7 +212,7 @@ fi
 # map pane. Pre-mosaic, the server could only serve 256x256 blocks (128 px
 # at this scale), so deep zoom-out drew a small square in the middle of a
 # dark pane — this asserts the pane is actually covered.
-SHOT_Z="${SHOT_Z:-${TMPDIR:-/tmp}/rustcraft-dashboard-shot-zoom.png}"
+SHOT_Z="${SHOT_Z:-${TMPDIR:-/tmp}/qwencraft-dashboard-shot-zoom.png}"
 echo "==> headless chromium at max zoom-out (?zoom=50, virtual time ${BUDGET}ms)"
 chromium \
   --headless \

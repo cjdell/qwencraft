@@ -1,5 +1,5 @@
 {
-  description = "RustCraft — a WebGPU Minecraft-style voxel engine in Rust, browser build via Nix";
+  description = "Qwencraft — a WebGPU Minecraft-style voxel engine in Rust, browser build via Nix";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
@@ -43,7 +43,7 @@
             pkgs.file
           ];
           shellHook = ''
-            echo "=== RustCraft dev shell ==="
+            echo "=== Qwencraft dev shell ==="
             echo "rustc:       $(rustc --version)"
             echo "wasm-bindgen: $(wasm-bindgen --version)"
             echo ""

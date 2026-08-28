@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Headless-browser smoke test for the RustCraft web app.
+# Headless-browser smoke test for the Qwencraft web app.
 #
 # - serves web/dist, runs headless Chromium with WebGPU (SwiftShader Vulkan,
 #   falling back to lavapipe), fast-forwards ~25s of virtual time,
@@ -18,16 +18,16 @@ PORT="${PORT:-$((20000 + RANDOM % 20000))}"
 # Default outputs go under $TMPDIR: on machines where the root filesystem
 # (and /tmp) is full, callers pass TMPDIR=/some/other/path and everything
 # (chromium profile, log, screenshots) follows.
-SHOT="${SHOT:-${TMPDIR:-/tmp}/rustcraft-shot.png}"
-LOG="${LOG:-${TMPDIR:-/tmp}/rustcraft-chrome.log}"
-DOM="${DOM:-${TMPDIR:-/tmp}/rustcraft-dom.html}"
+SHOT="${SHOT:-${TMPDIR:-/tmp}/qwencraft-shot.png}"
+LOG="${LOG:-${TMPDIR:-/tmp}/qwencraft-chrome.log}"
+DOM="${DOM:-${TMPDIR:-/tmp}/qwencraft-dom.html}"
 # 40s virtual budget: a COLD SwiftShader device init can consume ~20s of
 # virtual time while the 16ms interval fast-forwards (the first run after a
 # while); 25s left no budget for the frame-410 pixel readback.
 BUDGET="${BUDGET:-40000}"
 # The app streams the WebGL2 shadow-rendered scene as base64 VERIFY_PNG
 # chunks; we reconstruct a real PNG screenshot of the 3D view here.
-SCENE_PNG="${SCENE_PNG:-${TMPDIR:-/tmp}/rustcraft-scene.png}"
+SCENE_PNG="${SCENE_PNG:-${TMPDIR:-/tmp}/qwencraft-scene.png}"
 
 if [ ! -f web/dist/index.html ]; then
   echo "web/dist not found — run ./scripts/build.sh first" >&2
@@ -52,7 +52,7 @@ export VK_ICD_FILENAMES="${VK_ICD:-}"
 # Chromium needs scratch space (profile, GPU temp files). Honour a
 # pre-set TMPDIR (e.g. when / is full) and give it an explicit profile dir.
 export TMPDIR="${TMPDIR:-/tmp}"
-PROF_DIR="${TMPDIR}/rustcraft-chrome-prof"
+PROF_DIR="${TMPDIR}/qwencraft-chrome-prof"
 rm -rf "$PROF_DIR"
 mkdir -p "$PROF_DIR"
 
@@ -63,7 +63,7 @@ trap cleanup EXIT
 sleep 1
 
 # Sanity: make sure WE are the server on this port.
-curl -sf "http://127.0.0.1:${PORT}/" | grep -q "rustcraft" || {
+curl -sf "http://127.0.0.1:${PORT}/" | grep -q "qwencraft" || {
   echo "FAIL: port ${PORT} is not serving our web/dist (port squatted? rerun)"
   exit 1
 }
@@ -100,9 +100,9 @@ check() {
   fi
 }
 
-check "app started"                grep -q "RustCraft: app started" "$LOG"
-check "renderer ready (WebGPU)"    grep -q "RustCraft: renderer ready" "$LOG"
-check "first frame rendered"       grep -q "RustCraft: first frame rendered" "$LOG"
+check "app started"                grep -q "Qwencraft: app started" "$LOG"
+check "renderer ready (WebGPU)"    grep -q "Qwencraft: renderer ready" "$LOG"
+check "first frame rendered"       grep -q "Qwencraft: first frame rendered" "$LOG"
 check "no uncaught JS errors"      bash -c "! grep -E 'Uncaught|TypeError|ReferenceError' '$LOG' | grep -v 'favicon' | grep -q ."
 
 # Screenshot exists and is not a single-colour screen.

@@ -15,7 +15,7 @@ if [ ! -f web/dist/index.html ]; then
 fi
 
 if [ "${1:-}" != "--https" ]; then
-  echo "Serving RustCraft on http://localhost:${PORT}  (seed via ?seed=123)"
+  echo "Serving Qwencraft on http://localhost:${PORT}  (seed via ?seed=123)"
   echo "Other devices on your network need HTTPS (WebGPU is a secure-context"
   echo "feature) — run: ./scripts/serve.sh --https"
   exec python3 -m http.server "$PORT" --directory web/dist --bind 0.0.0.0
@@ -30,7 +30,7 @@ if [ ! -f .certs/cert.pem ] || [ ! -f .certs/key.pem ]; then
     -subj "/CN=localhost" \
     -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
 fi
-echo "Serving RustCraft on https://localhost:${PORT}  (self-signed cert)"
+echo "Serving Qwencraft on https://localhost:${PORT}  (self-signed cert)"
 echo "From another device: open https://<this-machine's-LAN-IP>:${PORT}"
 echo "The browser will warn about the certificate — click Advanced /"
 echo "\"Proceed to localhost (unsafe)\" to continue."

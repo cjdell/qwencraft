@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rustcraft-world",
-    "crates/rustcraft-server",
-    "crates/rustcraft-client",
-    "crates/rustcraft-web",
-    "crates/rustcraft-net",
+    "crates/qwencraft-world",
+    "crates/qwencraft-server",
+    "crates/qwencraft-client",
+    "crates/qwencraft-web",
+    "crates/qwencraft-net",
 ]
 
 [workspace.package]

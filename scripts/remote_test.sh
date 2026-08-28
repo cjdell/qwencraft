@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Headless-browser test for REMOTE mode: the page connects to a standalone
-# headless server (rustcraft-net) over WebSocket and renders its world.
+# headless server (qwencraft-net) over WebSocket and renders its world.
 #
-# - builds the rustcraft-net binary (release) if missing,
+# - builds the qwencraft-net binary (release) if missing,
 # - starts the headless server (single port: ws://…/ws + dashboard + game)
 #   + a static server for web/dist,
 # - runs headless Chromium with ?server=ws://127.0.0.1:PORT/ws&verify=1,
@@ -19,9 +19,9 @@ PORT="${PORT:-$((20000 + RANDOM % 20000))}"
 # The server's single port (WebSocket at /ws, dashboard at /dashboard).
 WS_PORT="${WS_PORT:-$((40000 + RANDOM % 20000))}"
 SEED="${SEED:-1337}"
-LOG="${LOG:-${TMPDIR:-/tmp}/rustcraft-remote-chrome.log}"
-LOG2="${LOG2:-${TMPDIR:-/tmp}/rustcraft-remote-chrome2.log}"
-WS_LOG="${WS_LOG:-${TMPDIR:-/tmp}/rustcraft-remote-server.log}"
+LOG="${LOG:-${TMPDIR:-/tmp}/qwencraft-remote-chrome.log}"
+LOG2="${LOG2:-${TMPDIR:-/tmp}/qwencraft-remote-chrome2.log}"
+WS_LOG="${WS_LOG:-${TMPDIR:-/tmp}/qwencraft-remote-server.log}"
 # Wall-clock seconds the page is left to connect, stream, and run the
 # WebGL2 shadow readback (the app renders at ~60 fps real time; the
 # readback fires at frame 410, ~7 s after the first frame).
@@ -43,10 +43,10 @@ if [ ! -f web/dist/index.html ]; then
 fi
 
 # Headless server binary (built once, reused afterwards).
-SRV_BIN=target/release/rustcraft-net
+SRV_BIN=target/release/qwencraft-net
 if [ ! -x "$SRV_BIN" ]; then
-  echo "==> building rustcraft-net (release)"
-  cargo build --release -p rustcraft-net || exit 1
+  echo "==> building qwencraft-net (release)"
+  cargo build --release -p qwencraft-net || exit 1
 fi
 
 # Find a lavapipe (software Vulkan) ICD — see verify.sh for the rationale.
@@ -61,7 +61,7 @@ for d in /nix/store/*/share/vulkan/icd.d; do
 done
 export VK_ICD_FILENAMES="${VK_ICD:-}"
 export TMPDIR="${TMPDIR:-/tmp}"
-PROF_DIR="${TMPDIR}/rustcraft-remote-chrome-prof"
+PROF_DIR="${TMPDIR}/qwencraft-remote-chrome-prof"
 rm -rf "$PROF_DIR"
 mkdir -p "$PROF_DIR"
 
@@ -75,10 +75,10 @@ trap cleanup EXIT
 sleep 1
 
 for _ in $(seq 1 50); do
-  grep -q "rustcraft-net: ready" "$WS_LOG" 2>/dev/null && break
+  grep -q "qwencraft-net: ready" "$WS_LOG" 2>/dev/null && break
   sleep 0.2
 done
-if ! grep -q "rustcraft-net: ready" "$WS_LOG" 2>/dev/null; then
+if ! grep -q "qwencraft-net: ready" "$WS_LOG" 2>/dev/null; then
   echo "FAIL: headless server did not start" >&2
   cat "$WS_LOG" >&2
   exit 1
@@ -86,7 +86,7 @@ fi
 
 # Second browser: joins the same shared world concurrently (a second
 # profile dir, no pixel readback — it just has to connect and be seen).
-PROF_DIR2="${TMPDIR}/rustcraft-remote-chrome-prof2"
+PROF_DIR2="${TMPDIR}/qwencraft-remote-chrome-prof2"
 rm -rf "$PROF_DIR2"
 mkdir -p "$PROF_DIR2"
 echo "==> second browser (same shared world, ${SECOND_SECS}s real time, background)"
@@ -132,10 +132,10 @@ check() {
   fi
 }
 
-check "app started"                    grep -q "RustCraft: app started" "$LOG"
-check "remote server connected"        grep -q "RustCraft: remote server connected (seed ${SEED}, player" "$LOG"
-check "renderer ready (WebGPU)"        grep -q "RustCraft: renderer ready" "$LOG"
-check "first frame rendered"           grep -q "RustCraft: first frame rendered" "$LOG"
+check "app started"                    grep -q "Qwencraft: app started" "$LOG"
+check "remote server connected"        grep -q "Qwencraft: remote server connected (seed ${SEED}, player" "$LOG"
+check "renderer ready (WebGPU)"        grep -q "Qwencraft: renderer ready" "$LOG"
+check "first frame rendered"           grep -q "Qwencraft: first frame rendered" "$LOG"
 check "no uncaught JS errors"          bash -c "! grep -E 'Uncaught|TypeError|ReferenceError' '$LOG' | grep -v 'favicon' | grep -q ."
 check "server saw the client"          grep -q "joined (shared world seed ${SEED}, 1 online)" "$WS_LOG"
 # The second browser must have joined the SAME shared world while the first
@@ -143,15 +143,15 @@ check "server saw the client"          grep -q "joined (shared world seed ${SEED
 # first browser must have RENDERED both players (the POOL telemetry counts
 # the agents the server streamed to it: player 0 + player 1, no ambient
 # NPCs in net mode).
-check "second browser connected"       grep -q "RustCraft: remote server connected (seed ${SEED}, player" "$LOG2"
+check "second browser connected"       grep -q "Qwencraft: remote server connected (seed ${SEED}, player" "$LOG2"
 check "shared world saw two players"   grep -q ", 2 online)" "$WS_LOG"
 check "first browser rendered 2 players" grep -q "POOL chunks=[0-9]* missing=[0-9]* agents=2" "$LOG"
 # Name tags: each browser must create a tag for the OTHER player (the shared
 # world streams the full agent list to both) and position it on screen
 # (TAGS telemetry, ?taglog=1 — the position must be finite CSS pixels).
-check "first browser tagged the other player"  grep -q "RustCraft: name tag created for player" "$LOG"
+check "first browser tagged the other player"  grep -q "Qwencraft: name tag created for player" "$LOG"
 check "first browser positioned the tag"  grep -Eq "TAGS [0-9]+:[0-9.]+px/[0-9.]+px" "$LOG"
-check "second browser tagged the other player"  grep -q "RustCraft: name tag created for player" "$LOG2"
+check "second browser tagged the other player"  grep -q "Qwencraft: name tag created for player" "$LOG2"
 
 # GPU readback: the shadow renderer re-renders the scene built from the
 # server-streamed chunk regions; the 4x3 grid must show sky + terrain.

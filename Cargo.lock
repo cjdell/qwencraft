@@ -884,6 +884,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "qwencraft-client"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "qwencraft-server",
+ "qwencraft-world",
+ "wasm-bindgen",
+ "web-sys",
+ "wgpu",
+]
+
+[[package]]
+name = "qwencraft-net"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "include_dir",
+ "qwencraft-server",
+ "qwencraft-world",
+ "rustls",
+ "rustls-pemfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tungstenite",
+]
+
+[[package]]
+name = "qwencraft-server"
+version = "0.1.0"
+dependencies = [
+ "qwencraft-world",
+]
+
+[[package]]
+name = "qwencraft-web"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "qwencraft-client",
+ "qwencraft-server",
+ "qwencraft-world",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "qwencraft-world"
+version = "0.1.0"
+
+[[package]]
 name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -952,58 +1004,6 @@ name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
-
-[[package]]
-name = "rustcraft-client"
-version = "0.1.0"
-dependencies = [
- "js-sys",
- "rustcraft-server",
- "rustcraft-world",
- "wasm-bindgen",
- "web-sys",
- "wgpu",
-]
-
-[[package]]
-name = "rustcraft-net"
-version = "0.1.0"
-dependencies = [
- "futures-util",
- "include_dir",
- "rustcraft-server",
- "rustcraft-world",
- "rustls",
- "rustls-pemfile",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tungstenite",
-]
-
-[[package]]
-name = "rustcraft-server"
-version = "0.1.0"
-dependencies = [
- "rustcraft-world",
-]
-
-[[package]]
-name = "rustcraft-web"
-version = "0.1.0"
-dependencies = [
- "js-sys",
- "rustcraft-client",
- "rustcraft-server",
- "rustcraft-world",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "rustcraft-world"
-version = "0.1.0"
 
 [[package]]
 name = "rustls"

@@ -1,0 +1,44 @@
+[package]
+name = "qwencraft-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Qwencraft browser entry point: input, pointer lock, main loop, HUD"
+
+[lib]
+crate-type = ["cdylib"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+qwencraft-world = { path = "../qwencraft-world" }
+qwencraft-server = { path = "../qwencraft-server" }
+qwencraft-client = { path = "../qwencraft-client" }
+wasm-bindgen = "=0.2.100"
+wasm-bindgen-futures = "=0.4.45"
+js-sys = "=0.3.77"
+web-sys = { version = "=0.3.77", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlCanvasElement",
+    "HtmlDivElement",
+    "HtmlInputElement",
+    "MessageEvent",
+    "WebSocket",
+    "BinaryType",
+    "std",
+    "WebGl2RenderingContext",
+    "WebGlBuffer",
+    "WebGlProgram",
+    "WebGlShader",
+    "WebGlUniformLocation",
+    "CssStyleDeclaration",
+    "KeyboardEvent",
+    "MouseEvent",
+    "Event",
+    "Location",
+    "DomTokenList",
+    "Node",
+    "HtmlCollection",
+    "console",
+] }

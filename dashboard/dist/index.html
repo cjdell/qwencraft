@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>RustCraft server</title>
+    <title>Qwencraft server</title>
     <link rel="stylesheet" href="./dashboard.css" />
   </head>
   <body>
@@ -11,11 +11,11 @@
     <div id="main"></div>
     <noscript>
       <p style="font-family: monospace; padding: 2rem">
-        The RustCraft dashboard needs JavaScript (it is a wasm dioxus app).
+        The Qwencraft dashboard needs JavaScript (it is a wasm dioxus app).
       </p>
     </noscript>
     <script type="module">
-      import init, { start } from "./rustcraft_dashboard.js";
+      import init, { start } from "./qwencraft_dashboard.js";
       init()
         .then(start)
         .catch((e) => {

@@ -1,0 +1,9 @@
+[package]
+name = "qwencraft-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Authoritative game server: lazy infinite world, deltas, surface caches, physics (wasm-safe)"
+
+[dependencies]
+qwencraft-world = { path = "../qwencraft-world" }

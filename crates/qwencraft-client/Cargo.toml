@@ -1,0 +1,14 @@
+[package]
+name = "qwencraft-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebGPU (wgpu) voxel renderer for Qwencraft: chunk meshing, voxel lighting, ambient occlusion"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+qwencraft-world = { path = "../qwencraft-world" }
+qwencraft-server = { path = "../qwencraft-server" }
+wgpu = "27.0.1"
+wasm-bindgen = "=0.2.100"
+js-sys = "=0.3.77"
+web-sys = { version = "=0.3.77", features = ["HtmlCanvasElement", "Navigator", "Window"] }

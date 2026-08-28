@@ -1,4 +1,7 @@
-# RustCraft
+# Qwencraft
+
+Repository: <https://github.com/cjdell/qwencraft> · deployed at
+<https://qwencraft.home.chrisdell.info>
 
 A voxel (Minecraft-style) engine written in Rust that runs in the browser.
 The world is generated procedurally from a seed, streamed on demand from an
@@ -40,7 +43,7 @@ nix develop
 cargo test             # host unit tests (worldgen, physics, streaming, …)
 
 # headless server (separate process, one shared world for all connections):
-cargo run -p rustcraft-net --release -- --seed 1337 --port 9000
+cargo run -p qwencraft-net --release -- --seed 1337 --port 9000
 # then open http://localhost:8080/?server=ws://localhost:9000/ws
 # — or type the ws:// URL into the start screen's Options panel.
 # Every browser that connects joins the SAME world: players see each other
@@ -51,7 +54,7 @@ cargo run -p rustcraft-net --release -- --seed 1337 --port 9000
 # at / (so the server can host the whole experience by itself).
 ```
 
-> **Headless server.** `rustcraft-net` runs the authoritative game server
+> **Headless server.** `qwencraft-net` runs the authoritative game server
 > standalone (tokio, WebSocket). All connections share *one* world (one
 > `Server` for the configured seed), ticked at a fixed 60 Hz on the server;
 > the browser only renders and forwards input. Open two browsers at the same
@@ -108,7 +111,7 @@ by the tiny per-agent cache (a 7³ block volume, `window 100%`) instead of
 the world's chunk buffers (`solid-fb` stays ~0 — only the spawn tick falls
 back). `?npcs=COUNT[:SPACING]` arms the same load on boot for headless
 runs (`./scripts/npc_test.sh`); for raw per-tick CPU cost use the host
-benchmark `cargo run -p rustcraft-server --release --example bench_tick`.
+benchmark `cargo run -p qwencraft-server --release --example bench_tick`.
 
 While flying the HUD shows the current speed (`FLY 120 b/s`). At high
 speeds the world streams in around you (terrain is generated on the fly),
@@ -125,24 +128,24 @@ against — even while you're turning fast.
 
 | crate / dir         | what it is                                                              |
 | ------------------- | ----------------------------------------------------------------------- |
-| `rustcraft-world`   | Block types, seeded noise/terrain, 16³ chunks with 26³ region payloads, chunk meshing (voxel lighting + AO), shared WGSL shader + view-projection math |
-| `rustcraft-server`  | The authoritative game server: infinite lazy world (chunks generated on demand), agent simulation (player + NPCs) with a per-agent local block window, fixed-tick physics, delta-based world updates, NPC load test. Plus the wire `protocol` module (binary codec shared by both transports). Runs in-process in the browser *and* inside the headless server |
-| `rustcraft-net`     | Headless server, single port: WebSocket at `/ws` (`ws://`, `wss://` with `--cert`/`--key`), dashboard at `/dashboard/` (bare `/dashboard` 302-redirects to it), game page at `/`, plus `/api/*` + `/healthz`; one shared world for all connections, 60 Hz tick loop, per-connection streaming |
-| `rustcraft-client`  | WebGPU (wgpu 27) renderer: shared terrain-mesh buffer pool, sphere agents, fog, first-person camera |
-| `rustcraft-web`     | wasm glue: input (keyboard/pointer lock), HUD, main loop, backend abstraction (embedded server or remote over WebSocket) |
+| `qwencraft-world`   | Block types, seeded noise/terrain, 16³ chunks with 26³ region payloads, chunk meshing (voxel lighting + AO), shared WGSL shader + view-projection math |
+| `qwencraft-server`  | The authoritative game server: infinite lazy world (chunks generated on demand), agent simulation (player + NPCs) with a per-agent local block window, fixed-tick physics, delta-based world updates, NPC load test. Plus the wire `protocol` module (binary codec shared by both transports). Runs in-process in the browser *and* inside the headless server |
+| `qwencraft-net`     | Headless server, single port: WebSocket at `/ws` (`ws://`, `wss://` with `--cert`/`--key`), dashboard at `/dashboard/` (bare `/dashboard` 302-redirects to it), game page at `/`, plus `/api/*` + `/healthz`; one shared world for all connections, 60 Hz tick loop, per-connection streaming |
+| `qwencraft-client`  | WebGPU (wgpu 27) renderer: shared terrain-mesh buffer pool, sphere agents, fog, first-person camera |
+| `qwencraft-web`     | wasm glue: input (keyboard/pointer lock), HUD, main loop, backend abstraction (embedded server or remote over WebSocket) |
 | `web/`              | `index.html` page hosting the wasm app                                  |
 | `scripts/`          | build / serve / verify / walk-stress / NPC-load / secure-context / remote-server tests |
 
 ## Headless server (remote play)
 
-`rustcraft-net` is the standalone server: the same authoritative `Server`
+`qwencraft-net` is the standalone server: the same authoritative `Server`
 (the browser's embedded server is just this crate running in wasm) wrapped
 in a tokio WebSocket front end.
 
 ```sh
-cargo run -p rustcraft-net --release -- --seed 1337 --port 9000 --bind 0.0.0.0
+cargo run -p qwencraft-net --release -- --seed 1337 --port 9000 --bind 0.0.0.0
 # TLS for LAN play (WebSockets from an https page need wss://):
-cargo run -p rustcraft-net --release -- --cert .certs/cert.pem --key .certs/key.pem
+cargo run -p qwencraft-net --release -- --cert .certs/cert.pem --key .certs/key.pem
 ```
 
 **One port only.** The WebSocket endpoint is `ws://<host>:<port>/ws`; the
@@ -166,7 +169,7 @@ WebSocket upgrade.
   independent of the client's frame rate and streams state snapshots; the
   client renders the latest snapshot it holds (at 60 Hz the difference is
   one tick, which reads as smooth).
-- **Wire protocol** (`rustcraft-server/src/protocol.rs`): little-endian
+- **Wire protocol** (`qwencraft-server/src/protocol.rs`): little-endian
   binary frames, versioned (currently 3). Server → client: `Hello` (seed +
   your player id), player/agent state (agents carry name + colour), chunk
   regions, world stats, NPC load echo. Client → server: the player profile
@@ -191,25 +194,25 @@ whole loop headlessly: standalone server + two Chromium browsers in remote
 mode on the same shared world, asserting both connect, the server sees both
 players, the world streams, and a GPU pixel readback of the rendered scene.
 
-**Public deployment:** `./deploy.sh` ships the web build to `/srv/rustcraft`
-and the `rustcraft-net` binary to `/srv/rustcraft-server` on the router, and
+**Public deployment:** `./deploy.sh` ships the web build to `/srv/qwencraft`
+and the `qwencraft-net` binary to `/srv/qwencraft-server` on the router, and
 restarts the server service so the new binary is live. The router's NixOS
-config (`hosts/grafton-router/services/rustcraft.nix` in its own
+config (`hosts/grafton-router/services/qwencraft.nix` in its own
 nixos-config repo) runs the binary on `127.0.0.1:9000` and nginx exposes it
-under `rustcraft.home.chrisdell.info`: the game page at `/` (static), with
+under `qwencraft.home.chrisdell.info`: the game page at `/` (static), with
 `/ws`, `/dashboard/`, `/api/*` and `/healthz` proxied to the server. So
-`https://rustcraft.home.chrisdell.info` is the game, `…/dashboard/` is the
-operator dashboard, and connecting to `rustcraft.home.chrisdell.info` (bare
+`https://qwencraft.home.chrisdell.info` is the game, `…/dashboard/` is the
+operator dashboard, and connecting to `qwencraft.home.chrisdell.info` (bare
 host works — it becomes `wss://…/ws`) plays the shared world.
 
 ## Server dashboard
 
-`rustcraft-net` also runs a small **dashboard** on the *same* port as the
+`qwencraft-net` also runs a small **dashboard** on the *same* port as the
 WebSocket, under **`/dashboard/`**, so you can jump onto a server and see
 what's going on without launching a game client:
 
 ```
-cargo run -p rustcraft-net --release -- --seed 1337 --port 9000
+cargo run -p qwencraft-net --release -- --seed 1337 --port 9000
 # → http://192.168.49.50:9000/dashboard/   (WebSocket at :9000/ws)
 ```
 
@@ -237,12 +240,12 @@ The dashboard is a dioxus (wasm) app in its own workspace under
 `dashboard/` — built by `./scripts/build_dashboard.sh` into
 `dashboard/dist/`, which is **embedded into the server binary**
 (`include_dir!`), so the server has no filesystem dependencies at runtime.
-After changing dashboard sources: rebuild dist, rebuild `rustcraft-net`,
+After changing dashboard sources: rebuild dist, rebuild `qwencraft-net`,
 and commit the new `dashboard/dist` (the assets are versioned with the
 binary). `./scripts/dashboard_test.sh` covers the whole loop headlessly:
 HTTP endpoint checks + Chromium on the page (DOM shows the live server,
 screenshot shows the rendered map). The HTTP side is also covered by the
-`rustcraft-net` e2e tests (`/healthz`, `/api/status`, `/api/map`, assets).
+`qwencraft-net` e2e tests (`/healthz`, `/api/status`, `/api/map`, assets).
 
 ## NPC load test
 
@@ -280,7 +283,7 @@ headless Chromium (SwiftShader WebGL, lavapipe Vulkan for WebGPU):
    gradient between;
 4. the full shadow frame is streamed back as base64 chunks
    (`VERIFY_PNG i/N …`) and reassembled into `docs/screenshot.png`-style
-   PNG output (default: `$TMPDIR/rustcraft-scene.png`).
+   PNG output (default: `$TMPDIR/qwencraft-scene.png`).
 
 The WGSL itself is exercised for real: the browser compiles the actual
 WebGPU pipeline at startup, and a shader error fails renderer init.
@@ -299,7 +302,7 @@ at speed is expected and allowed.
 ## Terrain buffer pool
 
 All terrain chunk meshes live in one pre-allocated vertex/index buffer
-pair (`rustcraft-client`): a frame costs one `set_index_buffer` +
+pair (`qwencraft-client`): a frame costs one `set_index_buffer` +
 `set_vertex_buffer` plus a single `draw_indexed` per chunk. When the pool
 fills, `compact_pool` drops chunks from the *farthest* first (3D Chebyshev
 distance, including Y) and reports **every** eviction — fog-bound or
@@ -309,10 +312,10 @@ chunk and its normal stream re-sends it when it is visible again, at the
 normal stream rate. Without the report, chunks evicted while far away
 would stay holes when the player walks back over them.
 
-Capacity (`rustcraft-world`'s `TERRAIN_POOL_VERTS`/`TERRAIN_POOL_IDX`,
+Capacity (`qwencraft-world`'s `TERRAIN_POOL_VERTS`/`TERRAIN_POOL_IDX`,
 aliased by the client) is sized with headroom over the measured worst
 case: the exact radius-7 streamed view needs up to ~1.87M vertices /
-~2.8M indices across seeds (`rustcraft-server`'s `pool_measure` example
+~2.8M indices across seeds (`qwencraft-server`'s `pool_measure` example
 scans them; the `worst_view_fits_terrain_pool_with_headroom` unit test
 pins the known worst positions); the pool holds 2.5M vertices / 3.75M
 indices — the worst view is ~75%, leaving room for the fog-bound trail

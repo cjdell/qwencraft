@@ -11,14 +11,14 @@ An **authoritative server** (infinite seeded world, physics, agents) runs
 **two ways**: **embedded in the same wasm module** as the **renderer**
 (terrain meshing, voxel lighting + AO, translucent water, block highlight,
 first-person controls; direct function calls, no network), or **headless**
-(`rustcraft-net`, a tokio WebSocket server — one **shared world** for all
+(`qwencraft-net`, a tokio WebSocket server — one **shared world** for all
 connections: every socket joins the same `Server`, each gets its own
 streaming window, and players see each other and each other's edits; `ws://`
 /`wss://`). The client renders whatever a `Backend` gives it and forwards
 input; it never mutates world state (golden rule 4 holds for both
-transports). The wire codec lives in `rustcraft-server::protocol`.
+transports). The wire codec lives in `qwencraft-server::protocol`.
 
-`rustcraft-net` additionally runs a small **dashboard** on the *same*
+`qwencraft-net` additionally runs a small **dashboard** on the *same*
 port, under `/dashboard/`: a dioxus (wasm) app — player/NPC counts, an
 event log, and a pan/zoom 2D minimap of the world with agents plotted —
 served from `dashboard/dist`, which is embedded into the server binary
@@ -57,7 +57,7 @@ edit history, never touching the authoritative world's lock.
    generation time. That's how chunks agree across boundaries (including
    trees, which are stamped from a 1-chunk halo). If you add a terrain
    feature, make it deterministic from coordinates (see `cell_hash` /
-   `column_hash` in `rustcraft-world/src/terrain.rs`) and prove it with a
+   `column_hash` in `qwencraft-world/src/terrain.rs`) and prove it with a
    cross-boundary test.
 
 ## Commands
@@ -75,20 +75,20 @@ writes temp files):
 | `./scripts/walk_test.sh` | ~80s scripted walk→fly→return-walk in headless Chromium (`SEED=N` env, default 1337); the fly phase makes a long corridor so the pool evicts the walk endpoint as fog-bound trail, then the player walks back through that re-entered terrain. Asserts no *sustained* visible holes (3+ consecutive POOL samples > 15 missing meshed-but-evicted chunks) — catches a broken eviction→re-stream path; a single-sample transient (fast re-entry) is OK. |
 | `./scripts/npc_test.sh [COUNT] [SPACING]` | Headless NPC load test (`?npcs=COUNT:SPACING`); asserts boot with the load, live count in the HUD, and that steady-state physics runs on the per-agent local block window (hit rate ≥ 99%, solid fallbacks at spawn-tick scale). |
 | `./scripts/secure_context_test.sh` | LAN-HTTP (graceful "WebGPU unavailable" message, no panic) + HTTPS startup on localhost and LAN IP. |
-| `./scripts/remote_test.sh` | Headless-server e2e: standalone `rustcraft-net` (single port, `?server=ws://…/ws`) + **two** Chromium browsers in the same shared world; asserts both connect, the server sees both, the first browser renders both players (`POOL … agents=2`), streamed world, GPU pixel readback. |
-| `./scripts/build_dashboard.sh` | Builds the dashboard (its own wasm workspace) → `dashboard/dist` (wasm-bindgen + html/css). The dist is **embedded into the `rustcraft-net` binary and committed** — after running it, rebuild `rustcraft-net` and commit `dashboard/dist`. |
+| `./scripts/remote_test.sh` | Headless-server e2e: standalone `qwencraft-net` (single port, `?server=ws://…/ws`) + **two** Chromium browsers in the same shared world; asserts both connect, the server sees both, the first browser renders both players (`POOL … agents=2`), streamed world, GPU pixel readback. |
+| `./scripts/build_dashboard.sh` | Builds the dashboard (its own wasm workspace) → `dashboard/dist` (wasm-bindgen + html/css). The dist is **embedded into the `qwencraft-net` binary and committed** — after running it, rebuild `qwencraft-net` and commit `dashboard/dist`. |
 | `./scripts/dashboard_test.sh` | Dashboard e2e: single-port curl checks (`/healthz`, `/api/status`, `/api/map`, `/dashboard/*` assets, game at `/`, 426 on `/ws` over plain HTTP, 404) + headless Chromium on `/dashboard/` (DOM shows the live server, screenshot shows the rendered minimap). |
 
 ## Architecture map
 
 ```
 crates/
-  rustcraft-world/    PURE, no deps. Blocks, seeded noise, terrain
+  qwencraft-world/    PURE, no deps. Blocks, seeded noise, terrain
                       generation (water/trees/snow/flowers/sand), chunk
                       meshing with voxel lighting+AO, raycasting,
                       camera matrices + the WGSL shader source.
                       Host-testable — put geometry/logic tests here.
-  rustcraft-server/   Authoritative game state. Server { world, agents,
+  qwencraft-server/   Authoritative game state. Server { world, agents,
                       inputs/actions/targets per agent id }, fixed 60Hz
                       tick, physics (walk/jump/fly/swim), per-agent
                       LocalBlockCache (dense 7³ local block window —
@@ -111,7 +111,7 @@ crates/
                       ClientMsg::Profile sends the player's name/colour)
                       shared by both transports; pure + host-testable, no
                       deps.
-  rustcraft-net/      HEADLESS server binary. tokio + tokio-tungstenite.
+  qwencraft-net/      HEADLESS server binary. tokio + tokio-tungstenite.
                       SINGLE PORT (one authority): dispatch_conn sniffs
                       the first bytes — TLS ClientHello → accept TLS
                       first; otherwise the request head is pre-read
@@ -155,12 +155,12 @@ crates/
                       edit sync), a wss round-trip with an
                       openssl-generated self-signed cert, and the
                       dashboard HTTP endpoints (single port, /dashboard/).
-  rustcraft-client/   WebGPU renderer. Terrain buffer POOL (one 2M-vertex
+  qwencraft-client/   WebGPU renderer. Terrain buffer POOL (one 2M-vertex
                       vbo/ibo, chunks own index ranges, compaction when
                       full), opaque+water pipelines (translucent water
                       pass), agent spheres, wireframe block highlight,
                       clear_terrain() for world switches.
-  rustcraft-web/      wasm glue. Backend { Builtin { server, streamer },
+  qwencraft-web/      wasm glue. Backend { Builtin { server, streamer },
                       Remote } — the frame loop talks only to the Backend;
                       builtin drives the embedded Server + Streamer
                       directly, remote decodes ServerMsg frames into the
@@ -193,7 +193,7 @@ dashboard/            STANDALONE cargo workspace (its dep graph must not
                       /api/map — max zoom-out fills the pane; ?zoom=N
                       sets the initial zoom). Built by
                       scripts/build_dashboard.sh into dist/ (COMMITTED —
-                      embedded into the rustcraft-net binary via
+                      embedded into the qwencraft-net binary via
                       include_dir!; the cdylib exposes #[wasm_bindgen]
                       start(), called from index.html after init()).
 scripts/              build.sh, serve.sh, verify.sh, walk_test.sh,
@@ -221,13 +221,13 @@ is visible on the map within one tick.
 
 ### Invariants that are easy to break
 
-- **Terrain pool capacity** lives in `rustcraft_world` as
+- **Terrain pool capacity** lives in `qwencraft_world` as
   `TERRAIN_POOL_VERTS`/`TERRAIN_POOL_IDX`; the client aliases them as
   `VERT_CAP`/`IDX_CAP`. **Do not fork the numbers in the client** — a stale
   2M/3M fork (while the world crate said 2.5M/3.75M) left the worst-case
   view at 93.5% of the *real* pool, so compaction dropped still-visible
   chunks (holes that only filled on a block edit). Sized to a *measured*
-  worst case: `rustcraft-server/examples/pool_measure.rs` scans seeds and
+  worst case: `qwencraft-server/examples/pool_measure.rs` scans seeds and
   the `worst_view_fits_terrain_pool_with_headroom` host test pins the known
   worst positions — both fail if the worst view exceeds 80% of the caps.
   Run `pool_measure` after any change that adds vertices per chunk (new
@@ -273,11 +273,11 @@ is visible on the map within one tick.
   WebSocket never quiesces, so virtual time stalls): `remote_test.sh` runs
   in real time with a wall-clock timeout instead. (The dashboard has no
   live WebSocket — plain fetch polling — so it *can* use virtual time.)
-- **The dashboard dist is embedded and committed**: `rustcraft-net` compiles
+- **The dashboard dist is embedded and committed**: `qwencraft-net` compiles
   `dashboard/dist` into the binary via `include_dir!` — the server has no
   filesystem dependencies at runtime. After changing anything under
   `dashboard/` (sources, html, css): `./scripts/build_dashboard.sh`,
-  `cargo build -p rustcraft-net`, and **commit the new `dashboard/dist`**
+  `cargo build -p qwencraft-net`, and **commit the new `dashboard/dist`**
   (stale dist → stale dashboard on every machine). The JS imports a
   `snippets/` subtree, so the *whole* tree must be served (the include_dir
   approach exists for that; don't regress to per-file include_bytes).
@@ -354,7 +354,7 @@ These are properties of *this machine/headless setup*, not code bugs:
   entry** (`start()`), not a binary: the wasm-bindgen glue only re-exports
   `#[wasm_bindgen]` functions, and a binary's `main` (argc/argv) is not one.
   Also note cargo names the cdylib artifact with **underscores**
-  (`rustcraft_dashboard.wasm`) — a stale hyphenated *bin* artifact left in
+  (`qwencraft_dashboard.wasm`) — a stale hyphenated *bin* artifact left in
   `target/` will silently ship the wrong wasm (symptom: "does not provide
   an export named 'start'"). `scripts/build_dashboard.sh` pins the
   underscored path.
@@ -369,7 +369,7 @@ These are properties of *this machine/headless setup*, not code bugs:
 ## Testing conventions
 
 - Host unit tests live in `#[cfg(test)]` mods in the same file (server) or
-  in `crates/rustcraft-world` (geometry/terrain). Tests are
+  in `crates/qwencraft-world` (geometry/terrain). Tests are
   **seeded-deterministic** (e.g. `Server::new(1337)`) and tick the server
   with fixed `dt = 1/60` — no real time, no `sleep`.
 - For physics/spawn tests, don't assume spawn coordinates — the spawn scan
@@ -396,11 +396,11 @@ These are properties of *this machine/headless setup*, not code bugs:
 4. For anything touching the pool, streaming, or world sync:
    `./scripts/walk_test.sh` — "WALK TEST PASSED".
 5. For anything touching startup/context: `./scripts/secure_context_test.sh`.
-6. For anything touching the protocol, `rustcraft-net`, or the remote
+6. For anything touching the protocol, `qwencraft-net`, or the remote
    backend: `./scripts/remote_test.sh` — "ALL CHECKS PASSED".
 7. For anything touching `dashboard/` (or the dashboard HTTP side of
-   `rustcraft-net`): `./scripts/build_dashboard.sh` + rebuild
-   `rustcraft-net` + `./scripts/dashboard_test.sh` — "ALL CHECKS PASSED",
+   `qwencraft-net`): `./scripts/build_dashboard.sh` + rebuild
+   `qwencraft-net` + `./scripts/dashboard_test.sh` — "ALL CHECKS PASSED",
    and commit the regenerated `dashboard/dist`.
 8. Update README.md if user-visible behavior changed; keep the version
    pins in lockstep if you touched them.

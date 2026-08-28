@@ -26,7 +26,7 @@ done
 export VK_ICD_FILENAMES="${VK_ICD}"
 
 export TMPDIR="${TMPDIR:-/tmp}"
-PROF_DIR="${TMPDIR}/rustcraft-ctx-prof"
+PROF_DIR="${TMPDIR}/qwencraft-ctx-prof"
 rm -rf "$PROF_DIR"
 mkdir -p "$PROF_DIR"
 
@@ -102,15 +102,15 @@ done
 
 echo "===> B: https://127.0.0.1:${PORT_S} (expect full startup)"
 chrome_dump "https://127.0.0.1:${PORT_S}/?seed=1337" "$PROF_DIR/b.log" "$PROF_DIR/b.dom"
-check "https localhost: app started" grep -q "RustCraft: app started" "$PROF_DIR/b.log"
-check "https localhost: renderer ready (WebGPU)" grep -q "RustCraft: renderer ready" "$PROF_DIR/b.log"
-check "https localhost: first frame rendered" grep -q "RustCraft: first frame rendered" "$PROF_DIR/b.log"
+check "https localhost: app started" grep -q "Qwencraft: app started" "$PROF_DIR/b.log"
+check "https localhost: renderer ready (WebGPU)" grep -q "Qwencraft: renderer ready" "$PROF_DIR/b.log"
+check "https localhost: first frame rendered" grep -q "Qwencraft: first frame rendered" "$PROF_DIR/b.log"
 
 if [ -n "$LAN_IP" ]; then
   echo "===> C: https://${LAN_IP}:${PORT_S} (expect full startup — the LAN case)"
   chrome_dump "https://${LAN_IP}:${PORT_S}/?seed=1337" "$PROF_DIR/c.log" "$PROF_DIR/c.dom"
-  check "https LAN: app started" grep -q "RustCraft: app started" "$PROF_DIR/c.log"
-  check "https LAN: renderer ready (WebGPU)" grep -q "RustCraft: renderer ready" "$PROF_DIR/c.log"
+  check "https LAN: app started" grep -q "Qwencraft: app started" "$PROF_DIR/c.log"
+  check "https LAN: renderer ready (WebGPU)" grep -q "Qwencraft: renderer ready" "$PROF_DIR/c.log"
 else
   echo "SKIP: C (no LAN IP)"
 fi

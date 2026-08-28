@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>RustCraft</title>
+  <title>Qwencraft</title>
   <style>
     html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
     #game { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
@@ -79,6 +79,8 @@
     }
     #palette .swatch.selected { border-color: #fff; box-shadow: 0 0 10px rgba(255,255,255,0.65); }
     #server-status { margin-top: 10px; font-size: 12px; opacity: 0.7; min-height: 14px; }
+    #repo-link { font-size: 12px; color: #9fc3ff; text-decoration: none; opacity: 0.85; }
+    #repo-link:hover { opacity: 1; text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -88,7 +90,7 @@
   <div id="tags"></div>
   <div id="overlay">
     <div class="box">
-      <h1>RUSTCRAFT</h1>
+      <h1>QWENCRAFT</h1>
       <div class="play">CLICK ANYWHERE TO PLAY</div>
       <p>WASD move &nbsp;·&nbsp; Space jump / swim up &nbsp;·&nbsp; Shift sprint &nbsp;·&nbsp; Mouse look</p>
       <p>F fly (Space/Shift up/down) &nbsp;·&nbsp; Q/E fly speed</p>
@@ -125,6 +127,9 @@
           <div class="opt-row">
             <button id="server-builtin" class="btn danger" type="button">Disconnect · use built-in server</button>
           </div>
+          <div class="opt-row">
+            <a id="repo-link" href="https://github.com/cjdell/qwencraft" target="_blank" rel="noopener">github.com/cjdell/qwencraft</a>
+          </div>
           <div id="server-status">built-in server</div>
         </div>
       </div>
@@ -132,19 +137,19 @@
     </div>
   </div>
   <script type="module">
-    import init from "./pkg/rustcraft_web.js";
+    import init from "./pkg/qwencraft_web.js";
     // Show seed in the overlay (the Rust side reads it too).
     const seed = new URLSearchParams(location.search).get("seed") || "1337";
     document.getElementById("seedline").textContent = "world seed: " + seed;
     // Hint the same-authority WebSocket URL in the connect field's
-    // placeholder (works when the game is hosted by rustcraft-net itself).
+    // placeholder (works when the game is hosted by qwencraft-net itself).
     const sameHost =
       (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
     const urlInput = document.getElementById("server-url");
     urlInput.placeholder = sameHost + " — blank = built-in server";
     init().catch((e) => {
-      console.error("RustCraft failed to load:", e);
-      document.getElementById("overlay").textContent = "Failed to load RustCraft: " + e;
+      console.error("Qwencraft failed to load:", e);
+      document.getElementById("overlay").textContent = "Failed to load Qwencraft: " + e;
     });
   </script>
 </body>

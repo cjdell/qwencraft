@@ -1,8 +1,0 @@
-[package]
-name = "rustcraft-world"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "Procedural voxel world generation for RustCraft (seeded, lazy chunks)"
-
-[dependencies]

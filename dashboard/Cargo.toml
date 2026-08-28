@@ -1,14 +1,14 @@
 [package]
-name = "rustcraft-dashboard"
+name = "qwencraft-dashboard"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Dioxus web dashboard for the RustCraft headless server (served by rustcraft-net)"
+description = "Dioxus web dashboard for the Qwencraft headless server (served by qwencraft-net)"
 
 # Standalone workspace on purpose: the dashboard's dependency graph
 # (dioxus et al.) must not interact with the main workspace's exact
 # wasm-bindgen pins. Built by scripts/build_dashboard.sh into dist/, which
-# is embedded into the rustcraft-net binary.
+# is embedded into the qwencraft-net binary.
 [workspace]
 
 # A cdylib (not a bin): the wasm-bindgen glue only re-exports

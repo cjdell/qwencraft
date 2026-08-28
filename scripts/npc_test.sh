@@ -11,7 +11,7 @@
 #     tiny fraction of lookups (they should be ~0 after the spawn tick).
 #
 # The real per-tick CPU cost is best measured with the host benchmark:
-#   cargo run -p rustcraft-server --release --example bench_tick
+#   cargo run -p qwencraft-server --release --example bench_tick
 # (headless virtual-time mode distorts Date.now(), so browser PERF timing
 #  there is not meaningful).
 #
@@ -25,8 +25,8 @@ SPACING="${2:-24}"
 BUDGET="${3:-20000}"
 PORT="${PORT:-$((20000 + RANDOM % 20000))}"
 export TMPDIR="${TMPDIR:-/tmp}"
-LOG="${TMPDIR}/rustcraft-npc.log"
-PROF_DIR="${TMPDIR}/rustcraft-npc-prof"
+LOG="${TMPDIR}/qwencraft-npc.log"
+PROF_DIR="${TMPDIR}/qwencraft-npc-prof"
 
 if [ ! -f web/dist/index.html ]; then
   echo "web/dist not found — run ./scripts/build.sh first" >&2
@@ -54,7 +54,7 @@ cleanup() { kill "$SRV" 2>/dev/null || true; }
 trap cleanup EXIT
 sleep 1
 
-curl -sf "http://127.0.0.1:${PORT}/" | grep -q "rustcraft" || {
+curl -sf "http://127.0.0.1:${PORT}/" | grep -q "qwencraft" || {
   echo "FAIL: port ${PORT} is not serving our web/dist (port squatted? rerun)"
   exit 1
 }
@@ -85,8 +85,8 @@ check() {
   fi
 }
 
-check "app started"           grep -q "RustCraft: app started" "$LOG"
-check "renderer ready"        grep -q "RustCraft: renderer ready" "$LOG"
+check "app started"           grep -q "Qwencraft: app started" "$LOG"
+check "renderer ready"        grep -q "Qwencraft: renderer ready" "$LOG"
 check "load armed"            grep -q "NPC load test armed: ${COUNT} agents" "$LOG"
 check "no uncaught JS errors" bash -c "! grep -E 'Uncaught|TypeError|ReferenceError' '$LOG' | grep -v 'favicon' | grep -q ."
 

@@ -2108,6 +2108,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "qwencraft-dashboard"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "dioxus",
+ "js-sys",
+ "serde",
+ "serde-wasm-bindgen",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2283,20 +2297,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
-]
-
-[[package]]
-name = "rustcraft-dashboard"
-version = "0.1.0"
-dependencies = [
- "console_error_panic_hook",
- "dioxus",
- "js-sys",
- "serde",
- "serde-wasm-bindgen",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
 ]
 
 [[package]]

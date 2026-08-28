@@ -1,6 +1,6 @@
-//! RustCraft server dashboard — a small dioxus web app (cdylib; entry
+//! Qwencraft server dashboard — a small dioxus web app (cdylib; entry
 //! point is the `#[wasm_bindgen] start()` below) served by
-//! `rustcraft-net` (see `dashboard/dist`, embedded into the server binary).
+//! `qwencraft-net` (see `dashboard/dist`, embedded into the server binary).
 //!
 //! Polls the same-origin status endpoints:
 //!   GET /api/status  → JSON: seed, uptime, agents, event log
@@ -72,7 +72,7 @@ struct LogEvent {
     m: String,
 }
 
-/// One fetched map region (mirrors `rustcraft_net::map::MapRegion`).
+/// One fetched map region (mirrors `qwencraft_net::map::MapRegion`).
 #[derive(Clone)]
 struct MapData {
     x0: i32,
@@ -112,7 +112,7 @@ const TILE: i32 = 256;
 const MAX_SPAN: i32 = 2048;
 const MIN_SCALE: f64 = 0.5; // px per block (zoomed out)
 const MAX_SCALE: f64 = 8.0; // px per block (zoomed in)
-/// `Block::Water` id (mirrors `rustcraft_world::Block`).
+/// `Block::Water` id (mirrors `qwencraft_world::Block`).
 const WATER: u8 = 5;
 /// Contour spacing in blocks: minor lines, and major lines.
 const CONTOUR_MINOR: i32 = 4;
@@ -129,7 +129,7 @@ const MAX_TILES: usize = 100;
 /// over ~1 s instead of bursting 40+ requests at once).
 const TILES_PER_TICK: usize = 6;
 
-/// Top-face colour per block id (mirrors `rustcraft_world::Block::color_top`).
+/// Top-face colour per block id (mirrors `qwencraft_world::Block::color_top`).
 fn block_color(b: u8) -> [u8; 3] {
     const C: [[u8; 3]; 11] = [
         [255, 255, 255], //  air (unused)
@@ -825,7 +825,7 @@ fn App() -> Element {
     rsx! {
         div { class: "app",
             header { class: "topbar",
-                div { class: "title", "RustCraft server" }
+                div { class: "title", "Qwencraft server" }
                 div { class: "stat",
                     span { class: if online { "dot on" } else { "dot off" } }
                     { if online { "connected" } else { "connecting…" } }
@@ -968,7 +968,7 @@ fn App() -> Element {
 }
 
 /// The JS entry point (called from index.html after `init()`):
-/// `import init, { start } from "./rustcraft-dashboard.js"; init().then(start);`
+/// `import init, { start } from "./qwencraft-dashboard.js"; init().then(start);`
 ///
 /// A cdylib with an explicit `#[wasm_bindgen]` entry is used instead of a
 /// binary's `main`: the wasm-bindgen glue only re-exports `#[wasm_bindgen]`

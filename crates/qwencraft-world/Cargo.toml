@@ -1,0 +1,8 @@
+[package]
+name = "qwencraft-world"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Procedural voxel world generation for Qwencraft (seeded, lazy chunks)"
+
+[dependencies]

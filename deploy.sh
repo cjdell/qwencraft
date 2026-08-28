@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Build the RustCraft wasm web app AND the headless server binary, and deploy
+# Build the Qwencraft wasm web app AND the headless server binary, and deploy
 # both to the router.
 #
 # The web build (web/dist/: index.html + pkg/*.wasm + *.js) is rsynced to
-# /srv/rustcraft, where nginx serves the game page under
-# rustcraft.home.chrisdell.info. The native `rustcraft-net` binary (built for
+# /srv/qwencraft, where nginx serves the game page under
+# qwencraft.home.chrisdell.info. The native `qwencraft-net` binary (built for
 # the build box's arch — the router is the same x86_64) is rsynced to
-# /srv/rustcraft-server, where the router's NixOS config runs it as a systemd
-# service (rustcraft-net.service) on 127.0.0.1:9000; nginx proxies /ws,
+# /srv/qwencraft-server, where the router's NixOS config runs it as a systemd
+# service (qwencraft-net.service) on 127.0.0.1:9000; nginx proxies /ws,
 # /dashboard, /api and /healthz for the same domain to it. The vhost +
-# service live in hosts/grafton-router/services/rustcraft.nix in the router's
+# service live in hosts/grafton-router/services/qwencraft.nix in the router's
 # own nixos-config repo. The binary is a glibc build for the build box, so
 # the service runs it through the router's dynamic loader (that glue lives
-# in the NixOS unit, not here). NOTE: /srv/rustcraft-server must exist and
+# in the NixOS unit, not here). NOTE: /srv/qwencraft-server must exist and
 # be owned by $DEPLOY_USER (one-time bootstrap: sudo mkdir + chown).
 #
 # Usage:
@@ -23,8 +23,8 @@
 #   DEPLOY_HOST        router IP/hostname        (default 192.168.49.1)
 #   DEPLOY_USER        SSH user                  (default cjdell)
 #   DEPLOY_SSH_KEY     SSH private key           (default ~/.ssh/id_rsa)
-#   DEPLOY_DEST        remote web root           (default /srv/rustcraft)
-#   DEPLOY_SERVER_DEST remote server bin dir     (default /srv/rustcraft-server)
+#   DEPLOY_DEST        remote web root           (default /srv/qwencraft)
+#   DEPLOY_SERVER_DEST remote server bin dir     (default /srv/qwencraft-server)
 #
 # The build tools (cargo, wasm-bindgen) live in the Nix dev shell. If this
 # script is run outside `nix develop`, it re-execs itself through the shell.
@@ -41,20 +41,20 @@ mkdir -p "$TMPDIR"
 DEPLOY_HOST="${DEPLOY_HOST:-192.168.49.1}"
 DEPLOY_USER="${DEPLOY_USER:-cjdell}"
 DEPLOY_SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/.ssh/id_rsa}"
-DEPLOY_DEST="${DEPLOY_DEST:-/srv/rustcraft}"
+DEPLOY_DEST="${DEPLOY_DEST:-/srv/qwencraft}"
 # Separate dir from the web root: the web rsync below uses --delete, so the
 # server binary must not live under $DEPLOY_DEST or it would be wiped.
-DEPLOY_SERVER_DEST="${DEPLOY_SERVER_DEST:-/srv/rustcraft-server}"
+DEPLOY_SERVER_DEST="${DEPLOY_SERVER_DEST:-/srv/qwencraft-server}"
 # Cargo crate name (hyphen) vs. produced wasm artifact name (underscore).
-CRATE_NAME="rustcraft-web"
-WASM_ARTIFACT="rustcraft_web"
-SERVER_CRATE="rustcraft-net"
+CRATE_NAME="qwencraft-web"
+WASM_ARTIFACT="qwencraft_web"
+SERVER_CRATE="qwencraft-net"
 
 # Always build inside the Nix dev shell (golden rule: everything runs through
 # it) so cargo/wasm-bindgen use the pinned toolchain and wasm32 target. The
 # marker env var prevents re-exec recursion once we're already inside it.
-if [ -z "${_RUSTCRAFT_DEPLOYED:-}" ]; then
-  export _RUSTCRAFT_DEPLOYED=1
+if [ -z "${_QWENCRAFT_DEPLOYED:-}" ]; then
+  export _QWENCRAFT_DEPLOYED=1
   exec nix develop --command bash "$0" "$@"
 fi
 
@@ -92,13 +92,13 @@ rsync -av \
 # effect on a restart. Best-effort: on a first-time deploy the unit may not
 # exist yet (it is created by the router's NixOS config + switch).
 if ssh -i "${DEPLOY_SSH_KEY}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
-    "systemctl list-unit-files rustcraft-net.service | grep -q '^rustcraft-net'"; then
-  echo "==> restarting rustcraft-net.service (picks up the new binary)"
+    "systemctl list-unit-files qwencraft-net.service | grep -q '^qwencraft-net'"; then
+  echo "==> restarting qwencraft-net.service (picks up the new binary)"
   ssh -i "${DEPLOY_SSH_KEY}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
-    "sudo -n systemctl restart rustcraft-net"
+    "sudo -n systemctl restart qwencraft-net"
 else
-  echo "==> note: rustcraft-net.service not present on ${DEPLOY_HOST} yet —"
+  echo "==> note: qwencraft-net.service not present on ${DEPLOY_HOST} yet —"
   echo "    it is created by the router's NixOS config; start it after the next switch."
 fi
 
-echo "==> done: ${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_DEST} + ${DEPLOY_SERVER_DEST} (rustcraft.home.chrisdell.info)"
+echo "==> done: ${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_DEST} + ${DEPLOY_SERVER_DEST} (qwencraft.home.chrisdell.info)"
