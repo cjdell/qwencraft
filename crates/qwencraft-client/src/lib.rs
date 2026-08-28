@@ -21,7 +21,7 @@ use qwencraft_server::{AgentState, WorldUpdate, VIEW_RADIUS};
 use qwencraft_world::camera::{
     uniform_bytes, view_projection, FOG_END, FOG_START, SHADER, SKY, UNIFORM_SIZE,
 };
-use qwencraft_world::{ChunkPos, REGION_BLOCKS, TERRAIN_POOL_IDX, TERRAIN_POOL_VERTS};
+use qwencraft_world::{ChunkPos, REGION_BLOCKS, Slot, TERRAIN_POOL_IDX, TERRAIN_POOL_VERTS, TerrainPool};
 // Pool capacity lives in qwencraft_world so the host-side `pool_measure`
 // example can assert the worst-case view stays under ~80% of it. Do not
 // fork these numbers here (the old 2M/3M fork caused exactly the
@@ -29,16 +29,20 @@ use qwencraft_world::{ChunkPos, REGION_BLOCKS, TERRAIN_POOL_IDX, TERRAIN_POOL_VE
 const IDX_CAP: u32 = TERRAIN_POOL_IDX;
 const VERT_CAP: u32 = TERRAIN_POOL_VERTS;
 
-/// Terrain mesh pool. Chunks append into one pre-allocated vertex/index
+/// Terrain mesh pool. Chunks own slots in one pre-allocated vertex/index
 /// buffer pair, so a frame costs one set_index_buffer + one
 /// set_vertex_buffer plus a single draw_indexed per chunk (instead of
-/// three state changes per chunk). When the pool fills up, chunks far from
-/// the player are dropped and the survivors are compacted to the front
-/// (CPU-side copies are kept so this needs no GPU readback).
+/// three state changes per chunk). Slot bookkeeping is the pure
+/// `TerrainPool` allocator (free list with coalescing + tail rewind, in
+/// `qwencraft_world::pool`): when the pool is full, the farthest
+/// (fog-bound) chunk's slot is evicted and reused in place, so a
+/// drop+insert costs ONE small buffer upload — never a full-pool
+/// re-upload (the old `compact_pool` re-uploaded the entire ~75 MB pool
+/// on the main thread, which was the fly-mode stutter).
 ///
 /// `VERT_CAP`/`IDX_CAP` (in `qwencraft_world`) are sized to hold the
 /// ENTIRE worst-case streamed view — a view bigger than the pool forces
-/// compaction to drop still-visible chunks, which then thrash on the
+/// eviction to drop still-visible chunks, which then thrash on the
 /// evict/re-send loop. Keep the worst case under ~80% of the caps
 /// (measured by qwencraft-server's `pool_measure` example).
 /// Chunks at 3D Chebyshev chunk-cell distance >= this are fully inside
@@ -55,6 +59,23 @@ struct TerrainChunk {
     /// Its draw offsets are derived: base_i + opaque index count, and
     /// base_vertex = base_v + opaque vertex count.
     water: Option<(Vec<f32>, Vec<u32>)>,
+}
+
+impl TerrainChunk {
+    /// The chunk's pool slot (opaque + water; the water sub-mesh follows
+    /// the opaque part in both buffers, so the slot is contiguous).
+    fn slot(&self) -> Slot {
+        let (wv, wi) = match &self.water {
+            Some((w, i)) => (w.len() as u32 / 6, i.len() as u32),
+            None => (0, 0),
+        };
+        Slot {
+            base_v: self.base_v,
+            base_i: self.base_i,
+            v_count: self.verts.len() as u32 / 6 + wv,
+            i_count: self.idxs.len() as u32 + wi,
+        }
+    }
 }
 
 /// One agent's sphere buffers. Keyed by agent id in `Renderer::agents`
@@ -85,8 +106,9 @@ pub struct Renderer {
     uniform_buf: Buffer,
     terrain_vbo: Buffer,
     terrain_ibo: Buffer,
-    terrain_v_used: u32,
-    terrain_i_used: u32,
+    /// Slot allocator for the terrain pool (high-water mark + coalescing
+    /// free list of released slots).
+    pool: TerrainPool,
     /// Meshed terrain chunks (CPU-side copies + pool offsets).
     terrain: Vec<TerrainChunk>,
     /// Chunks evicted from the pool by pressure (visible or fog-bound);
@@ -303,8 +325,7 @@ impl Renderer {
             uniform_buf,
             terrain_vbo,
             terrain_ibo,
-            terrain_v_used: 0,
-            terrain_i_used: 0,
+            pool: TerrainPool::new(VERT_CAP, IDX_CAP),
             terrain: Vec::new(),
             evicted: Vec::new(),
             known: std::collections::HashSet::new(),
@@ -324,6 +345,13 @@ impl Renderer {
 
     pub fn chunk_count(&self) -> usize {
         self.terrain.len()
+    }
+
+    /// Number of released slots sitting in the pool's free list (telemetry:
+    /// a healthy pool reuses them quickly, so this stays small; a steadily
+    /// growing count means fragmentation is outpacing reuse).
+    pub fn free_slots(&self) -> usize {
+        self.pool.free_slots()
     }
 
     /// Current drawing-buffer size in device pixels.
@@ -366,8 +394,7 @@ impl Renderer {
     pub fn clear_terrain(&mut self) {
         self.terrain.clear();
         self.backlog.clear();
-        self.terrain_v_used = 0;
-        self.terrain_i_used = 0;
+        self.pool.reset();
         self.evicted.clear();
         self.known.clear();
         self.pool_full_warns = 0;
@@ -385,6 +412,7 @@ impl Renderer {
                 WorldUpdate::Chunk { pos, data } => self.build_chunk(pos, data),
             }
         }
+        self.trim_known();
     }
 
     fn build_chunk(&mut self, pos: ChunkPos, data: Vec<u8>) {
@@ -392,29 +420,36 @@ impl Renderer {
             return;
         }
         let mesh = qwencraft_world::mesh::build_chunk_mesh((pos.x * 16, pos.y * 16, pos.z * 16), &data);
+        let nv = (mesh.vertices.len() + mesh.water_vertices.len()) as u32 / 6;
+        let ni = (mesh.indices.len() + mesh.water_indices.len()) as u32;
         if mesh.is_empty() {
             // A re-sent fully-air chunk (e.g. everything broken) drops the
-            // old mesh.
+            // old mesh and frees its pool slot.
             if let Some(idx) = self.terrain.iter().position(|t| t.pos == pos) {
-                self.terrain.remove(idx);
+                let old = self.terrain.remove(idx);
+                self.pool.release(old.slot());
             }
             return;
         }
-        let nv = (mesh.vertices.len() + mesh.water_vertices.len()) as u32 / 6;
-        let ni = (mesh.indices.len() + mesh.water_indices.len()) as u32;
-        // A re-sent chunk (an edit changed it) replaces the old mesh. The
-        // old entry's pool space is orphaned (append-only pool); the next
-        // compaction reclaims it.
+        // A re-sent chunk (an edit changed it) replaces the old mesh; its
+        // slot is freed immediately (tail rewind or free-list slot). The
+        // old append-only design orphaned it until a full compaction.
         if let Some(idx) = self.terrain.iter().position(|t| t.pos == pos) {
-            self.terrain.remove(idx);
+            let old = self.terrain.remove(idx);
+            self.pool.release(old.slot());
         }
-        if self.terrain_v_used + nv > VERT_CAP || self.terrain_i_used + ni > IDX_CAP {
-            self.compact_pool(nv, ni);
-        }
-        if self.terrain_v_used + nv > VERT_CAP || self.terrain_i_used + ni > IDX_CAP {
-            // The whole pool is in-view chunks (pathological terrain):
-            // report this chunk as evicted so the streamer keeps trying to
-            // deliver it, and warn (rate-limited).
+        // Allocate pool space: tail headroom → free slot (best fit) →
+        // evict the farthest (fog-bound) chunks until a slot fits. Every
+        // step costs at most one small buffer upload — never a full-pool
+        // re-upload (which is what made fly mode stutter).
+        let Some(slot) = self
+            .pool
+            .alloc(nv, ni)
+            .or_else(|| self.drop_for_slot(nv, ni))
+        else {
+            // The pool cannot hold this chunk even with everything evicted
+            // (pathological): report it as evicted so the streamer keeps
+            // trying to deliver it, and warn (rate-limited).
             self.evicted.push(pos);
             self.pool_full_warns += 1;
             if self.pool_full_warns == 1 || self.pool_full_warns % 120 == 0 {
@@ -423,9 +458,8 @@ impl Renderer {
                 ));
             }
             return;
-        }
-        let base_v = self.terrain_v_used;
-        let base_i = self.terrain_i_used;
+        };
+        let (base_v, base_i) = (slot.base_v, slot.base_i);
         // Indices stay chunk-local; draw_indexed adds base_vertex to each.
         // Water is appended after the opaque part (its draw offsets the
         // base_vertex by the opaque vertex count).
@@ -455,8 +489,6 @@ impl Renderer {
             water: (!mesh.water_vertices.is_empty())
                 .then_some((mesh.water_vertices, mesh.water_indices)),
         });
-        self.terrain_v_used += nv;
-        self.terrain_i_used += ni;
         self.known.insert(pos);
     }
 
@@ -468,120 +500,65 @@ impl Renderer {
         (pos.x - cx).abs().max((pos.y - cy).abs()).max((pos.z - cz).abs())
     }
 
-    /// Free pool space for `need_v` extra vertices / `need_i` indices.
+    /// Evict chunks farthest-from-camera first (fog-bound trail before
+    /// visible terrain) until one of their slots — or a coalesced set of
+    /// them — can hold `need_v`/`need_i`, and return that slot.
     ///
-    /// The drop decision is based on the *live* total (not the high-water
-    /// mark, which may include orphaned space from replaced chunks that a
-    /// plain rewrite reclaims). Chunks are dropped from the farthest (3D
-    /// Chebyshev) first, so the first casualties are chunks fully inside
-    /// the fog (Chebyshev distance >= FOG_END/16+2: their nearest corner is
-    /// (d-1)*16 > FOG_END blocks away — invisible). Every evicted chunk is
-    /// reported via `evicted`; the streamer re-sends a chunk only if it is
-    /// visible again, so fog-bound evictions cost nothing visually.
-    /// Survivors are rewritten to the front of the pool.
-    fn compact_pool(&mut self, need_v: u32, need_i: u32) {
-        let before = self.terrain.len();
-        // (index, distance, vertex count, index count) per chunk — water
-        // counts against the same pool.
-        let mut ranked: Vec<(usize, i32, u32, u32)> = self
+    /// Each eviction frees its slot (coalescing with adjacent free slots);
+    /// the retry may then take the coalesced run, another free slot, or the
+    /// tail headroom a tail-adjacent eviction rewound. Every evicted chunk
+    /// is reported via `evicted`; the streamer re-sends a chunk only if it
+    /// is visible again, so fog-bound evictions cost nothing visually
+    /// (without the report, walking back over evicted terrain would leave
+    /// holes). Returns None when there are no chunks left to evict (the
+    /// pool cannot hold the chunk — the caller drops it with a warning).
+    fn drop_for_slot(&mut self, need_v: u32, need_i: u32) -> Option<Slot> {
+        let mut ranked: Vec<(ChunkPos, i32, u32)> = self
             .terrain
             .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let wv = t.water.as_ref().map(|(w, _)| w.len() as u32 / 6).unwrap_or(0);
-                let wi = t.water.as_ref().map(|(_, w)| w.len() as u32).unwrap_or(0);
-                (
-                    i,
-                    self.chunk_dist(t.pos),
-                    t.verts.len() as u32 / 6 + wv,
-                    t.idxs.len() as u32 + wi,
-                )
-            })
+            .map(|t| (t.pos, self.chunk_dist(t.pos), t.slot().v_count))
             .collect();
-        // Live totals (high-water minus orphans).
-        let live_v: u32 = ranked.iter().map(|r| r.2).sum();
-        let live_i: u32 = ranked.iter().map(|r| r.3).sum();
         // Farthest first; on equal distance the biggest chunk (frees the
         // most space per drop).
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
-        let mut drop = vec![false; self.terrain.len()];
-        let mut used_v = live_v;
-        let mut used_i = live_i;
-        for &(_i, _d, vc, ic) in &ranked {
-            if used_v + need_v <= VERT_CAP && used_i + need_i <= IDX_CAP {
-                break;
+        for (pos, _d, _s) in ranked {
+            // Re-locate by pos (earlier removals shift indices).
+            let idx = self
+                .terrain
+                .iter()
+                .position(|t| t.pos == pos)
+                .expect("chunk pos unique in pool");
+            let t = self.terrain.remove(idx);
+            self.evicted.push(t.pos);
+            self.pool.release(t.slot());
+            if let Some(s) = self.pool.alloc(need_v, need_i) {
+                return Some(s);
             }
-            // Every evicted chunk is reported (visible or fog-bound): the
-            // streamer forgets it and re-sends it only if it is visible
-            // again. Fog-bound drops cost a little bookkeeping; without
-            // them, walking back over evicted terrain would leave holes.
-            self.evicted.push(self.terrain[_i].pos);
-            drop[_i] = true;
-            used_v -= vc;
-            used_i -= ic;
         }
-        let dropping = drop.iter().any(|&d| d);
-        let has_orphans = self.terrain_v_used > live_v || self.terrain_i_used > live_i;
-        if !dropping && !has_orphans {
-            return; // spurious call: there is room and nothing to reclaim
+        None
+    }
+
+    /// Keep the `known` telemetry set bounded over long exploration: once
+    /// it grows past 256K entries (~8 MB), forget chunks far beyond the
+    /// fog. Trade-off: if the player later returns to such distant terrain,
+    /// silently evicted chunks there are no longer re-requested (holes
+    /// until a block edit re-sends them). Everything within ~230 blocks is
+    /// always kept, so re-entering recently visited terrain (a few km of
+    /// travel) still works. (Cheap to run per update: the trim itself only
+    /// fires once per ~256K chunk visits.)
+    fn trim_known(&mut self) {
+        if self.known.len() <= 262144 {
+            return;
         }
-        let mut nv = 0u32;
-        let mut ni = 0u32;
-        let mut idx = 0usize;
-        self.terrain.retain_mut(|t| {
-            let keep = !drop[idx];
-            idx += 1;
-            if keep {
-                let ov = t.verts.len() as u32 / 6;
-                let oi = t.idxs.len() as u32;
-                t.base_v = nv;
-                t.base_i = ni;
-                self.queue
-                    .write_buffer(&self.terrain_vbo, (nv * 24) as u64, f32_bytes(&t.verts));
-                self.queue
-                    .write_buffer(&self.terrain_ibo, (ni * 4) as u64, u32_bytes(&t.idxs));
-                if let Some((wv, wi)) = &t.water {
-                    self.queue
-                        .write_buffer(&self.terrain_vbo, ((nv + ov) * 24) as u64, f32_bytes(wv));
-                    self.queue
-                        .write_buffer(&self.terrain_ibo, ((ni + oi) * 4) as u64, u32_bytes(wi));
-                    nv += wv.len() as u32 / 6;
-                    ni += wi.len() as u32;
-                }
-                nv += ov;
-                ni += oi;
-            }
-            keep
+        let cell = [
+            (self.camera[0] / 16.0).floor() as i32,
+            (self.camera[1] / 16.0).floor() as i32,
+            (self.camera[2] / 16.0).floor() as i32,
+        ];
+        self.known.retain(|c| {
+            (c.x - cell[0]).abs().max((c.y - cell[1]).abs()).max((c.z - cell[2]).abs())
+                <= VIEW_RADIUS + 2
         });
-        self.terrain_v_used = nv;
-        self.terrain_i_used = ni;
-        // Keep `known` bounded over long exploration: once it grows past
-        // 256K entries (~8 MB), forget chunks far beyond the fog. Trade-off:
-        // if the player later returns to such distant terrain, silently
-        // evicted chunks there are no longer re-requested (holes until a
-        // block edit re-sends them). Everything within ~230 blocks is
-        // always kept, so re-entering recently visited terrain (a few km
-        // of travel) still works.
-        if self.known.len() > 262144 {
-            // (The closure can't call self.chunk_dist while `known` is
-            // mutably borrowed, so compute the camera cell up front.)
-            let cell = [
-                (self.camera[0] / 16.0).floor() as i32,
-                (self.camera[1] / 16.0).floor() as i32,
-                (self.camera[2] / 16.0).floor() as i32,
-            ];
-            self.known.retain(|c| {
-                (c.x - cell[0]).abs().max((c.y - cell[1]).abs()).max((c.z - cell[2]).abs())
-                    <= VIEW_RADIUS + 2
-            });
-        }
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "Qwencraft: compacted terrain pool {} -> {} chunks ({} verts, {} dropped)",
-            before,
-            self.terrain.len(),
-            nv,
-            before - self.terrain.len()
-        )));
     }
 
     /// Chunks evicted from the pool since the last call (visible or

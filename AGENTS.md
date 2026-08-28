@@ -67,7 +67,7 @@ writes temp files):
 
 | Command | What it does |
 |---|---|
-| `cargo test` | All host unit tests (69: world 23, server 38, net e2e 4 incl. a wss TLS round-trip, a two-client shared-world test, and a dashboard HTTP test, dashboard lib 4 — the map). The only place Rust tests run — **wasm tests can't execute here**. |
+| `cargo test` | All host unit tests (80: world 33 incl. the terrain-pool allocator tests, server 39, net e2e 4 incl. a wss TLS round-trip, a two-client shared-world test, and a dashboard HTTP test, net lib 4 — the map). The only place Rust tests run — **wasm tests can't execute here**. |
 | `./scripts/build.sh` | Release build → `web/dist` (wasm-bindgen 0.2.100). |
 | `./scripts/serve.sh` | Serve `web/dist` at `http://localhost:8080` (python3). |
 | `./scripts/serve.sh --https` | Same over TLS with a self-signed cert (`.certs/`, generated once via openssl). **Required for LAN play** — WebGPU needs a secure context. |
@@ -231,9 +231,12 @@ is visible on the map within one tick.
   the `worst_view_fits_terrain_pool_with_headroom` host test pins the known
   worst positions — both fail if the worst view exceeds 80% of the caps.
   Run `pool_measure` after any change that adds vertices per chunk (new
-  mesh/terrain features) and update the pins. Compaction drops fog-bound
-  chunks (Chebyshev distance ≥ 8 from the player is fully fogged and safe);
-  the walk test guards the eviction→re-stream path end to end.
+  mesh/terrain features) and update the pins. Under pressure the pool evicts
+  fog-bound chunks first (Chebyshev distance ≥ 8 from the player is fully
+  fogged and safe) and reuses the dropped slot in place via the
+  `qwencraft_world::pool` free-list allocator — no full-pool re-upload
+  (that was the fly-mode stutter); the walk test guards the
+  eviction→re-stream path end to end.
 - **Chunk meshing margin**: `build_chunk_mesh` renders a 5-block margin
   beyond the 16³ chunk so faces at chunk borders agree with neighbors.
   There was a misalignment bug here once (dark scene); regression test

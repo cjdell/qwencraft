@@ -11,4 +11,10 @@ qwencraft-server = { path = "../qwencraft-server" }
 wgpu = "27.0.1"
 wasm-bindgen = "=0.2.100"
 js-sys = "=0.3.77"
-web-sys = { version = "=0.3.77", features = ["HtmlCanvasElement", "Navigator", "Window"] }
+web-sys = {
+    version = "=0.3.77",
+    # "console" is used for the startup/log lines; listed here so this
+    # crate builds standalone (a -p qwencraft-client build used to rely on
+    # feature unification from qwencraft-web).
+    features = ["console", "HtmlCanvasElement", "Navigator", "Window"],
+}

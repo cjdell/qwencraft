@@ -9,10 +9,12 @@ pub mod block;
 pub mod camera;
 pub mod mesh;
 pub mod noise;
+pub mod pool;
 pub mod terrain;
 
 pub use block::Block;
 pub use noise::Noise;
+pub use pool::{Slot, TerrainPool};
 pub use terrain::{SEA_LEVEL, SNOW_LEVEL, Tree, WorldGen};
 
 /// Edge length of a chunk in blocks.

@@ -309,14 +309,22 @@ at speed is expected and allowed.
 
 All terrain chunk meshes live in one pre-allocated vertex/index buffer
 pair (`qwencraft-client`): a frame costs one `set_index_buffer` +
-`set_vertex_buffer` plus a single `draw_indexed` per chunk. When the pool
-fills, `compact_pool` drops chunks from the *farthest* first (3D Chebyshev
-distance, including Y) and reports **every** eviction — fog-bound or
-visible. The client forwards the report to the server (built-in: direct
+`set_vertex_buffer` plus a single `draw_indexed` per chunk. Slot
+bookkeeping is a pure, host-tested allocator (`qwencraft_world::pool`):
+a coalescing free list of released slots plus a tail high-water mark. When
+the pool is full, the farthest (3D Chebyshev distance, including Y) chunk's
+slot is evicted and **reused in place** — a drop+insert costs one small
+buffer upload, never a full-pool re-upload. (The old design re-uploaded the
+entire ~75 MB pool to the GPU on every compaction, which stuttered fast
+flight exactly when the pool sat at capacity; the "compacted terrain pool"
+log line is gone with it.) Every eviction is still **reported** — fog-bound
+or visible: the client forwards the report to the server (built-in: direct
 `note_evicted`; remote: `ClientMsg::Evicted`); the streamer forgets the
 chunk and its normal stream re-sends it when it is visible again, at the
 normal stream rate. Without the report, chunks evicted while far away
-would stay holes when the player walks back over them.
+would stay holes when the player walks back over them. The `POOL` telemetry
+line reports the free-slot count (`free=`) — it stays small in steady
+state; a steadily growing count would mean fragmentation outpacing reuse.
 
 Capacity (`qwencraft-world`'s `TERRAIN_POOL_VERTS`/`TERRAIN_POOL_IDX`,
 aliased by the client) is sized with headroom over the measured worst

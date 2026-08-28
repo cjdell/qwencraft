@@ -195,17 +195,46 @@ impl Server {
     }
 
     /// Add a player agent at the spawn point and return its id. Successive
-    /// players are nudged apart so they don't spawn in the same cell.
+    /// players spawn a short distance in front of the most recent player's
+    /// view, so existing players see a newcomer immediately (a fixed world-
+    /// axis offset could put the newcomer behind their camera).
     pub fn add_player(&mut self) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
         // Spawn near the origin on dry, tree-free grass (skip water, snow
         // and tree columns so nobody starts underwater or in a trunk).
         let (sx, sz) = Self::find_spawn(&self.world, 8, 8, 16);
-        let surface = self.world.height_at(sx, sz);
-        let k = self.agents.iter().filter(|a| a.kind == AgentKind::Player).count() as f32;
-        let off = k * 1.6;
-        let pos = Vec3::new(sx as f32 + 0.5 + off, (surface + 2) as f32, sz as f32 + 0.5);
+        let players = self
+            .agents
+            .iter()
+            .filter(|a| a.kind == AgentKind::Player)
+            .count();
+        // 1.6 blocks in front per existing player, along the newest
+        // player's horizontal view direction (same convention as
+        // `look_direction`: [-sin(yaw), 0, -cos(yaw)]).
+        let (fx, fz) = match self
+            .agents
+            .iter()
+            .rev()
+            .find(|a| a.kind == AgentKind::Player)
+        {
+            Some(last) => {
+                let (sy, cy) = last.yaw.sin_cos();
+                (-sy, -cy)
+            }
+            None => (0.0, 0.0),
+        };
+        let (mut cx, mut cz) = (sx, sz);
+        if players > 0 {
+            let off = players as f32 * 1.6;
+            let bx = (sx as f32 + 0.5 + fx * off).floor() as i32;
+            let bz = (sz as f32 + 0.5 + fz * off).floor() as i32;
+            if Self::spawnable(&self.world, bx, bz) {
+                (cx, cz) = (bx, bz);
+            }
+        }
+        let surface = self.world.height_at(cx, cz);
+        let pos = Vec3::new(cx as f32 + 0.5, (surface + 2) as f32, cz as f32 + 0.5);
         self.agents.push(Agent::player(id, pos, "Player", [255, 255, 255]));
         self.inputs.insert(id, Input::default());
         self.prev_inputs.insert(id, Input::default());
@@ -1521,6 +1550,51 @@ mod tests {
         // The remaining player still simulates (no dangling per-player state).
         s.tick(1.0 / 60.0);
         assert!(s.agent_state(b).is_player);
+    }
+
+    /// Successive players must spawn where existing players can see them:
+    /// the newcomer's head projects into the previous player's default view
+    /// (the name tag is visible immediately; a fixed world-axis offset could
+    /// put the newcomer behind the camera — this regression kept the remote
+    /// test's "positioned the tag" check failing).
+    #[test]
+    fn new_players_spawn_in_front_of_existing_players() {
+        let mut s = Server::new_world(1337);
+        let a = s.add_player();
+        let b = s.add_player();
+        let sa = s.agent_state(a);
+        let sb = s.agent_state(b);
+        // A column or two away (the 1.6-block nudge snaps to a column),
+        // never the same cell.
+        let d = ((sb.pos.x - sa.pos.x).powi(2) + (sb.pos.z - sa.pos.z).powi(2)).sqrt();
+        assert!(
+            (0.9..3.5).contains(&d),
+            "newcomer should spawn a column or two away, got {d:.2}"
+        );
+        // The newcomer's head must project into the existing player's view,
+        // on screen (same projection inputs as the client's name tags).
+        let cam = [sa.pos.x, sa.pos.y + crate::agent::EYE_HEIGHT, sa.pos.z];
+        let vp = qwencraft_world::camera::view_projection(
+            cam,
+            sa.yaw,
+            sa.pitch,
+            1280.0 / 720.0,
+            1.15,
+            0.1,
+            300.0,
+        );
+        let top = [sb.pos.x, sb.pos.y + 2.0 * sb.radius + 0.35, sb.pos.z];
+        let (px, py) = qwencraft_world::camera::project_point(&vp, top, 1280.0, 720.0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "newcomer's head does not project into the existing player's view: a={:?} b={:?}",
+                    sa.pos, sb.pos
+                )
+            });
+        assert!(
+            (0.0..1280.0).contains(&px) && (0.0..720.0).contains(&py),
+            "tag projects off-screen: ({px:.1}, {py:.1})"
+        );
     }
 
     #[test]

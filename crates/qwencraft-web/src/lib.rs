@@ -914,10 +914,11 @@ impl App {
                 if let Some(r) = &self.renderer {
                     let missing = r.missing_visible(6).len();
                     log(&format!(
-                        "POOL chunks={} missing={} agents={}",
+                        "POOL chunks={} missing={} agents={} free={}",
                         r.chunk_count(),
                         missing,
-                        stats.agents
+                        stats.agents,
+                        r.free_slots()
                     ));
                 }
             }
