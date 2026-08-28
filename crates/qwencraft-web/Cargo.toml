@@ -8,6 +8,13 @@ description = "Qwencraft browser entry point: input, pointer lock, main loop, HU
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# Headless pixel verification: the WebGL2 "shadow" renderer (verify_gl.rs)
+# and the ?verify=1 mode that drives it. scripts/build.sh enables it so the
+# test harnesses work; a production build can omit it to keep the second
+# renderer out of the shipped wasm.
+verify = []
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 qwencraft-world = { path = "../qwencraft-world" }
 qwencraft-server = { path = "../qwencraft-server" }

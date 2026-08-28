@@ -12,10 +12,12 @@
 
 #![cfg(target_arch = "wasm32")]
 
+#[cfg(feature = "verify")]
 mod verify_gl;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+#[cfg(feature = "verify")]
+use std::collections::HashMap; // verify_regions (the shadow renderer's input)
 use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
@@ -224,7 +226,8 @@ struct App {
     last_frame_ms: f64,
     // Verify mode (?verify=1): accumulate the streamed chunk regions and
     // re-render them through a WebGL2 "shadow" renderer whose pixels can be
-    // read back even in headless browsers (see verify_gl.rs).
+    // read back even in headless browsers (see verify_gl.rs, `verify` feature).
+    #[cfg(feature = "verify")]
     verify_mode: bool,
     /// Headless stress test: hold W and walk (turning away when blocked by
     /// terrain), exercising terrain streaming + pool compaction.
@@ -269,13 +272,16 @@ struct App {
     /// would otherwise trap the walker (the engine has no auto-step).
     pending_walk_jump: bool,
     frames_total: u32,
+    #[cfg(feature = "verify")]
     verify_done: bool,
     // Per-phase frame timings (ms), accumulated since the last HUD update.
     perf_tick_ms: f64,
     perf_mesh_ms: f64,
     perf_render_ms: f64,
     hud_updates: u32,
+    #[cfg(feature = "verify")]
     verify_regions: HashMap<ChunkPos, Vec<u8>>,
+    #[cfg(feature = "verify")]
     gl_verify: Option<verify_gl::GlVerifier>,
 
     // Remote-server bookkeeping (the live link itself lives in `backend`).
@@ -311,6 +317,8 @@ impl App {
         tag_log: bool,
         npcs: Option<(u32, f32)>,
     ) -> Self {
+        #[cfg(not(feature = "verify"))]
+        let _ = verify_mode; // `verify` feature off: the parameter is ignored.
         let mut server = Server::new(seed);
         let spawn = server.player_state().pos;
         let streamer = Streamer::new();
@@ -352,14 +360,18 @@ impl App {
             fps_time: 0.0,
             fps: 0.0,
             last_frame_ms: 0.0,
+            #[cfg(feature = "verify")]
             verify_mode,
             frames_total: 0,
+            #[cfg(feature = "verify")]
             verify_done: false,
             perf_tick_ms: 0.0,
             perf_mesh_ms: 0.0,
             perf_render_ms: 0.0,
             hud_updates: 0,
+            #[cfg(feature = "verify")]
             verify_regions: HashMap::new(),
+            #[cfg(feature = "verify")]
             gl_verify: None,
             next_link_id: 0,
             pending_npcs: npcs,
@@ -581,6 +593,8 @@ impl App {
     /// streaming the full frame once as base64 `VERIFY_PNG` chunks so
     /// verify.sh can reconstruct a real screenshot of the 3D scene (the
     /// WebGPU canvas itself cannot be composited in headless Chromium).
+    /// `verify` feature only (the shadow renderer is not built without it).
+    #[cfg(feature = "verify")]
     fn run_gl_verify(&mut self) {
         let p = self.backend.player_state();
         let cam = [p.pos.x, p.pos.y + qwencraft_server::agent::EYE_HEIGHT, p.pos.z];
@@ -700,6 +714,7 @@ impl App {
         let t_mesh = js_sys::Date::now();
 
         let updates = self.backend.take_world_updates();
+        #[cfg(feature = "verify")]
         if self.verify_mode {
             for u in &updates {
                 match u {
@@ -817,6 +832,7 @@ impl App {
                 log("Qwencraft: first frame rendered");
             }
             self.frames_total += 1;
+            #[cfg(feature = "verify")]
             if self.verify_mode && self.frames_total == 410 && !self.verify_done {
                 // Plenty of chunks have been streamed and meshed by now;
                 // run the WebGL2 shadow readback + one-shot screenshot.
