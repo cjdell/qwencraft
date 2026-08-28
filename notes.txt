@@ -1,0 +1,12 @@
+nix develop
+
+scripts/build.sh
+
+PORT=8888 scripts/serve.sh
+
+cargo run -p qwencraft-net --release -- --seed 1337 --port 9000
+
+ssh 192.168.49.50 -L 8888:127.0.0.1:8888 -L 9000:127.0.0.1:9000
+
+http://localhost:8888/?server=ws://localhost:9000
+http://localhost:9000/dashboard

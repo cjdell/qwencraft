@@ -9,6 +9,8 @@
 
 #![cfg(target_arch = "wasm32")]
 
+mod sphere;
+
 use wgpu::{
     Buffer, BufferUsages, Device, DeviceDescriptor, Instance, InstanceDescriptor, PipelineLayout,
     Queue, RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions, ShaderModule,
@@ -620,7 +622,8 @@ impl Renderer {
             if s.id == own_id {
                 continue; // first person: the player is the camera
             }
-            let (verts, indices) = qwencraft_server::sphere_mesh(s);
+            let (verts, indices) =
+                sphere::sphere_mesh([s.pos.x, s.pos.y, s.pos.z], s.radius, s.color);
             let existing = self.agents.get_mut(&s.id);
             match existing {
                 Some(m) => {

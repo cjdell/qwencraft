@@ -14,7 +14,6 @@
 pub mod agent;
 pub mod local_block_cache;
 pub mod protocol;
-pub mod sphere;
 pub mod world;
 
 mod input;
@@ -23,7 +22,6 @@ pub use agent::{
     Agent, AgentKind, AgentState, FLY_BASE_SPEED, FLY_MAX_SPEED, FLY_MIN_SPEED, FLY_STEP,
 };
 pub use local_block_cache::{CacheStats, LocalBlockCache};
-pub use sphere::sphere_mesh;
 pub use input::{Action, Input, Key, KeySet};
 pub use world::{Edit, World, WorldUpdate};
 
