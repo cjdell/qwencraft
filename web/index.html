@@ -2,11 +2,13 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- user-scalable=no + the CSS touch-action below: a mobile game must
+       not double-tap-zoom / scroll / pull-to-refresh under the thumbs. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <title>Qwencraft</title>
   <style>
-    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
-    #game { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; touch-action: none; }
+    #game { display: block; width: 100vw; height: 100vh; cursor: crosshair; touch-action: none; -webkit-touch-callout: none; }
     #hud {
       position: fixed; top: 8px; left: 8px; z-index: 10;
       font: 13px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -25,7 +27,7 @@
        selected slot gets the gold ring, the name floats above. */
     #hotbar-wrap {
       position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
-      z-index: 10; display: flex; flex-direction: column; align-items: center; gap: 5px;
+      z-index: 15; display: flex; flex-direction: column; align-items: center; gap: 5px;
       pointer-events: none; user-select: none;
     }
     #hotbar-name {
@@ -39,6 +41,9 @@
       width: 44px; height: 44px; border-radius: 8px;
       border: 2px solid rgba(255, 255, 255, 0.28);
       box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+      /* Tappable on touch devices (the click listener also serves desktop
+         mouse clicks); the wrap stays pointer-events:none. */
+      pointer-events: auto; cursor: pointer;
     }
     #hotbar .hotbar-slot.selected {
       border-color: #ffd54a;
@@ -105,6 +110,55 @@
     #server-status { margin-top: 10px; font-size: 12px; opacity: 0.7; min-height: 14px; }
     #repo-link { font-size: 12px; color: #9fc3ff; text-decoration: none; opacity: 0.85; }
     #repo-link:hover { opacity: 1; text-decoration: underline; }
+    /* ---- Touch controls (mobile: two thumb pads) ------------------------
+       Shown only when the wasm layer detects a coarse pointer (body.touch):
+       left pad = analog move joystick, full-screen right pad = look drag,
+       JUMP/FLY/BREAK/PLACE buttons, and a menu button that re-opens the
+       overlay (the mobile equivalent of Esc). The overlay (z 20) stays on
+       top; the hotbar (z 15) sits above the lookpad so its slots get
+       their taps. */
+    .touch-only { display: none; }
+    body.touch .touch-only { display: block; }
+    body.touch .desktop-only { display: none; }
+    #touch-ui { display: none; position: fixed; inset: 0; z-index: 12; pointer-events: none; }
+    body.touch #touch-ui { display: block; }
+    #lookpad { position: absolute; inset: 0; pointer-events: auto; touch-action: none; }
+    #joy {
+      position: absolute; left: calc(18px + env(safe-area-inset-left)); bottom: calc(64px + env(safe-area-inset-bottom));
+      width: 148px; height: 148px; border-radius: 50%;
+      background: rgba(255, 255, 255, 0.08); border: 2px solid rgba(255, 255, 255, 0.32);
+      pointer-events: auto; touch-action: none; -webkit-touch-callout: none;
+    }
+    #joy-knob {
+      position: absolute; left: 50%; top: 50%; width: 72px; height: 72px; margin: -36px 0 0 -36px;
+      border-radius: 50%; background: rgba(255, 255, 255, 0.34); border: 2px solid rgba(255, 255, 255, 0.55);
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+    }
+    #tbtns {
+      position: absolute; right: calc(14px + env(safe-area-inset-right)); bottom: calc(64px + env(safe-area-inset-bottom));
+      display: grid; grid-template-columns: 64px 64px; gap: 10px; pointer-events: none;
+    }
+    .tbtn {
+      width: 64px; height: 64px; border-radius: 50%; pointer-events: auto; touch-action: none;
+      background: rgba(16, 22, 32, 0.55); color: #fff; border: 2px solid rgba(255, 255, 255, 0.42);
+      font: 600 11px/1.1 ui-monospace, "SF Mono", Menlo, Consolas, monospace; letter-spacing: 1px;
+      cursor: pointer; user-select: none; -webkit-touch-callout: none;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+    }
+    .tbtn.pressed { background: rgba(255, 213, 74, 0.4); border-color: #ffd54a; }
+    #btn-menu {
+      position: absolute; top: calc(10px + env(safe-area-inset-top)); right: calc(10px + env(safe-area-inset-right));
+      width: 44px; height: 44px; border-radius: 50%; pointer-events: auto; touch-action: none;
+      background: rgba(16, 22, 32, 0.55); color: #fff; border: 2px solid rgba(255, 255, 255, 0.42);
+      font: 600 18px/1 ui-monospace, monospace; cursor: pointer; user-select: none; -webkit-touch-callout: none;
+    }
+    #btn-menu.pressed { background: rgba(255, 213, 74, 0.4); border-color: #ffd54a; }
+    /* On phones: tighter hotbar (the pads need the bottom corners) and no
+       name label (the selected block is obvious from the slot ring). */
+    body.touch #hotbar .hotbar-slot { width: 34px; height: 34px; border-radius: 6px; }
+    body.touch #hotbar { gap: 3px; }
+    body.touch #hotbar-name { display: none; }
+    body.touch #options input[type="text"], body.touch #options .btn, body.touch #options .swatch, body.touch #options-btn { touch-action: manipulation; }
   </style>
 </head>
 <body>
@@ -116,15 +170,33 @@
     <div id="hotbar-name"></div>
     <div id="hotbar"></div>
   </div>
+  <!-- Touch controls (mobile): shown by the wasm layer on coarse-pointer
+       devices. Left pad = analog move joystick (the thumb's distance from
+       centre is the walk speed); the lookpad is the whole screen behind the
+       other controls (drag to look); buttons act on the crosshair. -->
+  <div id="touch-ui">
+    <div id="lookpad"></div>
+    <div id="joy"><div id="joy-knob"></div></div>
+    <div id="tbtns">
+      <button id="btn-break" class="tbtn" type="button">BREAK</button>
+      <button id="btn-place" class="tbtn" type="button">PLACE</button>
+      <button id="btn-jump" class="tbtn" type="button">JUMP</button>
+      <button id="btn-fly" class="tbtn" type="button">FLY</button>
+    </div>
+    <button id="btn-menu" class="tbtn" type="button" aria-label="menu">≡</button>
+  </div>
   <div id="overlay">
     <div class="box">
       <h1>QWENCRAFT</h1>
-      <div class="play">CLICK ANYWHERE TO PLAY</div>
-      <p>WASD move &nbsp;·&nbsp; Space jump / swim up &nbsp;·&nbsp; Shift sprint &nbsp;·&nbsp; Mouse look</p>
-      <p>F fly (Space/Shift up/down) &nbsp;·&nbsp; Q/E fly speed</p>
-      <p>Left click break &nbsp;·&nbsp; Right click place &nbsp;·&nbsp; 1-9 / wheel select block &nbsp;·&nbsp; Esc release mouse</p>
-      <p>NPC load test: N spawn &nbsp;·&nbsp; C clear &nbsp;·&nbsp; I/U count ×2 ÷2 &nbsp;·&nbsp; [ ] spacing</p>
-      <p>The black outline shows the block you'll break / place against</p>
+      <div class="play" id="play">CLICK ANYWHERE TO PLAY</div>
+      <p class="desktop-only">WASD move &nbsp;·&nbsp; Space jump / swim up &nbsp;·&nbsp; Shift sprint &nbsp;·&nbsp; Mouse look</p>
+      <p class="desktop-only">F fly (Space/Shift up/down) &nbsp;·&nbsp; Q/E fly speed</p>
+      <p class="desktop-only">Left click break &nbsp;·&nbsp; Right click place &nbsp;·&nbsp; 1-9 / wheel select block &nbsp;·&nbsp; Esc release mouse</p>
+      <p class="desktop-only">NPC load test: N spawn &nbsp;·&nbsp; C clear &nbsp;·&nbsp; I/U count ×2 ÷2 &nbsp;·&nbsp; [ ] spacing</p>
+      <p class="desktop-only">The black outline shows the block you'll break / place against</p>
+      <p class="touch-only">Left thumb: move stick &nbsp;·&nbsp; right thumb: drag to look</p>
+      <p class="touch-only">JUMP / FLY buttons &nbsp;·&nbsp; BREAK / PLACE act on the crosshair</p>
+      <p class="touch-only">Tap the hotbar to select a block &nbsp;·&nbsp; ≡ menu</p>
       <div id="options">
         <button id="options-btn" type="button">Options</button>
         <div id="options-body">

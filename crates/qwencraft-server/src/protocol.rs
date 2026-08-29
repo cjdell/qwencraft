@@ -55,7 +55,48 @@ use qwencraft_world::{BlockPos, ChunkPos, Vec3};
 /// player teleports; the server applies them with the same world-write
 /// path as player edits). The client stays a pure forwarder (golden
 /// rule 4 holds for the console too).
-pub const PROTOCOL_VERSION: u8 = 6;
+///
+/// v7: `Input` carries the touch joystick's analog movement vector
+/// (`analog_x`/`analog_y`, magnitude ≤ 1): mobile clients send the stick
+/// instead of WASD bits; the server uses it when non-zero (the stick's
+/// distance from centre is the throttle — see `Input::move_direction`)
+/// and falls back to the key bits otherwise. Look deltas are reused as-is
+/// (the mobile look pad feeds `dx`/`dy` in screen pixels, like a mouse).
+pub const PROTOCOL_VERSION: u8 = 7;
+
+/// How many times a client tab may force a cache-busting reload in the
+/// "server is from the future" case (`future_reload_budget`) before it
+/// gives up and falls back to the built-in server. The budget is per-tab
+/// and only attempts within `FUTURE_RELOAD_WINDOW_MS` count, so a later
+/// genuine upgrade gets a fresh budget while a permanently stale link
+/// (e.g. an intermediary ignoring the bust) can't loop the page forever.
+pub const FUTURE_RELOAD_MAX: u32 = 3;
+pub const FUTURE_RELOAD_WINDOW_MS: f64 = 5.0 * 60_000.0;
+
+/// Per-tab budget for the "server is from the future" reload. When the
+/// client's `Hello` version check finds a NEWER server, the page's assets
+/// are stale (the headless server serves the build matching its own
+/// protocol) — the client force-reloads with cache busting, using this
+/// budget so it can't loop forever.
+///
+/// `prev` is the raw stored budget string (`"{count},{ts_ms}"`) or None;
+/// `now_ms` is wall-clock milliseconds. Returns the new `(count, ts_ms)`
+/// to store (reload allowed), or None (budget exhausted — the caller
+/// falls back instead of reloading). A missing/unparseable timestamp
+/// counts as stale (fresh budget); a missing/unparseable count is zero.
+pub fn future_reload_budget(prev: Option<&str>, now_ms: f64) -> Option<(u32, f64)> {
+    let mut count = 0;
+    if let Some(prev) = prev {
+        let (c, ts) = match prev.split_once(',') {
+            Some((c, t)) => (c.parse().unwrap_or(0), t.parse().unwrap_or(f64::NEG_INFINITY)),
+            None => (prev.parse().unwrap_or(0), f64::NEG_INFINITY),
+        };
+        if now_ms - ts < FUTURE_RELOAD_WINDOW_MS {
+            count = c;
+        }
+    }
+    (count < FUTURE_RELOAD_MAX).then_some((count + 1, now_ms))
+}
 
 // ---- client -> server message types --------------------------------------
 const T_INPUT: u8 = 0x01;
@@ -93,11 +134,17 @@ const A_NPC_SPACING_DOWN: u8 = 10;
 /// Messages the client sends to the server.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClientMsg {
-    /// Per-frame input snapshot: key bitmask + accumulated look deltas.
+    /// Per-frame input snapshot: key bitmask + accumulated look deltas +
+    /// the touch joystick's analog movement vector (zero for keyboard/
+    /// mouse clients).
     Input {
         keys: u32,
         dx: f32,
         dy: f32,
+        /// Touch joystick: right(+)/left(-), magnitude ≤ 1.
+        analog_x: f32,
+        /// Touch joystick: forward(+)/back(-), magnitude ≤ 1.
+        analog_y: f32,
     },
     /// One-shot action (break/place carry the click-time aim).
     Action(Action),
@@ -160,10 +207,12 @@ impl ClientMsg {
     pub fn encode(&self) -> Vec<u8> {
         let mut p = Enc::new();
         let ty = match self {
-            ClientMsg::Input { keys, dx, dy } => {
+            ClientMsg::Input { keys, dx, dy, analog_x, analog_y } => {
                 p.u32(*keys);
                 p.f32(*dx);
                 p.f32(*dy);
+                p.f32(*analog_x);
+                p.f32(*analog_y);
                 T_INPUT
             }
             ClientMsg::Action(a) => {
@@ -254,7 +303,15 @@ impl ClientMsg {
                 let keys = d.u32()?;
                 let dx = d.f32()?;
                 let dy = d.f32()?;
-                ClientMsg::Input { keys, dx, dy }
+                let analog_x = d.f32()?;
+                let analog_y = d.f32()?;
+                ClientMsg::Input {
+                    keys,
+                    dx,
+                    dy,
+                    analog_x,
+                    analog_y,
+                }
             }
             T_ACTION => {
                 let kind = d.u8()?;
@@ -719,6 +776,17 @@ mod tests {
                 keys: keys.bits(),
                 dx: -12.5,
                 dy: 3.25,
+                analog_x: 0.0,
+                analog_y: 0.0,
+            },
+            // Analog (touch joystick) input: a half-speed right-forward
+            // stick, no keys.
+            ClientMsg::Input {
+                keys: 0,
+                dx: 0.0,
+                dy: 0.0,
+                analog_x: 0.354,
+                analog_y: 0.354,
             },
             ClientMsg::Action(Action::Break {
                 yaw: 0.5,
@@ -897,5 +965,47 @@ mod tests {
         // Unknown action discriminant.
         let bad = [0x02u8, 1, 0, 0, 0, 99];
         assert!(ClientMsg::decode(&bad).is_none());
+    }
+
+    #[test]
+    fn future_reload_budget_counts_to_the_max() {
+        let now = 1_000_000.0;
+        let (c1, t1) = future_reload_budget(None, now).unwrap();
+        assert_eq!((c1, t1), (1, now));
+        let (c2, t2) = future_reload_budget(Some(&format!("{c1},{t1}")), now).unwrap();
+        assert_eq!((c2, t2), (2, now));
+        let (c3, t3) = future_reload_budget(Some(&format!("{c2},{t2}")), now).unwrap();
+        assert_eq!((c3, t3), (3, now));
+        assert!(future_reload_budget(Some(&format!("{c3},{t3}")), now).is_none());
+    }
+
+    #[test]
+    fn future_reload_budget_resets_after_the_window() {
+        let now = 1_000_000.0;
+        let (c1, t1) = future_reload_budget(None, now).unwrap();
+        let (c2, t2) = future_reload_budget(Some(&format!("{c1},{t1}")), now).unwrap();
+        let (c3, t3) = future_reload_budget(Some(&format!("{c2},{t2}")), now).unwrap();
+        // Just inside the window the attempt still counts (exhausted).
+        assert!(future_reload_budget(
+            Some(&format!("{c3},{t3}")),
+            now + FUTURE_RELOAD_WINDOW_MS - 1.0
+        )
+        .is_none());
+        // At/past the window: fresh budget.
+        let later = now + FUTURE_RELOAD_WINDOW_MS;
+        let (c, t) = future_reload_budget(Some(&format!("{c3},{t3}")), later).unwrap();
+        assert_eq!((c, t), (1, later));
+    }
+
+    #[test]
+    fn future_reload_budget_tolerates_garbage() {
+        let now = 1_000_000.0;
+        // Unparseable pieces: count 0, stale timestamp → fresh budget.
+        assert_eq!(future_reload_budget(Some("garbage"), now), Some((1, now)));
+        assert_eq!(future_reload_budget(Some("garbage,also"), now), Some((1, now)));
+        // Count without a timestamp: the timestamp is stale → fresh budget.
+        assert_eq!(future_reload_budget(Some("9"), now), Some((1, now)));
+        // A fresh, well-formed high count still exhausts.
+        assert!(future_reload_budget(Some(&format!("9,{now}")), now).is_none());
     }
 }

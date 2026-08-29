@@ -175,7 +175,10 @@ async fn end_to_end_single_player() {
     // until it is replaced.
     let mut keys = KeySet::default();
     keys.insert(Key::W);
-    send(&mut sock, &ClientMsg::Input { keys: keys.bits(), dx: 0.0, dy: 0.0 });
+    send(
+        &mut sock,
+        &ClientMsg::Input { keys: keys.bits(), dx: 0.0, dy: 0.0, analog_x: 0.0, analog_y: 0.0 },
+    );
     let s = sample(&mut sock, 1.5);
     let p = s.player.expect("no player state after walking");
     let moved = dist(p.pos, p0.pos);
@@ -187,7 +190,10 @@ async fn end_to_end_single_player() {
     // Release the key (level-triggered input must clear) and wait until the
     // player stands still, so the break below lands on a standing player
     // (if the walk ended on a ledge, let the fall finish first).
-    send(&mut sock, &ClientMsg::Input { keys: 0, dx: 0.0, dy: 0.0 });
+    send(
+        &mut sock,
+        &ClientMsg::Input { keys: 0, dx: 0.0, dy: 0.0, analog_x: 0.0, analog_y: 0.0 },
+    );
     let mut p = sample(&mut sock, 0.25)
         .player
         .expect("no player state after release");

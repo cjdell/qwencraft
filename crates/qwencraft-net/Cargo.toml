@@ -22,6 +22,10 @@ rustls-pemfile = "2"
 include_dir = "0.7"
 
 [dev-dependencies]
-tungstenite = "0.30"
+# `rustls-tls-webpki-roots` gives the probe a real trust store: bare
+# `__rustls-tls` (from tokio-tungstenite's feature unification) builds an
+# EMPTY root store, so wss:// to a normally-CA-certified deployment would
+# fail with UnknownIssuer even though the chain is perfectly valid.
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio-tungstenite = { version = "0.30", features = ["__rustls-tls"] }
 qwencraft-world = { path = "../qwencraft-world" }

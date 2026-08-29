@@ -47,6 +47,7 @@ nix develop
 ./scripts/npc_test.sh  # headless NPC load test (physics on cached surfaces)
 ./scripts/secure_context_test.sh  # secure-context / HTTPS regression test
 ./scripts/remote_test.sh          # headless-server + browser end-to-end test
+./scripts/touch_test.sh           # mobile touch-controls end-to-end test
 ./scripts/wan_resync_test.sh      # deterministic transit-loss test (resync repair)
 ./scripts/dashboard_test.sh       # server dashboard end-to-end test
 cargo test             # host unit tests (worldgen, physics, streaming, …)
@@ -78,7 +79,9 @@ cargo run -p qwencraft-net --release -- --seed 1337 --port 9000
 > (generates a self-signed cert in `.certs/` once) and open
 > `https://<machine-LAN-IP>:8080` on the other device, accepting the
 > browser's certificate warning. The app detects the missing WebGPU on
-> plain HTTP and shows an explanatory message instead of crashing.
+> plain HTTP and shows an explanatory message instead of crashing. Phones
+> and tablets get the two-thumb touch controls automatically (see
+> [Mobile (touch controls)](#mobile-touch-controls)).
 
 ## Start screen & options
 
@@ -134,6 +137,34 @@ it with the player state; left/right clicks are applied with the exact
 aim from the moment you clicked (the aim is stamped onto the action), so
 the highlighted block is always the one that gets broken or built
 against — even while you're turning fast.
+
+## Mobile (touch controls)
+
+On touch devices (detected via the `pointer: coarse` media query) the app
+swaps keyboard + pointer lock for **two thumb control pads**:
+
+- **Move pad** (bottom-left): an analog joystick. The stick's distance
+  from centre is the walk *speed* (push it half out, walk at half speed),
+  and its direction is relative to where you're looking — the same model
+  as WASD, just continuous. It's sent to the server as an analog move
+  vector (protocol v7), so it works identically against the embedded and
+  the headless server.
+- **Look pad** (the rest of the screen): drag to look, exactly like
+  dragging a mouse (same pixels-per-radian sensitivity). Both pads track
+  separate touches, so you can move and look at the same time.
+- **Buttons** (bottom-right): `JUMP` (hold — re-jumps on landing, like
+  holding Space), `FLY` (toggle), `BREAK` / `PLACE` (act on the
+  crosshair, stamped with the current aim, exactly like clicks).
+- **Hotbar**: tap a slot to select it (mouse clicks work too).
+- **≡ menu** (top-right): re-opens the start/options screen — the mobile
+  equivalent of Esc — for changing name/colour or connecting to a server.
+
+Tap anywhere on the start screen to begin (there's no pointer lock to
+request on touch). The whole thing is exercised end-to-end by
+`./scripts/touch_test.sh` (a headless phone-sized browser driving the
+pads with real touch events: tap-to-play, look drag, joystick walk,
+jump, break, place, and a hotbar tap — each verified against the
+authoritative server's state).
 
 ## Blocks & the hotbar
 

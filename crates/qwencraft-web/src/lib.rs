@@ -25,7 +25,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
     Element, HtmlCanvasElement, HtmlDivElement, HtmlElement, HtmlInputElement, KeyboardEvent,
-    MessageEvent, MouseEvent, Window, WheelEvent,
+    MessageEvent, MouseEvent, Touch, TouchEvent, TouchList, Window, WheelEvent,
 };
 
 use js_sys::Function;
@@ -52,6 +52,16 @@ const HOTBAR_SLOTS: usize = 9;
 const RESYNC_GAP_CHUNKS: i64 = 32;
 const RESYNC_STALE_MS: f64 = 5000.0;
 const RESYNC_COOLDOWN_MS: f64 = 10_000.0;
+
+// "Server is from the future": if the Hello version is NEWER than ours,
+// this page's assets are stale — the headless server serves the build
+// matching its own protocol, so a version skew can only mean the browser
+// handed us an old cached copy. `force_reload_cache_busted` reloads the
+// page with a unique query param (busting the document in every cache,
+// intermediaries included) + unregisters any service worker, under a
+// per-tab budget (sessionStorage) so a permanently stale link can't loop
+// the page forever (see `protocol::future_reload_budget`).
+const FUTURE_RELOAD_KEY: &str = "qwc_future_reload";
 
 fn log(msg: &str) {
     web_sys::console::log_1(&JsValue::from_str(msg));
@@ -106,6 +116,8 @@ impl Backend {
                         keys: input.keys.bits(),
                         dx: input.mouse_dx,
                         dy: input.mouse_dy,
+                        analog_x: input.analog_x,
+                        analog_y: input.analog_y,
                     });
                 }
             }
@@ -311,6 +323,15 @@ struct App {
     aim_yaw: f32,
     aim_pitch: f32,
     locked: bool,
+    /// Coarse-pointer device (or forced by `?touchtest=1`): the two thumb
+    /// pads replace pointer lock (no touch device → desktop controls).
+    touch_mode: bool,
+    /// Move pad (left thumb): stick vector, x = right, y = forward,
+    /// magnitude ≤ 1. Sent as the analog part of the per-frame Input (the
+    /// server scales walk speed by it — the stick's distance from centre
+    /// is the throttle).
+    joy_x: f32,
+    joy_y: f32,
     last_time: f64,
     frames: u32,
     fps_time: f64,
@@ -382,6 +403,10 @@ struct App {
 
     // Remote-server bookkeeping (the live link itself lives in `backend`).
     next_link_id: u32,
+    /// A cache-busting "server is from the future" reload is in flight —
+    /// the link's close handler must not fall back to the built-in while
+    /// the page is reloading.
+    future_reloading: bool,
     /// Pending `qwc.getBlock` round-trips (remote mode): (owning link id,
     /// requested position, promise). Settled FIFO per position when the
     /// `BlockAt` answer arrives; rejected when the link dies (a replaced
@@ -471,6 +496,9 @@ impl App {
             aim_yaw: 0.0,
             aim_pitch: 0.0,
             locked: false,
+            touch_mode: false,
+            joy_x: 0.0,
+            joy_y: 0.0,
             last_time: 0.0,
             frames: 0,
             fps_time: 0.0,
@@ -490,6 +518,7 @@ impl App {
             #[cfg(feature = "verify")]
             gl_verify: None,
             next_link_id: 0,
+            future_reloading: false,
             pending_blocks: Vec::new(),
             pending_npcs: npcs,
             server_status,
@@ -532,6 +561,7 @@ impl App {
                 )
                 .ok();
             let _ = el.set_attribute("data-block", &block.as_u8().to_string());
+            let _ = el.set_attribute("data-slot", &i.to_string());
             let _ = el.set_attribute("title", block.info().name);
             if i == 0 {
                 let _ = el.class_list().add_1("selected");
@@ -750,11 +780,40 @@ impl App {
                 match m {
                     ServerMsg::Hello { version, seed, player_id } => {
                         if version != PROTOCOL_VERSION {
-                            log(&format!(
-                                "Qwencraft: server speaks protocol {version}, client has {PROTOCOL_VERSION} — closing"
-                            ));
+                            let future = version > PROTOCOL_VERSION;
                             let _ = r.ws.close();
-                            return; // the close handler does the fallback
+                            let mut reloaded = false;
+                            if future {
+                                // Server is from the future: this page's
+                                // assets are stale — force a cache-busting
+                                // reload. If the per-tab budget is
+                                // exhausted, fall back to the built-in
+                                // with a clear message instead of reloading
+                                // forever.
+                                log(&format!(
+                                    "Qwencraft: server speaks protocol {version}, client has {PROTOCOL_VERSION} — server is newer than this page"
+                                ));
+                                reloaded = force_reload_cache_busted();
+                            } else {
+                                log(&format!(
+                                    "Qwencraft: server speaks protocol {version}, client has {PROTOCOL_VERSION} — closing"
+                                ));
+                            }
+                            // `r`'s last use was above; the rest works on
+                            // `self` directly.
+                            if reloaded {
+                                self.future_reloading = true;
+                                self.set_server_status(
+                                    "server is newer than this page — reloading with cache busting…",
+                                );
+                            } else if future {
+                                self.set_server_status(
+                                    "server is newer than this page and cache-bust reloads failed — built-in server (hard-reload the page)",
+                                );
+                                self.fallback_to_builtin();
+                            }
+                            // Else: the close handler does the fallback.
+                            return;
                         }
                         r.connected = true;
                         r.seed = Some(seed);
@@ -976,6 +1035,11 @@ impl App {
             input.mouse_dx += self.pending_walk_turn;
             self.pending_walk_turn = 0.0;
         }
+        // Touch joystick (the move pad): the server scales walk speed by
+        // the stick's distance from centre (throttle); keyboard clients
+        // always send (0, 0) here and the keys drive movement.
+        input.analog_x = self.joy_x;
+        input.analog_y = self.joy_y;
         self.backend.set_input(input);
         for a in self.actions.drain(..) {
             self.backend.push_action(a);
@@ -1266,6 +1330,7 @@ fn connect_remote(app: &Rc<RefCell<App>>, raw_url: &str) {
         let mut a = app.borrow_mut();
         let id = a.next_link_id;
         a.next_link_id += 1;
+        a.future_reloading = false;
         a.backend = Backend::Remote(RemoteLink {
             id,
             ws: ws.clone(),
@@ -1340,6 +1405,11 @@ fn connect_remote(app: &Rc<RefCell<App>>, raw_url: &str) {
             if a.remote_id() != id {
                 return;
             }
+            if a.future_reloading {
+                // A cache-busting "server is from the future" reload is in
+                // flight — the page goes away; no fallback.
+                return;
+            }
             let (had_hello, url) = match &a.backend {
                 Backend::Remote(r) => (r.connected, r.url.clone()),
                 _ => return,
@@ -1400,7 +1470,7 @@ fn key_from_code(code: &str) -> Option<Key> {
     }
 }
 
-fn params_from_url() -> (u64, bool, bool, bool, Option<(u32, f32)>, Option<String>, bool) {
+fn params_from_url() -> (u64, bool, bool, bool, Option<(u32, f32)>, Option<String>, bool, bool) {
     let mut seed = 1337u64;
     let mut verify = false;
     let mut walk = false;
@@ -1409,6 +1479,11 @@ fn params_from_url() -> (u64, bool, bool, bool, Option<(u32, f32)>, Option<Strin
     let mut tag_log = false;
     // `dbg=1` logs a verbose chunk-receive/eviction trace (WAN debugging).
     let mut dbg = false;
+    // `touchtest=1` forces the mobile touch controls ON (even on fine-
+    // pointer headless browsers) and runs a scripted self-test that drives
+    // them with real TouchEvents and logs TOUCHTEST telemetry (the mobile
+    // end-to-end check, scripts/touch_test.sh).
+    let mut touchtest = false;
     // `npcs=COUNT[:SPACING]` starts the app with an NPC load already
     // spawned (headless load testing without a keyboard).
     let mut npcs: Option<(u32, f32)> = None;
@@ -1450,10 +1525,12 @@ fn params_from_url() -> (u64, bool, bool, bool, Option<(u32, f32)>, Option<Strin
                 if !v.is_empty() {
                     server = Some(v.to_string());
                 }
+            } else if part.strip_prefix("touchtest=").is_some_and(|v| v != "0") {
+                touchtest = true;
             }
         }
     }
-    (seed, verify, walk, tag_log, npcs, server, dbg)
+    (seed, verify, walk, tag_log, npcs, server, dbg, touchtest)
 }
 
 /// Accept `ws://…`, `wss://…`, or bare `host:port` (scheme implied by the
@@ -1503,6 +1580,66 @@ fn default_ws_scheme() -> &'static str {
     }
 }
 
+/// Force-reload the page with as much cache busting as a client can do —
+/// called when the server speaks a NEWER protocol than this page (the
+/// page's assets are stale: the server serves the build matching its own
+/// protocol). The reload URL gets a unique query param (existing ones
+/// like `?server=` are preserved), so the document URL misses every cache
+/// — browser and intermediaries alike — and any registered service worker
+/// is unregistered (this app registers none; a user-installed one could
+/// still intercept). Returns `false` when the per-tab reload budget
+/// (sessionStorage, `protocol::future_reload_budget`) is exhausted: the
+/// caller then falls back to the built-in server instead of reloading
+/// forever.
+fn force_reload_cache_busted() -> bool {
+    let Some(window) = web_sys::window() else { return false };
+    let Ok(Some(storage)) = window.session_storage() else { return false };
+    let now = js_sys::Date::now();
+    let prev = storage.get_item(FUTURE_RELOAD_KEY).ok().flatten();
+    let Some((count, ts)) =
+        qwencraft_server::protocol::future_reload_budget(prev.as_deref(), now)
+    else {
+        return false; // budget exhausted — don't loop
+    };
+    // Belt and braces: unregister any service workers (fire and forget —
+    // the reload doesn't wait for them). `navigator.serviceWorker` is
+    // undefined in insecure contexts, so probe it with Reflect first
+    // (same pattern as the `navigator.gpu` check).
+    let sw = js_sys::Reflect::get(&window.navigator(), &JsValue::from_str("serviceWorker"))
+        .ok()
+        .filter(|v| !v.is_undefined());
+    if let Some(sw) = sw {
+        let sw: web_sys::ServiceWorkerContainer = sw.unchecked_into();
+        let regs = sw.get_registrations();
+        spawn_local(async move {
+            let Ok(regs) = wasm_bindgen_futures::JsFuture::from(regs).await else {
+                return
+            };
+            let Ok(list) = regs.dyn_into::<js_sys::Array>() else { return };
+            for r in list.iter() {
+                let Ok(reg) = r.dyn_into::<web_sys::ServiceWorkerRegistration>() else {
+                    continue;
+                };
+                let _ = reg.unregister();
+            }
+        });
+    }
+    let _ = storage.set_item(FUTURE_RELOAD_KEY, &format!("{count},{ts}"));
+    // Unique query param → new document URL → cache miss everywhere.
+    let loc = window.location();
+    let search = loc.search().ok().unwrap_or_default();
+    let sep = if search.is_empty() { "?" } else { "&" };
+    let token = format!(
+        "{:x}{:x}",
+        now as i64,
+        (js_sys::Math::random() * 4294967296.0) as u32 // 2^32
+    );
+    let pathname = loc.pathname().ok().unwrap_or_default();
+    let url = format!("{pathname}{sep}qwc_reload={token}");
+    let _ = window.location().replace(&url);
+    true
+}
+
 // World point → screen pixels for the name tags. Lives in
 // `qwencraft_world::camera` (next to `view_projection`) so the exact math
 // the tags use is host-tested there (this crate is wasm-only).
@@ -1519,6 +1656,28 @@ fn event_target_is_text_input(e: &KeyboardEvent) -> bool {
 
 /// True when `target` is `ancestor` or nested inside it (the options panel
 /// is the pointer-lock exclusion zone).
+/// The first touch in a list (our pads track one touch each, so the rest
+/// is irrelevant).
+fn first_touch(list: TouchList) -> Option<Touch> {
+    list.item(0)
+}
+
+/// The touch with identifier `id` in a list (changedTouches carries the
+/// touch(es) this event is about; the identifier ties a multi-touch
+/// gesture to the pad that started it).
+fn find_touch(list: TouchList, id: i32) -> Option<Touch> {
+    let mut i = 0;
+    while i < list.length() {
+        if let Some(t) = list.item(i) {
+            if t.identifier() == id {
+                return Some(t);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 fn is_inside(target: &Element, ancestor: &Element) -> bool {
     let mut cur: Option<Element> = Some(target.clone());
     while let Some(el) = cur {
@@ -1671,11 +1830,240 @@ fn block_obj(pos: BlockPos, block: Block) -> JsValue {
 }
 
 /// The console usage help (logged on startup and by `qwc.help()`).
+/// `?touchtest=1` self-test: a classic script injected into the page that
+/// drives the touch controls with real `TouchEvent`s and logs `TOUCHTEST`
+/// telemetry (`scripts/touch_test.sh` greps for it). It is a black box —
+/// DOM + `window.qwc` only, the same surface a real user has: tap-to-play,
+/// look-pad drag, joystick walk, JUMP hold, BREAK/PLACE on the crosshair,
+/// and a hotbar slot tap (the placed block must be the tapped one).
+// Note: r##"…"## — the JS below contains "# (querySelectorAll("#hotbar…")),
+// which would terminate a plain r"#" raw string.
+const TOUCHTEST_JS: &str = r##"
+(function () {
+  "use strict";
+  function log(m) { console.log("TOUCHTEST " + m); }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  // fail() just throws; the catch below logs "TOUCHTEST FAIL …" once.
+  function fail(m) { throw new Error(m); }
+
+  var nextId = 1;
+  function mkTouch(el, x, y, id) {
+    return new Touch({ identifier: id, target: el, clientX: x, clientY: y,
+                       pageX: x, pageY: y, radiusX: 3, radiusY: 3, force: 1 });
+  }
+  function fire(el, type, touches, changed) {
+    var ev = new TouchEvent(type, {
+      touches: touches, targetTouches: touches, changedTouches: changed,
+      bubbles: true, cancelable: true, composed: true
+    });
+    el.dispatchEvent(ev);
+    return ev.defaultPrevented;
+  }
+  function tap(el, id) {
+    var r = el.getBoundingClientRect();
+    var x = r.left + r.width / 2, y = r.top + r.height / 2;
+    var t = mkTouch(el, x, y, id);
+    // A real (trusted) tap whose touchstart was NOT preventDefaulted makes
+    // the browser fire a synthetic click afterwards — untrusted synthetic
+    // touches never do, so we replay it here (that is the path the hotbar
+    // slot selection rides on).
+    var prevented = fire(el, "touchstart", [t], [t]);
+    fire(el, "touchend", [], [t]);
+    if (!prevented) {
+      el.dispatchEvent(new MouseEvent("click", {
+        bubbles: true, cancelable: true, detail: 1, view: window,
+        clientX: x, clientY: y
+      }));
+    }
+  }
+  function waitForTarget() {
+    return new Promise(function (resolve) {
+      var tries = 0;
+      (function poll() {
+        var t = window.qwc.getPlayer().target;
+        if (t || tries++ > 40) resolve(t || null);
+        else setTimeout(poll, 100);
+      })();
+    });
+  }
+  // The place cell is the target plus one face normal → one of the six
+  // neighbour cells. Resolve with its coordinates, or null.
+  function scanNeighbours(t, id) {
+    var dirs = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+    var i = 0;
+    function next() {
+      if (i >= dirs.length) return Promise.resolve(null);
+      var d = dirs[i++];
+      return window.qwc.getBlock(t.x + d[0], t.y + d[1], t.z + d[2]).then(function (b) {
+        return b.id === id ? "(" + b.x + "," + b.y + "," + b.z + ")" : next();
+      });
+    }
+    return next();
+  }
+
+  (async function () {
+    try {
+      // Wait for the app: qwc + a live player (pos.y > 1 means the built-in
+      // server has spawned and ticked).
+      var p = null;
+      for (var i = 0; i < 300; i++) {
+        p = window.qwc ? window.qwc.getPlayer() : null;
+        if (p && p.y > 1) break;
+        await sleep(100);
+      }
+      if (!p || p.y <= 1) fail("no live player state (app not running?)");
+
+      // 1) TAP TO PLAY: the overlay's touchstart must hide the overlay.
+      var ov = document.getElementById("overlay");
+      var ovT = mkTouch(ov, innerWidth / 2, innerHeight / 2, nextId++);
+      fire(ov, "touchstart", [ovT], [ovT]);
+      await sleep(200);
+      if (getComputedStyle(ov).display !== "none") fail("overlay still visible after tap");
+      var ui = document.getElementById("touch-ui");
+      if (getComputedStyle(ui).display === "none") fail("touch UI not shown");
+      log("start ok (overlay dismissed, pads shown)");
+
+      // 2) LOOK pad: drag right (yaw), then drag down (pitch — and aim at
+      //    the ground so the break/place tests have a target).
+      var lp = document.getElementById("lookpad");
+      var lx = Math.round(innerWidth * 0.75), ly = Math.round(innerHeight * 0.35);
+      var yaw0 = window.qwc.getPlayer().yaw;
+      var pitch0 = window.qwc.getPlayer().pitch;
+      var id = nextId++;
+      fire(lp, "touchstart", [mkTouch(lp, lx, ly, id)], [mkTouch(lp, lx, ly, id)]);
+      // One continuous drag (no jumps back — a jump would cancel itself
+      // out: dx is a delta). Right for the yaw, then down for the pitch.
+      var mx = lx, my = ly;
+      for (var k = 1; k <= 5; k++) {
+        await sleep(60);
+        mx += 18;
+        fire(lp, "touchmove", [mkTouch(lp, mx, my, id)], [mkTouch(lp, mx, my, id)]);
+      }
+      for (var k = 1; k <= 8; k++) {
+        await sleep(60);
+        my += 25;
+        fire(lp, "touchmove", [mkTouch(lp, mx, my, id)], [mkTouch(lp, mx, my, id)]);
+      }
+      fire(lp, "touchend", [], [mkTouch(lp, mx, my, id)]);
+      await sleep(400);
+      var p1 = window.qwc.getPlayer();
+      var dyaw = yaw0 - p1.yaw;      // drag right → yaw -= dx*sens
+      var dpitch = pitch0 - p1.pitch; // drag down → pitch -= dy*sens (looks down)
+      if (Math.abs(dyaw) < 0.03) fail("look: yaw barely changed (" + dyaw.toFixed(3) + ")");
+      if (dpitch < 0.1) fail("look: pitch did not look down (" + dpitch.toFixed(3) + ")");
+      log("look ok (dyaw=" + dyaw.toFixed(3) + " dpitch=" + dpitch.toFixed(3) + ")");
+
+      // 3) MOVE pad: hold the stick half out for ~1.3 s; if the terrain
+      //    blocks that way (spawned against a tree/wall), retry backwards.
+      var joy = document.getElementById("joy");
+      var jr = joy.getBoundingClientRect();
+      var jx = jr.left + jr.width / 2, jy = jr.top + jr.height / 2;
+      async function walkWithStick(sx, sy) {
+        var jid = nextId++;
+        fire(joy, "touchstart", [mkTouch(joy, jx, jy, jid)], [mkTouch(joy, jx, jy, jid)]);
+        await sleep(100);
+        fire(joy, "touchmove", [mkTouch(joy, jx + sx * 20, jy - sy * 20, jid)],
+                            [mkTouch(joy, jx + sx * 20, jy - sy * 20, jid)]);
+        await sleep(100);
+        var a = window.qwc.getPlayer();
+        await sleep(1300);
+        var b = window.qwc.getPlayer();
+        fire(joy, "touchend", [], [mkTouch(joy, jx + sx * 20, jy - sy * 20, jid)]);
+        await sleep(100);
+        return Math.hypot(b.x - a.x, b.z - a.z);
+      }
+      var md = await walkWithStick(0, 1);
+      if (md < 1.0) md = await walkWithStick(0, -1);
+      if (md < 1.0) fail("move: player did not walk either way (dist=" + md.toFixed(2) + ")");
+      if (md > 8.0) fail("move: walked " + md.toFixed(2) + " m in 1.3 s (throttle lost?)");
+      log("move ok (dist=" + md.toFixed(2) + " m, half stick over ~1.3 s)");
+
+      // 4) JUMP button: hold it until the player leaves the ground.
+      var jb = document.getElementById("btn-jump");
+      for (var i = 0; i < 50 && !window.qwc.getPlayer().onGround; i++) await sleep(100);
+      var jbr = jb.getBoundingClientRect();
+      var jid2 = nextId++;
+      var jbt = mkTouch(jb, jbr.left + 10, jbr.top + 10, jid2);
+      fire(jb, "touchstart", [jbt], [jbt]);
+      var airborne = false;
+      for (var i = 0; i < 15; i++) {
+        await sleep(80);
+        if (!window.qwc.getPlayer().onGround) { airborne = true; break; }
+      }
+      fire(jb, "touchend", [], [jbt]);
+      if (!airborne) fail("jump: player never left the ground");
+      log("jump ok (left the ground while holding JUMP)");
+
+      // 5) BREAK button: break the crosshair target (the ground, after the
+      //    look-down in step 2).
+      var tgt = await waitForTarget();
+      if (!tgt) fail("break: no crosshair target");
+      var before = await window.qwc.getBlock(tgt.x, tgt.y, tgt.z);
+      tap(document.getElementById("btn-break"), nextId++);
+      await sleep(500);
+      var after = await window.qwc.getBlock(tgt.x, tgt.y, tgt.z);
+      if (before.id === after.id) fail("break: block unchanged (" + before.name + ")");
+      if (after.id !== 0) fail("break: block is now " + after.name + " (expected air)");
+      log("break ok (" + before.name + " -> air)");
+
+      // 6) PLACE button: places the hotbar-selected block against the (new)
+      //    target's face → it appears in one of the target's six neighbours.
+      var blocks = window.qwc.listBlocks();
+      var placeables = blocks.filter(function (b) { return b.placeable; })
+                             .sort(function (a, b) { return a.id - b.id; });
+      var slot0 = placeables[0]; // hotbar slot 1
+      var t2 = await waitForTarget();
+      if (!t2) fail("place: no crosshair target");
+      tap(document.getElementById("btn-place"), nextId++);
+      await sleep(500);
+      var found = await scanNeighbours(t2, slot0.id);
+      if (!found) fail("place: " + slot0.name + " not found around the target");
+      log("place ok (" + slot0.name + " at " + found + ")");
+
+      // 7) HOTBAR tap: select slot 3 (Stone), place again, find the stone.
+      var slots = document.querySelectorAll("#hotbar .hotbar-slot");
+      if (slots.length < 3) fail("hotbar: fewer than 3 slots");
+      tap(slots[2], nextId++);
+      await sleep(200);
+      var stone = null;
+      for (var i = 0; i < 9 && !stone; i++) {
+        if (placeables[i] && placeables[i].id === 3) stone = placeables[i];
+      }
+      if (!stone) stone = placeables[2];
+      var t3 = await waitForTarget();
+      if (!t3) fail("hotbar: no crosshair target");
+      tap(document.getElementById("btn-place"), nextId++);
+      await sleep(500);
+      var found2 = await scanNeighbours(t3, stone.id);
+      if (!found2) fail("hotbar: " + stone.name + " not found (slot tap ignored?)");
+      log("hotbar ok (tapped slot 3 -> " + stone.name + " at " + found2 + ")");
+
+      log("ALL OK (start, look, move, jump, break, place, hotbar)");
+    } catch (err) {
+      log("FAIL " + (err && err.message ? err.message : String(err)));
+    }
+  })();
+})();
+"##;
+
+/// Inject the touch self-test script (runs synchronously on append).
+fn inject_touchtest_script(document: &web_sys::Document) {
+    let el: HtmlElement = document
+        .create_element("script")
+        .expect("script")
+        .dyn_into()
+        .expect("script");
+    el.set_text_content(Some(TOUCHTEST_JS));
+    if let Some(body) = document.body() {
+        let _ = body.append_child(&el);
+    }
+}
+
 fn console_greeting() -> &'static str {
     "Qwencraft console API — window.qwc:
   qwc.getBlock(x, y, z)        → Promise<{x, y, z, id, name}>
   qwc.setBlock(x, y, z, block) → Promise (block: a name like \"stone\" or an id; \"air\" breaks)
-  qwc.getPlayer()              → {x, y, z, yaw, pitch, onGround, fly, flySpeed, name}
+  qwc.getPlayer()              → {x, y, z, yaw, pitch, onGround, fly, flySpeed, name, target}
   qwc.setPlayerPos(x, y, z)    → Promise (teleport; y is the feet height)
   qwc.listBlocks()             → [{id, name, placeable, solid, water}, …]
   qwc.help()                   → show this help again"
@@ -1797,6 +2185,31 @@ fn install_console_api(app: &Rc<RefCell<App>>) -> Result<(), JsValue> {
                 &JsValue::from_str("name"),
                 &JsValue::from_str(&p.name),
             );
+            // The block under the crosshair (null when nothing in range) —
+            // the same target the break/place buttons (and clicks) act on.
+            let target = match p.target {
+                Some(t) => {
+                    let o = js_sys::Object::new();
+                    let _ = js_sys::Reflect::set(
+                        &o,
+                        &JsValue::from_str("x"),
+                        &JsValue::from_f64(t.x as f64),
+                    );
+                    let _ = js_sys::Reflect::set(
+                        &o,
+                        &JsValue::from_str("y"),
+                        &JsValue::from_f64(t.y as f64),
+                    );
+                    let _ = js_sys::Reflect::set(
+                        &o,
+                        &JsValue::from_str("z"),
+                        &JsValue::from_f64(t.z as f64),
+                    );
+                    o.into()
+                }
+                None => JsValue::NULL,
+            };
+            let _ = js_sys::Reflect::set(&o, &JsValue::from_str("target"), &target);
             o.into()
             },
         )
@@ -1940,9 +2353,20 @@ pub fn start() -> Result<(), JsValue> {
         .and_then(|e| e.dyn_into::<HtmlDivElement>().ok())
         .expect("missing #overlay");
 
-    let (seed, verify_mode, walk_mode, tag_log, npcs, server_url_param, dbg) =
+    let (seed, verify_mode, walk_mode, tag_log, npcs, server_url_param, dbg, touchtest) =
         params_from_url();
     log(&format!("Qwencraft: app started (seed {seed})"));
+
+    // Touch (mobile) mode: a coarse pointer means the two thumb pads
+    // replace pointer lock (pointer lock is unusable from touch — iOS
+    // Safari doesn't even have it). `?touchtest=1` forces it on for the
+    // headless self-test (scripts/touch_test.sh).
+    let touch_mode = touchtest
+        || window
+            .match_media("(pointer: coarse)")
+            .ok()
+            .flatten()
+            .is_some_and(|m| m.matches());
 
     let server_input = document
         .get_element_by_id("server-url")
@@ -2001,6 +2425,22 @@ pub fn start() -> Result<(), JsValue> {
         }
     }
 
+    // Touch mode: switch the UI to its mobile layout (body class shows the
+    // pads and the touch help lines, hides the keyboard/mouse ones) and
+    // relabel the start prompt.
+    if touch_mode {
+        if let Some(body) = document.body() {
+            let _ = body.class_list().add_1("touch");
+        }
+        if let Some(play) = document
+            .get_element_by_id("play")
+            .and_then(|e| e.dyn_into::<HtmlElement>().ok())
+        {
+            play.set_text_content(Some("TAP ANYWHERE TO PLAY"));
+        }
+        log("Qwencraft: touch controls enabled (coarse pointer or ?touchtest=1)");
+    }
+
     let app = Rc::new(RefCell::new(App::new(
         seed,
         hud.clone(),
@@ -2015,6 +2455,8 @@ pub fn start() -> Result<(), JsValue> {
         dbg,
         npcs,
     )));
+    // The event handlers below gate everything on App::touch_mode.
+    app.borrow_mut().touch_mode = touch_mode;
     // Build the hotbar slots (block list comes from the shared registry,
     // so a new block appears here automatically once it is placeable).
     app.borrow_mut().build_hotbar();
@@ -2225,9 +2667,12 @@ pub fn start() -> Result<(), JsValue> {
                     return;
                 }
                 let a = app.borrow();
-                if !a.locked {
-                    let _ = canvas_for_lock.request_pointer_lock();
+                // Touch devices can't usefully pointer-lock; taps start the
+                // game via the overlay's touchstart handler instead.
+                if a.touch_mode || a.locked {
+                    return;
                 }
+                let _ = canvas_for_lock.request_pointer_lock();
             }
         });
         document
@@ -2400,6 +2845,12 @@ pub fn start() -> Result<(), JsValue> {
             let canvas_ref = canvas.clone();
             let overlay_ref = overlay.clone();
             move || {
+                // Touch mode never pointer-locks — its overlay state is
+                // driven by taps (the overlay touchstart / the menu
+                // button), so a stray change event must not re-show it.
+                if app.borrow().touch_mode {
+                    return;
+                }
                 let locked = doc.pointer_lock_element().as_ref() == Some(&canvas_ref);
                 let mut a = app.borrow_mut();
                 a.locked = locked;
@@ -2417,6 +2868,395 @@ pub fn start() -> Result<(), JsValue> {
         app.borrow_mut()
             ._closures
             .push(Box::into_raw(Box::new(cb)) as *mut _);
+
+        // ---- Touch controls: two thumb pads (mobile) ---------------------
+        // Shown only in touch mode (coarse pointer / ?touchtest=1). The
+        // LEFT pad is an analog joystick: its stick vector is sent as the
+        // analog part of the per-frame Input (the server scales walk speed
+        // by it — stick distance from centre is the throttle). The RIGHT
+        // pad drags the view: screen pixels → the same dx/dy a mouse would
+        // send (the server converts at the mouse sensitivity). BREAK/PLACE
+        // act on the crosshair with the aim of the last rendered frame
+        // (same aim semantics as clicks); JUMP is level-triggered like
+        // holding Space (re-jumps on landing); FLY toggles fly mode.
+        // Every pad tracks ONE touch identifier, so both thumbs + a button
+        // work simultaneously (multi-touch).
+        if touch_mode {
+            // Tap-to-play: a tap outside the options panel starts the game
+            // (no pointer lock on touch). preventDefault kills the synthetic
+            // click so the desktop pointer-lock path can't fire.
+            let cb = Closure::<dyn FnMut(TouchEvent)>::new({
+                let app = app.clone();
+                let overlay_ref = overlay.clone();
+                let options_ref = options.clone();
+                move |e: TouchEvent| {
+                    let a = app.borrow();
+                    if !a.touch_mode || a.locked {
+                        return;
+                    }
+                    drop(a);
+                    // Options taps must reach their own (synthetic) clicks.
+                    if e
+                        .target()
+                        .and_then(|t| t.dyn_ref::<Element>().cloned())
+                        .is_some_and(|t| is_inside(&t, &options_ref))
+                    {
+                        return;
+                    }
+                    e.prevent_default();
+                    let mut a = app.borrow_mut();
+                    a.locked = true;
+                    a.keys = KeySet::default();
+                    a.joy_x = 0.0;
+                    a.joy_y = 0.0;
+                    let _ = overlay_ref.style().set_property("display", "none");
+                    log("Qwencraft: touch controls active (tap-to-play)");
+                }
+            });
+            overlay
+                .add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref())
+                .expect("overlay touchstart listener");
+            app.borrow_mut()
+                ._closures
+                .push(Box::into_raw(Box::new(cb)) as *mut _);
+
+            // LEFT PAD: analog joystick (the move stick).
+            let joy = document
+                .get_element_by_id("joy")
+                .and_then(|e| e.dyn_into::<HtmlElement>().ok())
+                .expect("missing #joy");
+            let joy_knob = document
+                .get_element_by_id("joy-knob")
+                .and_then(|e| e.dyn_into::<HtmlElement>().ok())
+                .expect("missing #joy-knob");
+            let joy_id: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
+
+            let cb = Closure::<dyn FnMut(TouchEvent)>::new({
+                let app = app.clone();
+                let id_ref = joy_id.clone();
+                move |e: TouchEvent| {
+                    let a = app.borrow();
+                    if !a.touch_mode || id_ref.borrow().is_some() {
+                        return;
+                    }
+                    let Some(t) = first_touch(e.changed_touches()) else {
+                        return;
+                    };
+                    *id_ref.borrow_mut() = Some(t.identifier());
+                    e.prevent_default();
+                }
+            });
+            joy
+                .add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref())
+                .expect("joy touchstart listener");
+            app.borrow_mut()
+                ._closures
+                .push(Box::into_raw(Box::new(cb)) as *mut _);
+
+            let cb = Closure::<dyn FnMut(TouchEvent)>::new({
+                let app = app.clone();
+                let id_ref = joy_id.clone();
+                let joy_ref = joy.clone();
+                let knob_ref = joy_knob.clone();
+                move |e: TouchEvent| {
+                    let Some(id) = *id_ref.borrow() else {
+                        return;
+                    };
+                    let Some(t) = find_touch(e.changed_touches(), id) else {
+                        return;
+                    };
+                    e.prevent_default();
+                    let rect = joy_ref.get_bounding_client_rect();
+                    let cx = rect.x() + rect.width() / 2.0;
+                    let cy = rect.y() + rect.height() / 2.0;
+                    // Knob travel: pad radius minus the knob's radius.
+                    let travel = (rect.width() / 2.0 - 36.0).max(20.0) as f32;
+                    let mut dx = (t.client_x() as f64 - cx) as f32;
+                    let mut dy = (t.client_y() as f64 - cy) as f32;
+                    let len = (dx * dx + dy * dy).sqrt();
+                    if len > travel {
+                        dx *= travel / len;
+                        dy *= travel / len;
+                    }
+                    let _ = knob_ref.style().set_property(
+                        "transform",
+                        &format!("translate({dx:.1}px, {dy:.1}px)"),
+                    );
+                    // Stick vector: screen-right = +x, screen-up = forward
+                    // (+y). Deadzone: a resting thumb jitters a few pixels
+                    // — below 15% of travel the stick reads centred (the
+                    // server would otherwise creep at 3% speed).
+                    let (sx, sy) = (dx / travel, -dy / travel);
+                    let mut a = app.borrow_mut();
+                    if (sx * sx + sy * sy).sqrt() < 0.15 {
+                        a.joy_x = 0.0;
+                        a.joy_y = 0.0;
+                    } else {
+                        a.joy_x = sx;
+                        a.joy_y = sy;
+                    }
+                }
+            });
+            joy
+                .add_event_listener_with_callback("touchmove", cb.as_ref().unchecked_ref())
+                .expect("joy touchmove listener");
+            app.borrow_mut()
+                ._closures
+                .push(Box::into_raw(Box::new(cb)) as *mut _);
+
+            // Release (touchend AND touchcancel — the browser fires both on
+            // the element the touch STARTED on, even if the thumb left it,
+            // and touchcancel for interruptions like incoming calls).
+            let cb = Closure::<dyn FnMut(TouchEvent)>::new({
+                let app = app.clone();
+                let id_ref = joy_id.clone();
+                let knob_ref = joy_knob.clone();
+                move |e: TouchEvent| {
+                    let Some(id) = *id_ref.borrow() else {
+                        return;
+                    };
+                    let Some(_) = find_touch(e.changed_touches(), id) else {
+                        return;
+                    };
+                    *id_ref.borrow_mut() = None;
+                    let _ = knob_ref.style().set_property("transform", "translate(0px, 0px)");
+                    let mut a = app.borrow_mut();
+                    a.joy_x = 0.0;
+                    a.joy_y = 0.0;
+                    e.prevent_default();
+                }
+            });
+            for name in ["touchend", "touchcancel"] {
+                joy
+                    .add_event_listener_with_callback(name, cb.as_ref().unchecked_ref())
+                    .expect("joy touchend listener");
+            }
+            app.borrow_mut()
+                ._closures
+                .push(Box::into_raw(Box::new(cb)) as *mut _);
+
+            // RIGHT PAD: drag to look. Full-screen (under the controls, which
+            // hit-test first): every non-control touch is a look drag.
+            // Screen pixels → the same dx/dy a mouse would send (the server
+            // converts at the mouse sensitivity, 0.0024 rad/px).
+            let lookpad = document
+                .get_element_by_id("lookpad")
+                .and_then(|e| e.dyn_into::<HtmlElement>().ok())
+                .expect("missing #lookpad");
+            let look_id: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
+            let look_last: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
+
+            let cb = Closure::<dyn FnMut(TouchEvent)>::new({
+                let app = app.clone();
+                let id_ref = look_id.clone();
+                let last_ref = look_last.clone();
+                move |e: TouchEvent| {
+                    let a = app.borrow();
+                    if !a.touch_mode || id_ref.borrow().is_some() {
+                        return;
+                    }
+                    let Some(t) = first_touch(e.changed_touches()) else {
+                        return;
+                    };
+                    *id_ref.borrow_mut() = Some(t.identifier());
+                    *last_ref.borrow_mut() = Some((t.client_x() as f64, t.client_y() as f64));
+                    e.prevent_default();
+                }
+            });
+            lookpad
+                .add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref())
+                .expect("lookpad touchstart listener");
+            app.borrow_mut()
+                ._closures
+                .push(Box::into_raw(Box::new(cb)) as *mut _);
+
+            let cb = Closure::<dyn FnMut(TouchEvent)>::new({
+                let app = app.clone();
+                let id_ref = look_id.clone();
+                let last_ref = look_last.clone();
+                move |e: TouchEvent| {
+                    let Some(id) = *id_ref.borrow() else {
+                        return;
+                    };
+                    let Some(t) = find_touch(e.changed_touches(), id) else {
+                        return;
+                    };
+                    e.prevent_default();
+                    let mut a = app.borrow_mut();
+                    if let Some((lx, ly)) = *last_ref.borrow() {
+                        a.mouse_dx += (t.client_x() as f64 - lx) as f32;
+                        a.mouse_dy += (t.client_y() as f64 - ly) as f32;
+                    }
+                    *last_ref.borrow_mut() = Some((t.client_x() as f64, t.client_y() as f64));
+                }
+            });
+            lookpad
+                .add_event_listener_with_callback("touchmove", cb.as_ref().unchecked_ref())
+                .expect("lookpad touchmove listener");
+            app.borrow_mut()
+                ._closures
+                .push(Box::into_raw(Box::new(cb)) as *mut _);
+
+            let cb = Closure::<dyn FnMut(TouchEvent)>::new({
+                let id_ref = look_id.clone();
+                let last_ref = look_last.clone();
+                move |e: TouchEvent| {
+                    let Some(id) = *id_ref.borrow() else {
+                        return;
+                    };
+                    let Some(_) = find_touch(e.changed_touches(), id) else {
+                        return;
+                    };
+                    *id_ref.borrow_mut() = None;
+                    *last_ref.borrow_mut() = None;
+                    e.prevent_default();
+                }
+            });
+            for name in ["touchend", "touchcancel"] {
+                lookpad
+                    .add_event_listener_with_callback(name, cb.as_ref().unchecked_ref())
+                    .expect("lookpad touchend listener");
+            }
+            app.borrow_mut()
+                ._closures
+                .push(Box::into_raw(Box::new(cb)) as *mut _);
+
+            // Action buttons (right thumb, above the hotbar): JUMP is
+            // level-triggered (hold = keep Space down, re-jumps on landing,
+            // exactly like the keyboard); the others are one-shot on
+            // touchstart (instant response — no waiting for touchend/click).
+            #[derive(Clone, Copy)]
+            enum TouchBtn {
+                Jump,
+                Fly,
+                Break,
+                Place,
+            }
+            for (id, kind) in [
+                ("btn-jump", TouchBtn::Jump),
+                ("btn-fly", TouchBtn::Fly),
+                ("btn-break", TouchBtn::Break),
+                ("btn-place", TouchBtn::Place),
+            ] {
+                let el = document
+                    .get_element_by_id(id)
+                    .and_then(|e| e.dyn_into::<HtmlElement>().ok())
+                    .unwrap_or_else(|| panic!("missing #{id}"));
+                let cb = Closure::<dyn FnMut(TouchEvent)>::new({
+                    let app = app.clone();
+                    let el_ref = el.clone();
+                    move |e: TouchEvent| {
+                        let mut a = app.borrow_mut();
+                        if !a.touch_mode {
+                            return;
+                        }
+                        e.prevent_default();
+                        // Stamp the aim of the last rendered frame (same
+                        // semantics as clicks) and the selected block
+                        // BEFORE touching the action queue (borrow checker).
+                        let (yaw, pitch) = (a.aim_yaw, a.aim_pitch);
+                        let block = a.selected_block().as_u8();
+                        match kind {
+                            TouchBtn::Jump => a.keys.insert(Key::Space),
+                            TouchBtn::Fly => a.actions.push(Action::ToggleFly),
+                            TouchBtn::Break => a.actions.push(Action::Break {
+                                yaw,
+                                pitch,
+                            }),
+                            TouchBtn::Place => a.actions.push(Action::Place {
+                                yaw,
+                                pitch,
+                                block,
+                            }),
+                        }
+                        let _ = el_ref.class_list().add_1("pressed");
+                    }
+                });
+                el.add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref())
+                    .expect("touch button touchstart listener");
+                app.borrow_mut()
+                    ._closures
+                    .push(Box::into_raw(Box::new(cb)) as *mut _);
+                let cb = Closure::<dyn FnMut(TouchEvent)>::new({
+                    let app = app.clone();
+                    let el_ref = el.clone();
+                    move |e: TouchEvent| {
+                        e.prevent_default();
+                        let _ = el_ref.class_list().remove_1("pressed");
+                        let mut a = app.borrow_mut();
+                        if a.touch_mode && matches!(kind, TouchBtn::Jump) {
+                            a.keys.remove(Key::Space);
+                        }
+                    }
+                });
+                for name in ["touchend", "touchcancel"] {
+                    el.add_event_listener_with_callback(name, cb.as_ref().unchecked_ref())
+                        .expect("touch button touchend listener");
+                }
+                app.borrow_mut()
+                    ._closures
+                    .push(Box::into_raw(Box::new(cb)) as *mut _);
+            }
+
+            // Menu button: re-show the start/options overlay (the mobile
+            // equivalent of releasing the pointer lock with Esc).
+            let cb = Closure::<dyn FnMut(TouchEvent)>::new({
+                let app = app.clone();
+                let overlay_ref = overlay.clone();
+                move |e: TouchEvent| {
+                    let mut a = app.borrow_mut();
+                    if !a.touch_mode {
+                        return;
+                    }
+                    e.prevent_default();
+                    a.locked = false;
+                    a.keys = KeySet::default();
+                    a.joy_x = 0.0;
+                    a.joy_y = 0.0;
+                    let _ = overlay_ref.style().set_property("display", "block");
+                }
+            });
+            if let Some(menu) = document
+                .get_element_by_id("btn-menu")
+                .and_then(|e| e.dyn_into::<HtmlElement>().ok())
+            {
+                menu
+                    .add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref())
+                    .expect("menu touchstart listener");
+            }
+            app.borrow_mut()
+                ._closures
+                .push(Box::into_raw(Box::new(cb)) as *mut _);
+
+            // Hotbar: tappable slots (the click listener also serves desktop
+            // mouse clicks — the slots are now pointer-events:auto).
+            let cb = Closure::<dyn FnMut(MouseEvent)>::new({
+                let app = app.clone();
+                move |e: MouseEvent| {
+                    let Some(slot) = e
+                        .target()
+                        .and_then(|t| t.dyn_ref::<Element>().cloned())
+                        .and_then(|t| t.closest(".hotbar-slot").ok().flatten())
+                    else {
+                        return;
+                    };
+                    let Some(s) = slot.get_attribute("data-slot") else {
+                        return;
+                    };
+                    let Ok(i) = s.parse::<usize>() else {
+                        return;
+                    };
+                    e.prevent_default();
+                    app.borrow_mut().select_slot(i);
+                }
+            });
+            hotbar
+                .add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
+                .expect("hotbar click listener");
+            app.borrow_mut()
+                ._closures
+                .push(Box::into_raw(Box::new(cb)) as *mut _);
+        }
 
         // Suppress the context menu on the canvas.
         let cb = Closure::<dyn FnMut(web_sys::Event)>::new(|e: web_sys::Event| {
@@ -2446,6 +3286,13 @@ pub fn start() -> Result<(), JsValue> {
         app.borrow_mut()
             ._closures
             .push(Box::into_raw(Box::new(cb)) as *mut _);
+    }
+
+    // ?touchtest=1: run the scripted touch self-test (real TouchEvents →
+    // the same handlers a thumb would drive; TOUCHTEST telemetry on the
+    // console for scripts/touch_test.sh to grep).
+    if touchtest {
+        inject_touchtest_script(&document);
     }
 
     // ---- Async renderer init, then main loop ------------------------------

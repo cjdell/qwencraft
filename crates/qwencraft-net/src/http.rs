@@ -326,9 +326,15 @@ where
         Some(loc) => format!("Location: {loc}\r\n"),
         None => String::new(),
     };
+    // `no-store` on everything: this server serves the EXACT build it has
+    // embedded, so a cached copy from an older server binary is stale by
+    // definition (the client force-reloads on detecting a newer protocol
+    // — but the header makes that rare to begin with). The payloads are
+    // tiny LAN-tool traffic; re-fetching costs nothing.
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
-         Content-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n{}\
+         Content-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\
+         Cache-Control: no-store\r\n{}\
          Connection: close\r\n\r\n",
         body.len(),
         location_header

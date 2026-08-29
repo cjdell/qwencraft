@@ -67,7 +67,7 @@ writes temp files):
 
 | Command | What it does |
 |---|---|
-| `cargo test` | All host unit tests (96: world 45 incl. the terrain-pool allocator tests and the face-UV-span test, client 2 — naga validation of the WGSL shader module + texture-function census, server 40 incl. the resync repair test, net e2e 5 incl. a wss TLS round-trip, a two-client shared-world test, a dashboard HTTP test, and a resync-over-a-real-socket test, net lib 4 — the map). The only place Rust tests run — **wasm tests can't execute here** (but the WGSL *is* checked here, see the client tests). |
+| `cargo test` | All host unit tests (106: world 45 incl. the terrain-pool allocator tests and the face-UV-span test, client 2 — naga validation of the WGSL shader module + texture-function census, server 49 incl. the resync repair test and the analog-stick (touch joystick) input tests, net e2e 6 incl. a wss TLS round-trip, a two-client shared-world test, a dashboard HTTP test, and a resync-over-a-real-socket test, net lib 4 — the map). The only place Rust tests run — **wasm tests can't execute here** (but the WGSL *is* checked here, see the client tests). |
 | `./scripts/build.sh` | Release build → `web/dist` (wasm-bindgen 0.2.100). |
 | `./scripts/serve.sh` | Serve `web/dist` at `http://localhost:8080` (python3). |
 | `./scripts/serve.sh --https` | Same over TLS with a self-signed cert (`.certs/`, generated once via openssl). **Required for LAN play** — WebGPU needs a secure context. |
@@ -76,6 +76,7 @@ writes temp files):
 | `./scripts/npc_test.sh [COUNT] [SPACING]` | Headless NPC load test (`?npcs=COUNT:SPACING`); asserts boot with the load, live count in the HUD, and that steady-state physics runs on the per-agent local block window (hit rate ≥ 99%, solid fallbacks at spawn-tick scale). |
 | `./scripts/secure_context_test.sh` | LAN-HTTP (graceful "WebGPU unavailable" message, no panic) + HTTPS startup on localhost and LAN IP. |
 | `./scripts/remote_test.sh` | Headless-server e2e: standalone `qwencraft-net` (single port, `?server=ws://…/ws`) + **two** Chromium browsers in the same shared world; asserts both connect, the server sees both, the first browser renders both players (`POOL … agents=2`), streamed world, GPU pixel readback. |
+| `./scripts/touch_test.sh` | Mobile touch-controls e2e: phone-sized (390×844) headless Chromium with `?touchtest=1` — forces touch mode and injects a self-test that drives the pads with real TouchEvents; asserts tap-to-play, look-pad yaw/pitch deltas, joystick walk distance (throttle-checked), JUMP, BREAK/PLACE (verified against the authoritative world via `qwc.getBlock`), and hotbar-tap selection. Real time (no virtual budget — cold SwiftShader init). |
 | `./scripts/wan_resync_test.sh [RTT_MS]` | Deterministic TRANSIT-LOSS test: headless Chromium → `wan_proxy.py` (TLS end, 200 ms RTT, drops ~4 MB of **whole WS frames** from the middle of the initial chunk burst) → `qwencraft-net`; asserts the drop happens, the client detects the gap and requests a resync, the server re-sends exactly the missing regions, and the view recovers (final `POOL chunks=` ≥ 250). Real-time (no virtual time — the resync timers use wall-clock `Date.now()` and a live 60 Hz socket never quiesces). |
 | `./scripts/build_dashboard.sh` | Builds the dashboard (its own wasm workspace) → `dashboard/dist` (wasm-bindgen + html/css). The dist is **embedded into the `qwencraft-net` binary and committed** — after running it, rebuild `qwencraft-net` and commit `dashboard/dist`. |
 | `./scripts/dashboard_test.sh` | Dashboard e2e: single-port curl checks (`/healthz`, `/api/status`, `/api/map`, `/dashboard/*` assets, game at `/`, 426 on `/ws` over plain HTTP, 404) + headless Chromium on `/dashboard/` (DOM shows the live server, screenshot shows the rendered minimap). |
@@ -114,15 +115,25 @@ crates/
                       Streamer = per-viewer chunk streaming state (sent
                       set + queue + dirty-chunk re-sends) so the builtin
                       (one viewer) and the net server (one per
-                      connection) share the logic. protocol.rs = versioned
-                      little-endian binary wire codec (ClientMsg/ServerMsg,
-                      encode/decode/decode_stream, currently v6: Hello
-                      carries the player id, agents carry name + colour,
-                      ClientMsg::Profile sends the player's name/colour,
-                      Action::Place carries the selected block id (u8 —
-                      the server validates it via
+                      connection) share the logic. input.rs = Key/KeySet/
+                      Input: per-frame input snapshot — key bits +
+                      accumulated look deltas + the touch joystick's
+                      analog move vector (analog_x/analog_y, magnitude
+                      ≤ 1; `Input::move_direction` uses it when non-zero,
+                      the stick's distance from centre being the THROTTLE
+                      — not renormalised like the 8-way key path — and
+                      falls back to the WASD bits otherwise). protocol.rs
+                      = versioned little-endian binary wire codec
+                      (ClientMsg/ServerMsg, encode/decode/decode_stream,
+                      currently v7: Hello carries the player id, agents
+                      carry name + colour, ClientMsg::Profile sends the
+                      player's name/colour, Action::Place carries the
+                      selected block id (u8 — the server validates it via
                       Block::from_u8(...).is_placeable() and silently
-                      drops unknown ids), ClientMsg::Resync carries the
+                      drops unknown ids), ClientMsg::Input carries the
+                      touch joystick's analog move vector (v7 — the mobile
+                      move pad; look drags reuse the mouse dx/dy fields),
+                      ClientMsg::Resync carries the
                       client's complete chunk set for transit-loss repair
                       — the server re-sends every ready chunk in view the
                       client doesn't have (the streamer's `sent` set can't
@@ -232,10 +243,30 @@ crates/
                       appends /ws); failed connect falls back to builtin.
                       ?dbg=1 logs a verbose chunk-receive/eviction trace
                       (WAN debugging).
+                      TOUCH CONTROLS (mobile): on a coarse pointer (or
+                      ?touchtest=1) pointer lock is replaced by two thumb
+                      pads built in web/index.html (#touch-ui, shown via
+                      the body.touch class): a fixed analog JOYSTICK
+                      (bottom-left; its stick vector is sent as the
+                      Input's analog_x/analog_y every frame — the server
+                      scales walk speed by it; 15% deadzone) and a
+                      full-screen LOOK PAD (drag → the same mouse_dx/dy
+                      pixels a mouse would send); JUMP (level-triggered
+                      Space), FLY, BREAK/PLACE (aim-stamped one-shots, same
+                      semantics as clicks) buttons; a ≡ menu button
+                      (re-opens the overlay — mobile Esc); the hotbar is
+                      tappable (slots are pointer-events:auto, click
+                      handler). Each pad tracks one Touch identifier, so
+                      both thumbs + a button work at once (multi-touch).
+                      ?touchtest=1 forces touch mode on any pointer type
+                      and injects a black-box self-test script (real
+                      TouchEvents + window.qwc only) that runs the whole
+                      choreography and logs TOUCHTEST telemetry (see
+                      scripts/touch_test.sh).
                       HOTBAR: 9-slot strip over the first 9 of the 13
                       PLACEABLE blocks (DOM, built from the registry),
                       digits 1–9 + mouse wheel select (wheel ignored in
-                      text inputs), right-click places the selected block.
+                      text inputs), right-click places the selected block,
                       CONSOLE API (window.qwc): getBlock (Promise —
                       builtin answers synchronously, remote round-trips
                       GetBlock→BlockAt via pending_blocks, FIFO per pos,
@@ -574,6 +605,12 @@ These are properties of *this machine/headless setup*, not code bugs:
    backend: `./scripts/remote_test.sh` — "ALL CHECKS PASSED".
    6b. For anything touching streaming, resync, or the remote backend's
    loss path: `./scripts/wan_resync_test.sh` — "TRANSIT-LOSS TEST PASSED".
+   6c. For anything touching the touch controls, mobile input, or the
+   `Input`/`ClientMsg::Input` wire path: `./scripts/touch_test.sh` —
+   "TOUCH TEST PASSED" (the self-test runs on headless fine-pointer
+   Chromium via `?touchtest=1`, so real device testing is not required —
+   but do sanity-check a real phone over `./scripts/serve.sh --https`
+   when you can).
 7. For anything touching `dashboard/` (or the dashboard HTTP side of
    `qwencraft-net`): `./scripts/build_dashboard.sh` + rebuild
    `qwencraft-net` + `./scripts/dashboard_test.sh` — "ALL CHECKS PASSED",

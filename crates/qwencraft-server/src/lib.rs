@@ -1216,6 +1216,31 @@ mod tests {
     }
 
     #[test]
+    fn analog_stick_moves_player_at_throttle() {
+        let mut s = Server::new(1337);
+        tick_n(&mut s, 120); // settle
+        let start = s.player_state().pos;
+        let start_facing = s.player_state().yaw;
+        // Half forward stick: the throttle is the stick's distance from
+        // centre, so the expected speed is HALF the walk speed.
+        let mut input = Input::default();
+        input.analog_y = 0.5;
+        s.set_input(input);
+        tick_n(&mut s, 60); // 1s
+        let end = s.player_state().pos;
+        let dx = end.x - start.x;
+        let dz = end.z - start.z;
+        let dist = (dx * dx + dz * dz).sqrt();
+        assert!(dist > 1.5, "half stick should walk ~2.2 m in 1s, moved {dist}");
+        assert!(dist < 3.5, "half stick moved {dist} in 1s — full speed (throttle ignored?)");
+        // The movement must be along the facing (the stick is yaw-relative).
+        let (sin, cos) = start_facing.sin_cos();
+        let facing = Vec3::new(-sin, 0.0, -cos);
+        let dot = (dx * facing.x + dz * facing.z) / dist.max(1e-4);
+        assert!(dot > 0.95, "movement not along the facing: dot {dot}");
+    }
+
+    #[test]
     fn jump_reaches_reasonable_height_and_lands() {
         let mut s = Server::new(1337);
         tick_n(&mut s, 120); // settle on the ground

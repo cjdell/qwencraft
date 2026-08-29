@@ -75,6 +75,11 @@ pub struct Input {
     pub mouse_dx: f32,
     /// Accumulated vertical mouse movement (pixels) since last frame.
     pub mouse_dy: f32,
+    /// Touch joystick: right(+)/left(-) component, magnitude ≤ 1.
+    /// (0, 0) = no analog input (keyboard/mouse clients use the key bits).
+    pub analog_x: f32,
+    /// Touch joystick: forward(+)/back(-) component, magnitude ≤ 1.
+    pub analog_y: f32,
 }
 
 /// Small fixed-size key set.
@@ -131,7 +136,28 @@ impl KeySet {
 impl Input {
     /// Movement direction in world space for the given yaw (radians).
     /// Yaw 0 looks towards -Z; positive yaw turns left.
+    ///
+    /// Analog-first: a non-zero joystick vector (the mobile move pad) moves
+    /// at exactly that magnitude — the stick's distance from centre is the
+    /// throttle (0..=1 × walk speed, NOT renormalised, unlike the key path
+    /// where a diagonal costs no speed). A zero vector falls back to the
+    /// WASD key bits (binary, normalised, 8-way).
     pub fn move_direction(&self, yaw: f32) -> Vec3 {
+        let (ax, ay) = (self.analog_x, self.analog_y);
+        let mag = (ax * ax + ay * ay).sqrt();
+        if mag > 0.05 {
+            let throttle = mag.min(1.0);
+            let inv = 1.0 / mag;
+            let right = ax * inv;
+            let fwd = ay * inv;
+            let (sin, cos) = yaw.sin_cos();
+            // Forward = (-sin, 0, -cos); Right = (cos, 0, -sin).
+            return Vec3::new(
+                (fwd * -sin + right * cos) * throttle,
+                0.0,
+                (fwd * -cos + right * -sin) * throttle,
+            );
+        }
         let mut x = 0.0f32;
         let mut z = 0.0f32;
         let (sin, cos) = yaw.sin_cos();
@@ -153,5 +179,59 @@ impl Input {
             z -= -sin;
         }
         Vec3::new(x, 0.0, z).normalize()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn analog(x: f32, y: f32) -> Input {
+        let mut i = Input::default();
+        i.analog_x = x;
+        i.analog_y = y;
+        i
+    }
+
+    #[test]
+    fn analog_stick_moves_relative_to_yaw() {
+        // Yaw 0 looks down -Z: full forward stick → (0, 0, -1).
+        let d = analog(0.0, 1.0).move_direction(0.0);
+        assert!((d.x - 0.0).abs() < 1e-4 && (d.z - -1.0).abs() < 1e-4);
+        // Full right stick → +X.
+        let d = analog(1.0, 0.0).move_direction(0.0);
+        assert!((d.x - 1.0).abs() < 1e-4 && (d.z - 0.0).abs() < 1e-4);
+        // Yaw π/2 turns left → looking down -X; forward stick → -X.
+        let d = analog(0.0, 1.0).move_direction(std::f32::consts::FRAC_PI_2);
+        assert!((d.x - -1.0).abs() < 1e-4 && (d.z - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn analog_magnitude_is_the_throttle() {
+        // Half forward stick → half speed, NOT renormalised to full.
+        let d = analog(0.0, 0.5).move_direction(0.0);
+        assert!((d.z - -0.5).abs() < 1e-4, "half stick must halve speed: {d:?}");
+        // Oversized vectors clamp to unit magnitude.
+        let d = analog(3.0, 4.0).move_direction(0.0);
+        let m = (d.x * d.x + d.z * d.z).sqrt();
+        assert!((m - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn analog_deadzone_falls_back_to_keys() {
+        // Centred-stick drift below the deadzone is "no input", and a zero
+        // stick uses the WASD bits exactly as before.
+        let d = analog(0.03, 0.0).move_direction(0.0);
+        assert!(d.length() < 1e-4);
+        let mut i = Input::default();
+        i.keys.insert(Key::W);
+        let d = i.move_direction(0.0);
+        assert!((d.z - -1.0).abs() < 1e-4, "key fallback broken: {d:?}");
+        // Analog takes priority over keys when both are present.
+        let mut i = analog(0.0, 1.0);
+        i.keys.insert(Key::W);
+        i.keys.insert(Key::A);
+        let d = i.move_direction(0.0);
+        assert!((d.x - 0.0).abs() < 1e-4 && (d.z - -1.0).abs() < 1e-4);
     }
 }

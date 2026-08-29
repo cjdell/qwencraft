@@ -525,11 +525,13 @@ fn apply_inbound(world: &Mutex<WorldState>, player_id: u32, m: ClientMsg) {
     let mut w = world.lock().unwrap();
     let WorldState { server, players, .. } = &mut *w;
     match m {
-        ClientMsg::Input { keys, dx, dy } => {
+        ClientMsg::Input { keys, dx, dy, analog_x, analog_y } => {
             let mut input = Input::default();
             input.keys = KeySet::from_bits(keys);
             input.mouse_dx = dx;
             input.mouse_dy = dy;
+            input.analog_x = analog_x;
+            input.analog_y = analog_y;
             server.set_agent_input(player_id, input);
         }
         ClientMsg::Action(a) => {
