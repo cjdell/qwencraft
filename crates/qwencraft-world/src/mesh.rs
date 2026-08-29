@@ -344,11 +344,17 @@ pub fn build_chunk_mesh(origin: (i32, i32, i32), data: &[u8]) -> MeshData {
                         let wy = origin.1 + ry - MARGIN + corner.1;
                         let wz = origin.2 + rz - MARGIN + corner.2;
                         // Face UVs: top/bottom use u=x, v=z; sides use
-                        // u=z, v=y (1 = top edge — the grass overhang rim
-                        // and the TNT label band live there).
+                        // u=(the face's horizontal world axis), v=y (1 =
+                        // top edge — the grass overhang rim and the TNT
+                        // label band live there). ±X faces are horizontal
+                        // in z, but ±Z faces are horizontal in X: using z
+                        // there made u constant across the whole face (z is
+                        // the face's normal) and every ±Z face rendered as
+                        // a 1D texture in v — flat horizontal bands.
                         let (u, v) = match face {
                             0 | 1 => (corner.0 as f32, corner.2 as f32),
-                            _ => (corner.2 as f32, corner.1 as f32),
+                            2 | 3 => (corner.2 as f32, corner.1 as f32),
+                            _ => (corner.0 as f32, corner.1 as f32),
                         };
                         out_corners[i] = (wx as f32, wy as f32, wz as f32, u, v);
                     }
@@ -465,9 +471,68 @@ fn ao_corners(
 mod tests {
     use super::*;
     use crate::{
-        Block, TEX_FLOWER_RED, TEX_GLASS, TEX_GRASS_TOP, TEX_HIGHLIGHT, TEX_LOG_SIDE,
-        TEX_LOG_TOP, TEX_STONE, CHUNK, CHUNK_BLOCKS, WorldGen,
+        Block, TEX_FLOWER_RED, TEX_FLOWER_YELLOW, TEX_GLASS, TEX_GRASS_TOP, TEX_HIGHLIGHT,
+        TEX_LOG_SIDE, TEX_LOG_TOP, TEX_STONE, CHUNK, CHUNK_BLOCKS, WorldGen,
     };
+
+    /// Every face quad must span the full 0..1 range of BOTH uv axes:
+    /// if u (or v) is constant across a quad's four corners, that face
+    /// samples only a 1D slice of its texture. This bit the ±Z sides once:
+    /// they used u=z — the face's own normal direction — so u was constant
+    /// and every north/south face rendered as flat horizontal bands while
+    /// the ±X faces looked fine ("stripy on some sides, not others").
+    /// Flower decals are the exception: each bar of the plus samples a
+    /// strip of the flower texture by design.
+    #[test]
+    fn every_face_quad_spans_both_uv_axes() {
+        let gen = WorldGen::new(1337);
+        let mut checked = 0usize;
+        for (cx, cy, cz) in [(0i32, 0, 0), (1, 0, 0), (0, 0, 1), (0, -1, 0), (2, 0, -1)] {
+            let region = region_for(&gen, cx, cy, cz);
+            let mesh = build_chunk_mesh(
+                (cx * CHUNK, cy * CHUNK, cz * CHUNK),
+                &region,
+            );
+            for (verts, label) in [
+                (&mesh.vertices, "opaque"),
+                (&mesh.water_vertices, "water"),
+            ] {
+                assert_eq!(
+                    verts.len() % (4 * VERT_STRIDE),
+                    0,
+                    "{label}: vertex count not a multiple of 4"
+                );
+                for q in verts.chunks(4 * VERT_STRIDE) {
+                    let tex = q[6] as u8;
+                    if tex == TEX_FLOWER_RED || tex == TEX_FLOWER_YELLOW {
+                        continue; // decal bars sample a strip, not a face
+                    }
+                    let axis = |k: usize| -> (f32, f32) {
+                        let mut lo = f32::INFINITY;
+                        let mut hi = f32::NEG_INFINITY;
+                        for i in 0..4usize {
+                            let v = q[i * VERT_STRIDE + k];
+                            lo = lo.min(v);
+                            hi = hi.max(v);
+                        }
+                        (lo, hi)
+                    };
+                    let (u_lo, u_hi) = axis(4);
+                    let (v_lo, v_hi) = axis(5);
+                    assert!(
+                        (u_hi - u_lo - 1.0).abs() < 1e-5,
+                        "face with tex {tex} does not span u (lo {u_lo}, hi {u_hi})"
+                    );
+                    assert!(
+                        (v_hi - v_lo - 1.0).abs() < 1e-5,
+                        "face with tex {tex} does not span v (lo {v_lo}, hi {v_hi})"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 500, "expected plenty of face quads, only saw {checked}");
+    }
 
     fn region_for(gen: &WorldGen, cx: i32, cy: i32, cz: i32) -> Vec<u8> {
         // Assemble a 26^3 region from the generator (3x3x3 chunk neighbourhood).

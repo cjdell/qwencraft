@@ -10,6 +10,14 @@
 //! Contract of every `tex_*` function (it maps ONE block face):
 //! - `uv` runs 0..1 across the face. `u` is horizontal, `v` vertical with
 //!   1 at the TOP edge (top/bottom faces use u=x, v=z).
+//! - **Vary in BOTH directions.** A face texture that is a function of
+//!   `uv.x` alone (or holds a noise argument constant) is a 1D texture in
+//!   disguise: it renders as flat stripes, and — because top/bottom faces
+//!   map u=x, v=z while sides map u=z, v=y — the stripes run in different
+//!   world directions on different faces. If a feature is genuinely
+//!   1D-ish (a ragged rim line, a label band, wood grain ALONG a board),
+//!   keep the 1D part for the edge/phase and make the *fill* 2D — see
+//!   `tex_grass_side` / `tex_log_side` / `tex_planks` in textures.wgsl.
 //! - `world` is the fragment's world position. A face lies on an integer
 //!   plane, so `floor(world)` is constant across the whole face (up to a
 //!   measure-zero boundary pixel) — that is how per-block variation works

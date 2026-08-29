@@ -67,7 +67,7 @@ writes temp files):
 
 | Command | What it does |
 |---|---|
-| `cargo test` | All host unit tests (93: world 44 incl. the terrain-pool allocator tests, client 2 — naga validation of the WGSL shader module + texture-function census, server 39, net e2e 4 incl. a wss TLS round-trip, a two-client shared-world test, and a dashboard HTTP test, net lib 4 — the map). The only place Rust tests run — **wasm tests can't execute here** (but the WGSL *is* checked here, see the client tests). |
+| `cargo test` | All host unit tests (94: world 45 incl. the terrain-pool allocator tests and the face-UV-span test, client 2 — naga validation of the WGSL shader module + texture-function census, server 39, net e2e 4 incl. a wss TLS round-trip, a two-client shared-world test, and a dashboard HTTP test, net lib 4 — the map). The only place Rust tests run — **wasm tests can't execute here** (but the WGSL *is* checked here, see the client tests). |
 | `./scripts/build.sh` | Release build → `web/dist` (wasm-bindgen 0.2.100). |
 | `./scripts/serve.sh` | Serve `web/dist` at `http://localhost:8080` (python3). |
 | `./scripts/serve.sh --https` | Same over TLS with a self-signed cert (`.certs/`, generated once via openssl). **Required for LAN play** — WebGPU needs a secure context. |
@@ -273,6 +273,17 @@ is visible on the map within one tick.
   beyond the 16³ chunk so faces at chunk borders agree with neighbors.
   There was a misalignment bug here once (dark scene); regression test
   exists — don't remove it.
+- **Every face quad spans both UV axes** (enforced by
+  `every_face_quad_spans_both_uv_axes` in mesh.rs): top/bottom use
+  u=x, v=z; sides use u = the face's *horizontal world axis* (z on ±X
+  faces, **x** on ±Z faces) and v = y (1 = top edge). There was a bug
+  where all sides used u=z: on ±Z faces z is the face's normal, so u
+  was constant and every north/south face rendered as a 1D texture in v
+  (flat horizontal bands) while the east/west faces looked fine. If you
+  touch the corner/UV code, keep that test green. (Related: every
+  `tex_*` function must vary in BOTH uv directions — a function of
+  uv.x alone is a 1D texture in disguise; see the contract in
+  `qwencraft-client/src/textures.rs`.)
 - **Actions carry their own aim**: `Action::Break/Place` include the
   click-time yaw/pitch, and the server raycasts block edits with *that*
   aim, not the agent's current one. If you add a new action that raycasts,

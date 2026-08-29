@@ -63,13 +63,17 @@ fn tex_dirt(uv: vec2<f32>, world: vec3<f32>, _time: f32) -> vec3<f32> {
 }
 
 // 1: grass side — dirt with a ragged green overhang along the top edge.
+// The rag (rim HEIGHT) varies only along u — a wavy horizontal line —
+// but the mottle inside the green must be 2D: a 1D-in-u noise made the
+// grass area read as vertical stripes.
 fn tex_grass_side(uv: vec2<f32>, world: vec3<f32>, time: f32) -> vec3<f32> {
     let dirt = tex_dirt(uv, world, time);
     let r = tex_block_rand(world, 7.0);
     let rag = tex_vnoise(vec2<f32>(uv.x * 5.0, r * 13.0));
     let h = 0.16 + 0.10 * rag;
     let rim = smoothstep(1.0 - h - 0.03, 1.0 - h, uv.y);
-    let grass = vec3<f32>(0.30, 0.56, 0.22) * (0.85 + 0.30 * tex_vnoise(vec2<f32>(uv.x * 9.0, r * 3.0)));
+    let mottle = tex_vnoise(vec2<f32>(uv.x * 9.0, uv.y * 14.0 + r * 3.0));
+    let grass = vec3<f32>(0.30, 0.56, 0.22) * (0.85 + 0.30 * mottle);
     return mix(dirt, grass, rim);
 }
 
@@ -102,11 +106,16 @@ fn tex_water(_uv: vec2<f32>, world: vec3<f32>, time: f32) -> vec3<f32> {
     return mix(base, light, ripple * 0.7);
 }
 
-// 6: log side — vertical bark stripes.
+// 6: log side — vertical bark ridges. The ridge PHASE undulates along
+// the face (2D noise) and the roughness is fully 2D: when every term is
+// a function of uv.x alone (a 1D sin plus noise with a constant second
+// argument) the whole face is a 1D texture in disguise — flat vertical
+// stripes with zero variation top-to-bottom.
 fn tex_log_side(uv: vec2<f32>, world: vec3<f32>, _time: f32) -> vec3<f32> {
     let r = tex_block_rand(world, 10.0);
-    let s = 0.5 + 0.5 * sin(uv.x * 28.0 + r * 20.0);
-    let n = tex_vnoise(vec2<f32>(uv.x * 8.0 + r * 31.0, r * 17.0));
+    let wobble = tex_vnoise(vec2<f32>(uv.x * 3.0 + r * 7.0, uv.y * 4.0 + r * 3.0));
+    let s = 0.5 + 0.5 * sin(uv.x * 28.0 + wobble * 5.0 + r * 20.0);
+    let n = tex_vnoise(vec2<f32>(uv.x * 8.0 + r * 31.0, uv.y * 6.0 + r * 17.0));
     return mix(vec3<f32>(0.32, 0.22, 0.12), vec3<f32>(0.55, 0.40, 0.24), 0.25 + 0.55 * s * 0.5 + 0.25 * n);
 }
 
@@ -169,13 +178,18 @@ fn tex_flower_yellow(uv: vec2<f32>, world: vec3<f32>, _time: f32) -> vec3<f32> {
 }
 
 // 13: planks — four rows of staggered boards with grain and seams.
+// The grain runs along the board (u) but its phase wobbles along the
+// board (v) and streak noise is 2D — a pure 1D sin(uv.x) made each row
+// read as fine stripes.
 fn tex_planks(uv: vec2<f32>, world: vec3<f32>, _time: f32) -> vec3<f32> {
     let r = tex_block_rand(world, 17.0);
     let row = floor(uv.y * 4.0);
     let y = fract(uv.y * 4.0);
     let x = fract(uv.x * 2.0 + tex_fmod(row, 2.0) * 0.5 + r);
-    let grain = 0.5 + 0.5 * sin((uv.x * 24.0 + row * 7.0 + r * 10.0) * 1.5708);
-    let base = mix(vec3<f32>(0.62, 0.45, 0.26), vec3<f32>(0.76, 0.58, 0.36), grain);
+    let wobble = tex_vnoise(vec2<f32>(uv.x * 3.0 + row * 5.0, y * 6.0 + r * 9.0));
+    let grain = 0.5 + 0.5 * sin((uv.x * 24.0 + row * 7.0 + r * 10.0) * 1.5708 + wobble * 3.0);
+    let streak = tex_vnoise(vec2<f32>(uv.x * 5.0 + row * 11.0, y * 20.0 + r * 7.0));
+    let base = mix(vec3<f32>(0.62, 0.45, 0.26), vec3<f32>(0.76, 0.58, 0.36), grain * (0.7 + 0.3 * streak));
     let seam = min(smoothstep(0.0, 0.05, x), smoothstep(0.0, 0.08, y));
     return base * (0.72 + 0.28 * seam);
 }

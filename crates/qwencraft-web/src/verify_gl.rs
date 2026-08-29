@@ -96,7 +96,8 @@ vec3 tex_grass_side(vec2 uv, vec3 world, float time) {
     float rag = tex_vnoise(vec2(uv.x * 5.0, r * 13.0));
     float h = 0.16 + 0.10 * rag;
     float rim = smoothstep(1.0 - h - 0.03, 1.0 - h, uv.y);
-    vec3 grass = vec3(0.30, 0.56, 0.22) * (0.85 + 0.30 * tex_vnoise(vec2(uv.x * 9.0, r * 3.0)));
+    float mottle = tex_vnoise(vec2(uv.x * 9.0, uv.y * 14.0 + r * 3.0));
+    vec3 grass = vec3(0.30, 0.56, 0.22) * (0.85 + 0.30 * mottle);
     return mix(dirt, grass, rim);
 }
 vec3 tex_stone(vec2 uv, vec3 world, float time) {
@@ -124,8 +125,9 @@ vec3 tex_water(vec2 uv, vec3 world, float time) {
 }
 vec3 tex_log_side(vec2 uv, vec3 world, float time) {
     float r = tex_block_rand(world, 10.0);
-    float s = 0.5 + 0.5 * sin(uv.x * 28.0 + r * 20.0);
-    float n = tex_vnoise(vec2(uv.x * 8.0 + r * 31.0, r * 17.0));
+    float wobble = tex_vnoise(vec2(uv.x * 3.0 + r * 7.0, uv.y * 4.0 + r * 3.0));
+    float s = 0.5 + 0.5 * sin(uv.x * 28.0 + wobble * 5.0 + r * 20.0);
+    float n = tex_vnoise(vec2(uv.x * 8.0 + r * 31.0, uv.y * 6.0 + r * 17.0));
     return mix(vec3(0.32, 0.22, 0.12), vec3(0.55, 0.40, 0.24), 0.25 + 0.55 * s * 0.5 + 0.25 * n);
 }
 vec3 tex_log_top(vec2 uv, vec3 world, float time) {
@@ -179,8 +181,10 @@ vec3 tex_planks(vec2 uv, vec3 world, float time) {
     float row = floor(uv.y * 4.0);
     float y = fract(uv.y * 4.0);
     float x = fract(uv.x * 2.0 + tex_fmod(row, 2.0) * 0.5 + r);
-    float grain = 0.5 + 0.5 * sin((uv.x * 24.0 + row * 7.0 + r * 10.0) * 1.5708);
-    vec3 base = mix(vec3(0.62, 0.45, 0.26), vec3(0.76, 0.58, 0.36), grain);
+    float wobble = tex_vnoise(vec2(uv.x * 3.0 + row * 5.0, y * 6.0 + r * 9.0));
+    float grain = 0.5 + 0.5 * sin((uv.x * 24.0 + row * 7.0 + r * 10.0) * 1.5708 + wobble * 3.0);
+    float streak = tex_vnoise(vec2(uv.x * 5.0 + row * 11.0, y * 20.0 + r * 7.0));
+    vec3 base = mix(vec3(0.62, 0.45, 0.26), vec3(0.76, 0.58, 0.36), grain * (0.7 + 0.3 * streak));
     float seam = min(smoothstep(0.0, 0.05, x), smoothstep(0.0, 0.08, y));
     return base * (0.72 + 0.28 * seam);
 }
