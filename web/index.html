@@ -20,6 +20,30 @@
     }
     /* Other players' name tags (positioned by the wasm layer). */
     #tags { position: fixed; inset: 0; z-index: 5; overflow: hidden; pointer-events: none; }
+    /* Hotbar: the 9 placeable-block slots, bottom-centre. Slots are built
+       by the wasm layer (the block list lives in the shared registry); the
+       selected slot gets the gold ring, the name floats above. */
+    #hotbar-wrap {
+      position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+      z-index: 10; display: flex; flex-direction: column; align-items: center; gap: 5px;
+      pointer-events: none; user-select: none;
+    }
+    #hotbar-name {
+      font: 600 13px/1.2 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      color: #fff; background: rgba(8, 10, 14, 0.62); padding: 3px 10px;
+      border-radius: 6px; text-shadow: 0 1px 2px rgba(0,0,0,0.9);
+      border: 1px solid rgba(255,255,255,0.22); min-width: 90px; text-align: center;
+    }
+    #hotbar { display: flex; gap: 4px; }
+    #hotbar .hotbar-slot {
+      width: 44px; height: 44px; border-radius: 8px;
+      border: 2px solid rgba(255, 255, 255, 0.28);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+    }
+    #hotbar .hotbar-slot.selected {
+      border-color: #ffd54a;
+      box-shadow: 0 0 12px rgba(255, 213, 74, 0.85);
+    }
     #tags .tag {
       position: absolute; transform: translate(-50%, -100%);
       font: 600 13px/1.2 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -88,13 +112,17 @@
   <div id="hud">loading…</div>
   <div id="crosshair">+</div>
   <div id="tags"></div>
+  <div id="hotbar-wrap">
+    <div id="hotbar-name"></div>
+    <div id="hotbar"></div>
+  </div>
   <div id="overlay">
     <div class="box">
       <h1>QWENCRAFT</h1>
       <div class="play">CLICK ANYWHERE TO PLAY</div>
       <p>WASD move &nbsp;·&nbsp; Space jump / swim up &nbsp;·&nbsp; Shift sprint &nbsp;·&nbsp; Mouse look</p>
       <p>F fly (Space/Shift up/down) &nbsp;·&nbsp; Q/E fly speed</p>
-      <p>Left click break &nbsp;·&nbsp; Right click place stone &nbsp;·&nbsp; Esc release mouse</p>
+      <p>Left click break &nbsp;·&nbsp; Right click place &nbsp;·&nbsp; 1-9 / wheel select block &nbsp;·&nbsp; Esc release mouse</p>
       <p>NPC load test: N spawn &nbsp;·&nbsp; C clear &nbsp;·&nbsp; I/U count ×2 ÷2 &nbsp;·&nbsp; [ ] spacing</p>
       <p>The black outline shows the block you'll break / place against</p>
       <div id="options">

@@ -14,7 +14,12 @@ pub mod pool;
 pub mod terrain;
 pub mod vec3;
 
-pub use block::Block;
+pub use block::{
+    Block, BlockInfo, BLOCKS, PLACEABLE, TEX_BRICK, TEX_COBBLE, TEX_DIRT, TEX_FLOWER_RED,
+    TEX_FLOWER_YELLOW, TEX_GLASS, TEX_GRASS_SIDE, TEX_GRASS_TOP, TEX_HIGHLIGHT, TEX_LEAVES,
+    TEX_LOG_SIDE, TEX_LOG_TOP, TEX_OBSIDIAN, TEX_PLANKS, TEX_SAND, TEX_SNOW_SIDE, TEX_SNOW_TOP,
+    TEX_STONE, TEX_TNT_SIDE, TEX_TNT_TOP, TEX_WATER,
+};
 pub use column_top::{column_top_base, column_top_edited};
 pub use noise::Noise;
 pub use pool::{Slot, TerrainPool};

@@ -2,7 +2,8 @@
 # Headless-browser test for REMOTE mode: the page connects to a standalone
 # headless server (qwencraft-net) over WebSocket and renders its world.
 #
-# - builds the qwencraft-net binary (release) if missing,
+# - builds the qwencraft-net binary (release) if missing or stale (it
+#   embeds web/dist + dashboard/dist, which cargo doesn't fingerprint),
 # - starts the headless server (single port: ws://…/ws + dashboard + game)
 #   + a static server for web/dist,
 # - runs headless Chromium with ?server=ws://127.0.0.1:PORT/ws&verify=1,
@@ -42,10 +43,24 @@ if [ ! -f web/dist/index.html ]; then
   exit 1
 fi
 
-# Headless server binary (built once, reused afterwards).
+# Headless server binary. It EMBEDS web/dist + dashboard/dist via
+# include_dir!, which cargo does not fingerprint — so if either tree is
+# newer than the binary, force a recompile of the crate (touch lib.rs)
+# before building; otherwise the server would serve stale assets, and an
+# old-protocol server silently breaks the new client ("server speaks
+# protocol N, client has N+1 — closing" → builtin fallback → the whole
+# remote scenario under test never runs).
 SRV_BIN=target/release/qwencraft-net
-if [ ! -x "$SRV_BIN" ]; then
+STALE=""
+for d in web/dist dashboard/dist; do
+  if [ -d "$d" ] && [ -n "$(find "$d" -newer "$SRV_BIN" -print -quit 2>/dev/null)" ]; then
+    STALE=1
+    break
+  fi
+done
+if [ ! -x "$SRV_BIN" ] || [ -n "$STALE" ]; then
   echo "==> building qwencraft-net (release)"
+  [ -n "$STALE" ] && touch crates/qwencraft-net/src/lib.rs
   cargo build --release -p qwencraft-net || exit 1
 fi
 
@@ -84,6 +99,33 @@ if ! grep -q "qwencraft-net: ready" "$WS_LOG" 2>/dev/null; then
   exit 1
 fi
 
+echo "==> headless chromium (remote mode, ?server=ws://127.0.0.1:${WS_PORT}/ws, ${RUN_SECS}s real time)"
+timeout "$RUN_SECS" chromium \
+  --headless \
+  --no-sandbox \
+  --disable-gpu-sandbox \
+  --enable-unsafe-webgpu \
+  --enable-unsafe-swiftshader \
+  --use-angle=swiftshader \
+  --user-data-dir="$PROF_DIR" \
+  --window-size=1280,720 \
+  --enable-logging=stderr --v=0 \
+  "http://127.0.0.1:${PORT}/?seed=${SEED}&server=ws://127.0.0.1:${WS_PORT}/ws&verify=1&taglog=1" \
+  >"$LOG" 2>&1 &
+FIRST=$!
+
+# Wait for the first browser to connect before starting the second. The
+# name-tag position assertion is only satisfiable by the FIRST player:
+# newcomers spawn 1.6 blocks in front of the existing player's view (see
+# Server::add_player), so only the existing player can see the newcomer —
+# the newcomer has the existing player behind its camera (the tag
+# projects to `None` and is hidden). Letting both browsers race to
+# connect made this check order-dependent and flaky.
+for _ in $(seq 1 150); do
+  grep -q "remote server connected" "$LOG" 2>/dev/null && break
+  sleep 0.2
+done
+
 # Second browser: joins the same shared world concurrently (a second
 # profile dir, no pixel readback — it just has to connect and be seen).
 PROF_DIR2="${TMPDIR}/qwencraft-remote-chrome-prof2"
@@ -104,20 +146,7 @@ timeout "$SECOND_SECS" chromium \
   >"$LOG2" 2>&1 &
 SECOND=$!
 
-echo "==> headless chromium (remote mode, ?server=ws://127.0.0.1:${WS_PORT}/ws, ${RUN_SECS}s real time)"
-timeout "$RUN_SECS" chromium \
-  --headless \
-  --no-sandbox \
-  --disable-gpu-sandbox \
-  --enable-unsafe-webgpu \
-  --enable-unsafe-swiftshader \
-  --use-angle=swiftshader \
-  --user-data-dir="$PROF_DIR" \
-  --window-size=1280,720 \
-  --enable-logging=stderr --v=0 \
-  "http://127.0.0.1:${PORT}/?seed=${SEED}&server=ws://127.0.0.1:${WS_PORT}/ws&verify=1&taglog=1" \
-  >"$LOG" 2>&1 || true
-
+wait "$FIRST" 2>/dev/null || true
 # Let the second browser finish (it runs shorter than the first).
 wait "$SECOND" 2>/dev/null || true
 

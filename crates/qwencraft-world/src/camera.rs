@@ -13,10 +13,10 @@ pub const FOG_START: f32 = 70.0;
 pub const FOG_END: f32 = 108.0;
 
 /// Size of the uniform block in bytes. Layout: mat4 (0..64), cam vec4
-/// (64..80), fog_start (80), fog_end (84), pad (88..96), sky vec4
-/// (96..112). All 16-byte-aligned WGSL types — no hidden padding, exactly
-/// 112 bytes (must match the WGSL `Uniforms` struct in the client's
-/// `shader.rs`).
+/// (64..80), fog_start (80), fog_end (84), time vec2 (88..96; x = seconds,
+/// used by the water texture), sky vec4 (96..112). All 16-byte-aligned
+/// WGSL types — no hidden padding, exactly 112 bytes (must match the WGSL
+/// `Uniforms` struct in the client's `shader.rs`).
 pub const UNIFORM_SIZE: u64 = 112;
 
 /// View direction for the server's yaw/pitch convention
@@ -124,12 +124,15 @@ pub fn view_projection(
     mul4(&projection_matrix(aspect, fov_y, near, far), &view_matrix(cam, yaw, pitch))
 }
 
-/// Serialize the uniform block to little-endian bytes.
+/// Serialize the uniform block to little-endian bytes. `time` is the wall
+/// clock in seconds (the water texture ripples with it; pass 0.0 for
+/// still water).
 pub fn uniform_bytes(
     view_proj: &[f32; 16],
     cam: [f32; 3],
     fog_start: f32,
     fog_end: f32,
+    time: f32,
     sky: [f32; 3],
 ) -> [u8; UNIFORM_SIZE as usize] {
     let mut out = [0u8; UNIFORM_SIZE as usize];
@@ -148,8 +151,8 @@ pub fn uniform_bytes(
     push(&mut o, 0.0); // cam.w
     push(&mut o, fog_start);
     push(&mut o, fog_end);
-    push(&mut o, 0.0); // pad x
-    push(&mut o, 0.0); // pad y
+    push(&mut o, time); // time.x
+    push(&mut o, 0.0); // time.y (unused)
     for v in sky {
         push(&mut o, v);
     }
@@ -262,7 +265,7 @@ mod tests {
     #[test]
     fn uniform_layout() {
         let vp = [0.5f32; 16];
-        let b = uniform_bytes(&vp, [1.0, 2.0, 3.0], 70.0, 108.0, [0.5, 0.6, 0.7]);
+        let b = uniform_bytes(&vp, [1.0, 2.0, 3.0], 70.0, 108.0, 12.5, [0.5, 0.6, 0.7]);
         assert_eq!(b.len(), 112);
         // cam at 64
         assert_eq!(&b[64..68], &1.0f32.to_le_bytes());
@@ -272,8 +275,9 @@ mod tests {
         // fog at 80 / 84
         assert_eq!(&b[80..84], &70.0f32.to_le_bytes());
         assert_eq!(&b[84..88], &108.0f32.to_le_bytes());
-        // pad at 88..96
-        assert!(b[88..96].iter().all(|&x| x == 0));
+        // time at 88 (x = seconds, y unused)
+        assert_eq!(&b[88..92], &12.5f32.to_le_bytes());
+        assert_eq!(&b[92..96], &0.0f32.to_le_bytes());
         // sky at 96
         assert_eq!(&b[96..100], &0.5f32.to_le_bytes());
         assert_eq!(&b[100..104], &0.6f32.to_le_bytes());

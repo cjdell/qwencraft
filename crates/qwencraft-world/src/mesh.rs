@@ -3,24 +3,35 @@
 //! Per chunk we compute:
 //! - voxel sky light (BFS flood fill from the sky, attenuating by 1 per step)
 //! - per-vertex ambient occlusion from the three corner neighbour blocks
-//! - face culling (only faces adjacent to air are emitted)
+//! - face culling (only faces adjacent to non-solid are emitted)
 //!
-//! Vertex colours are fully baked on the CPU: block base colour * face
-//! shading * light * AO. The GPU shader only applies distance fog.
+//! The GPU samples each block's procedural texture in the fragment stage
+//! (the texture id is a per-vertex attribute, see `qwencraft_world::block`),
+//! so what is baked on the CPU is: world position, a **light scalar**
+//! (sky light * face shading * AO) that multiplies the texture, the face
+//! UV (0..1 across the face) and the texture id. The shader also applies
+//! distance fog.
+//!
+//! Vertex layout (7 floats, 28 bytes): `[x, y, z, light, u, v, tex]`.
+//! `u` is horizontal across the face, `v` vertical with 1 at the top edge
+//! (top/bottom faces use u=x, v=z); `tex` is a `TEX_*` id.
 
-use crate::{Block, REGION};
+use crate::{Block, REGION, TEX_HIGHLIGHT};
 
 const R: usize = REGION as usize; // 26
 const MARGIN: i32 = 5;
 
-/// A built chunk mesh (positions + baked colours, u32 indices).
+/// Vertex stride in floats (see the module docs for the layout).
+pub const VERT_STRIDE: usize = 7;
+
+/// A built chunk mesh (positions + baked light + UV + texture id, u32 indices).
 pub struct MeshData {
-    /// Interleaved [x, y, z, r, g, b] in world space (opaque terrain +
-    /// flower decals).
+    /// Interleaved [x, y, z, light, u, v, tex] in world space (opaque
+    /// terrain + flower decals).
     pub vertices: Vec<f32>,
     pub indices: Vec<u32>,
-    /// Water: separate geometry, drawn with a translucent pipeline after
-    /// all opaque geometry.
+    /// Translucent geometry (water + glass): separate, drawn with a
+    /// translucent pipeline after all opaque geometry.
     pub water_vertices: Vec<f32>,
     pub water_indices: Vec<u32>,
 }
@@ -134,7 +145,8 @@ pub fn build_chunk_mesh(origin: (i32, i32, i32), data: &[u8]) -> MeshData {
 
                 // Water: translucent, separate pass. Faces are only emitted
                 // against *air* (never against water or solid), and the top
-                // surface sits slightly below the cell top.
+                // surface sits slightly below the cell top. The texture
+                // (rippling with world position + time) is sampled on the GPU.
                 if b == Block::Water {
                     let air = |x: i32, y: i32, z: i32| -> bool {
                         (0..R as i32).contains(&x)
@@ -146,83 +158,84 @@ pub fn build_chunk_mesh(origin: (i32, i32, i32), data: &[u8]) -> MeshData {
                     let wy = (origin.1 + ry - MARGIN) as f32;
                     let wz = (origin.2 + rz - MARGIN) as f32;
                     let top_h = if air(rx, ry + 1, rz) { 0.875 } else { 1.0 };
-                    let shaded = |li: usize, base: [f32; 3], shade: f32| -> [f32; 3] {
-                        let f = 0.38 + 0.62 * (light[li] as f32 / 15.0);
-                        [base[0] * f * shade, base[1] * f * shade, base[2] * f * shade]
+                    let light_of = |li: usize, shade: f32| -> f32 {
+                        (0.38 + 0.62 * (light[li] as f32 / 15.0)) * shade
                     };
                     // Top (only against air).
                     if air(rx, ry + 1, rz) {
-                        let c = shaded(idx(rx, ry + 1, rz), b.color_top(), 1.0);
+                        let l = light_of(idx(rx, ry + 1, rz), 1.0);
                         push_quad(
                             &mut water_vertices,
                             &mut water_indices,
                             &[
-                                (wx, wy + top_h, wz),
-                                (wx, wy + top_h, wz + 1.0),
-                                (wx + 1.0, wy + top_h, wz + 1.0),
-                                (wx + 1.0, wy + top_h, wz),
+                                (wx, wy + top_h, wz, 0.0, 0.0),
+                                (wx, wy + top_h, wz + 1.0, 0.0, 1.0),
+                                (wx + 1.0, wy + top_h, wz + 1.0, 1.0, 1.0),
+                                (wx + 1.0, wy + top_h, wz, 1.0, 0.0),
                             ],
-                            c,
+                            [l; 4],
+                            b.tex_for_dir(0),
                         );
                     }
                     // Bottom (a cave under the lake).
                     if air(rx, ry - 1, rz) {
-                        let c = shaded(idx(rx, ry - 1, rz), b.color_bottom(), 0.55);
+                        let l = light_of(idx(rx, ry - 1, rz), 0.55);
                         push_quad(
                             &mut water_vertices,
                             &mut water_indices,
                             &[
-                                (wx, wy, wz + 1.0),
-                                (wx, wy, wz),
-                                (wx + 1.0, wy, wz),
-                                (wx + 1.0, wy, wz + 1.0),
+                                (wx, wy, wz + 1.0, 0.0, 1.0),
+                                (wx, wy, wz, 0.0, 0.0),
+                                (wx + 1.0, wy, wz, 1.0, 0.0),
+                                (wx + 1.0, wy, wz + 1.0, 1.0, 1.0),
                             ],
-                            c,
+                            [l; 4],
+                            b.tex_for_dir(1),
                         );
                     }
                     // Sides (only against air; the top edge follows the
-                    // water surface).
+                    // water surface). Side UVs: u = z, v = y (0 at bottom).
                     for (nx, nz, face) in [(1i32, 0i32, 2u32), (-1, 0, 3), (0, 1, 4), (0, -1, 5)] {
                         if air(rx + nx, ry, rz + nz) {
-                            let c = shaded(
+                            let l = light_of(
                                 idx(rx + nx, ry, rz + nz),
-                                b.color_side(),
                                 match face {
                                     2 | 3 => 0.82,
                                     _ => 0.7,
                                 },
                             );
-                            let corners: [(f32, f32, f32); 4] = match face {
+                            let corners: [(f32, f32, f32, f32, f32); 4] = match face {
                                 2 => [
-                                    (wx + 1.0, wy, wz + 1.0),
-                                    (wx + 1.0, wy, wz),
-                                    (wx + 1.0, wy + top_h, wz),
-                                    (wx + 1.0, wy + top_h, wz + 1.0),
+                                    (wx + 1.0, wy, wz + 1.0, 1.0, 0.0),
+                                    (wx + 1.0, wy, wz, 0.0, 0.0),
+                                    (wx + 1.0, wy + top_h, wz, 0.0, 1.0),
+                                    (wx + 1.0, wy + top_h, wz + 1.0, 1.0, 1.0),
                                 ],
                                 3 => [
-                                    (wx, wy, wz),
-                                    (wx, wy, wz + 1.0),
-                                    (wx, wy + top_h, wz + 1.0),
-                                    (wx, wy + top_h, wz),
+                                    (wx, wy, wz, 0.0, 0.0),
+                                    (wx, wy, wz + 1.0, 1.0, 0.0),
+                                    (wx, wy + top_h, wz + 1.0, 1.0, 1.0),
+                                    (wx, wy + top_h, wz, 0.0, 1.0),
                                 ],
                                 4 => [
-                                    (wx, wy, wz + 1.0),
-                                    (wx + 1.0, wy, wz + 1.0),
-                                    (wx + 1.0, wy + top_h, wz + 1.0),
-                                    (wx, wy + top_h, wz + 1.0),
+                                    (wx, wy, wz + 1.0, 0.0, 0.0),
+                                    (wx + 1.0, wy, wz + 1.0, 1.0, 0.0),
+                                    (wx + 1.0, wy + top_h, wz + 1.0, 1.0, 1.0),
+                                    (wx, wy + top_h, wz + 1.0, 0.0, 1.0),
                                 ],
                                 _ => [
-                                    (wx, wy + top_h, wz),
-                                    (wx + 1.0, wy + top_h, wz),
-                                    (wx + 1.0, wy, wz),
-                                    (wx, wy, wz),
+                                    (wx, wy + top_h, wz, 0.0, 1.0),
+                                    (wx + 1.0, wy + top_h, wz, 1.0, 1.0),
+                                    (wx + 1.0, wy, wz, 1.0, 0.0),
+                                    (wx, wy, wz, 0.0, 0.0),
                                 ],
                             };
                             push_quad(
                                 &mut water_vertices,
                                 &mut water_indices,
                                 &corners,
-                                c,
+                                [l; 4],
+                                b.tex_for_dir(2),
                             );
                         }
                     }
@@ -230,34 +243,37 @@ pub fn build_chunk_mesh(origin: (i32, i32, i32), data: &[u8]) -> MeshData {
                 }
 
                 // Flowers: opaque plus-shaped decals on top of the cell.
-                if b == Block::FlowerRed || b == Block::FlowerYellow {
+                // Each bar of the plus samples a strip through the middle of
+                // the flower texture (the two bars overlap at the centre;
+                // identical pixels, so the double draw is invisible).
+                if b.is_flower() {
                     let wx = (origin.0 + rx - MARGIN) as f32;
                     let wy = (origin.1 + ry - MARGIN) as f32 + 0.03;
                     let wz = (origin.2 + rz - MARGIN) as f32;
-                    let f = 0.38 + 0.62 * (light[idx(rx, ry, rz)] as f32 / 15.0);
-                    let base = b.color_top();
-                    let c = [base[0] * f, base[1] * f, base[2] * f];
+                    let l = 0.38 + 0.62 * (light[idx(rx, ry, rz)] as f32 / 15.0);
                     push_quad(
                         &mut vertices,
                         &mut indices,
                         &[
-                            (wx + 0.19, wy, wz + 0.56),
-                            (wx + 0.81, wy, wz + 0.56),
-                            (wx + 0.81, wy, wz + 0.44),
-                            (wx + 0.19, wy, wz + 0.44),
+                            (wx + 0.19, wy, wz + 0.56, 0.0, 0.58),
+                            (wx + 0.81, wy, wz + 0.56, 1.0, 0.58),
+                            (wx + 0.81, wy, wz + 0.44, 1.0, 0.42),
+                            (wx + 0.19, wy, wz + 0.44, 0.0, 0.42),
                         ],
-                        c,
+                        [l; 4],
+                        b.tex_for_dir(0),
                     );
                     push_quad(
                         &mut vertices,
                         &mut indices,
                         &[
-                            (wx + 0.44, wy, wz + 0.19),
-                            (wx + 0.44, wy, wz + 0.81),
-                            (wx + 0.56, wy, wz + 0.81),
-                            (wx + 0.56, wy, wz + 0.19),
+                            (wx + 0.44, wy, wz + 0.19, 0.42, 0.0),
+                            (wx + 0.44, wy, wz + 0.81, 0.42, 1.0),
+                            (wx + 0.56, wy, wz + 0.81, 0.58, 1.0),
+                            (wx + 0.56, wy, wz + 0.19, 0.58, 0.0),
                         ],
-                        c,
+                        [l; 4],
+                        b.tex_for_dir(0),
                     );
                     continue;
                 }
@@ -265,6 +281,15 @@ pub fn build_chunk_mesh(origin: (i32, i32, i32), data: &[u8]) -> MeshData {
                 if !b.is_solid() {
                     continue;
                 }
+
+                // Glass is solid but translucent: its faces go to the
+                // translucent sub-mesh (drawn after all opaque geometry with
+                // blending and no depth writes), like water.
+                let (out_v, out_i) = if b.is_translucent() {
+                    (&mut water_vertices, &mut water_indices)
+                } else {
+                    (&mut vertices, &mut indices)
+                };
 
                 for face in 0..6 {
                     // face: 0:+Y 1:-Y 2:+X 3:-X 4:+Z 5:-Z
@@ -283,11 +308,7 @@ pub fn build_chunk_mesh(origin: (i32, i32, i32), data: &[u8]) -> MeshData {
                         continue; // hidden face
                     }
 
-                    let base_color = match face {
-                        0 => b.color_top(),
-                        1 => b.color_bottom(),
-                        _ => b.color_side(),
-                    };
+                    let tex = b.tex_for_dir(face as u8);
                     let face_shade = match face {
                         0 => 1.0,
                         1 => 0.55,
@@ -306,33 +327,32 @@ pub fn build_chunk_mesh(origin: (i32, i32, i32), data: &[u8]) -> MeshData {
                         _ => [(0, 1, 0), (1, 1, 0), (1, 0, 0), (0, 0, 0)],
                     };
 
-                    let start = vertices.len() as u32 / 6;
-                    for corner in corners {
-                        // Ambient occlusion: the 3 blocks around this corner
-                        // in the face plane. Corner direction along each
-                        // tangent axis: +1 if the corner is on the + side.
+                    // Ambient occlusion per corner: the 3 blocks around the
+                    // corner in the face plane. Baked as a light scalar that
+                    // multiplies the (GPU-sampled) texture colour.
+                    let mut lights = [0.0f32; 4];
+                    let mut out_corners: [(f32, f32, f32, f32, f32); 4] = [(0.0, 0.0, 0.0, 0.0, 0.0); 4];
+                    for (i, corner) in corners.iter().enumerate() {
                         let signs = (corner.0 * 2 - 1, corner.1 * 2 - 1, corner.2 * 2 - 1);
                         let (s1, s2, sc) = ao_corners(fx, fy, fz, signs, face, &solid);
                         let ao = if s1 && s2 { 0 } else { 3 - s1 as u8 - s2 as u8 - sc as u8 };
                         let ao_f = [0.45f32, 0.62, 0.82, 1.0][ao as usize];
-
-                        let mut br = light_f * face_shade * ao_f;
-                        br = br.min(1.0);
+                        lights[i] = (light_f * face_shade * ao_f).min(1.0);
                         // rx/ry/rz are region-local (core starts at MARGIN);
                         // convert to chunk-local before adding the origin.
                         let wx = origin.0 + rx - MARGIN + corner.0;
                         let wy = origin.1 + ry - MARGIN + corner.1;
                         let wz = origin.2 + rz - MARGIN + corner.2;
-                        vertices.extend_from_slice(&[
-                            wx as f32,
-                            wy as f32,
-                            wz as f32,
-                            (base_color[0] * br).min(1.0),
-                            (base_color[1] * br).min(1.0),
-                            (base_color[2] * br).min(1.0),
-                        ]);
+                        // Face UVs: top/bottom use u=x, v=z; sides use
+                        // u=z, v=y (1 = top edge — the grass overhang rim
+                        // and the TNT label band live there).
+                        let (u, v) = match face {
+                            0 | 1 => (corner.0 as f32, corner.2 as f32),
+                            _ => (corner.2 as f32, corner.1 as f32),
+                        };
+                        out_corners[i] = (wx as f32, wy as f32, wz as f32, u, v);
                     }
-                    indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+                    push_quad(out_v, out_i, &out_corners, lights, tex);
                 }
             }
         }
@@ -348,16 +368,19 @@ pub fn build_chunk_mesh(origin: (i32, i32, i32), data: &[u8]) -> MeshData {
 
 /// Wireframe cube (24 vertices, 12 line segments) around block `t`,
 /// inflated by 0.001 so the lines sit just outside the solid faces (no
-/// z-fighting). Vertex layout: [x, y, z, r, g, b] (same as chunk meshes).
-/// Drawn with a line-list pipeline (client) / `gl.LINES` (shadow renderer).
+/// z-fighting). Vertex layout: [x, y, z, light, u, v, tex] (same as chunk
+/// meshes) with light = 1 and `tex` = `TEX_HIGHLIGHT` (a constant dark
+/// colour in the texture dispatch). Drawn with a line-list pipeline
+/// (client) / `gl.LINES` (shadow renderer).
 pub fn highlight_vertices(t: (i32, i32, i32)) -> Vec<f32> {
-    const C: [f32; 3] = [0.03, 0.03, 0.03];
     let (x, y, z) = (t.0 as f32 + 0.5, t.1 as f32 + 0.5, t.2 as f32 + 0.5);
     let h = 0.501f32;
-    let mut out = Vec::with_capacity(24 * 6);
+    let mut out = Vec::with_capacity(24 * VERT_STRIDE);
     let c = |dx: f32, dy: f32, dz: f32| (x + dx, y + dy, z + dz);
     let seg = |out: &mut Vec<f32>, a: (f32, f32, f32), b: (f32, f32, f32)| {
-        out.extend_from_slice(&[a.0, a.1, a.2, C[0], C[1], C[2], b.0, b.1, b.2, C[0], C[1], C[2]]);
+        for p in [a, b] {
+            out.extend_from_slice(&[p.0, p.1, p.2, 1.0, 0.0, 0.0, TEX_HIGHLIGHT as f32]);
+        }
     };
     // Bottom square.
     seg(&mut out, c(-h, -h, -h), c(h, -h, -h));
@@ -377,30 +400,30 @@ pub fn highlight_vertices(t: (i32, i32, i32)) -> Vec<f32> {
     out
 }
 
-/// One convex quad (CCW as seen from outside) with a baked colour.
+/// One convex quad (CCW as seen from outside): per-corner position + face
+/// UV, per-corner light scalar, one texture id for the whole face.
 fn push_quad(
     verts: &mut Vec<f32>,
     idxs: &mut Vec<u32>,
-    corners: &[(f32, f32, f32); 4],
-    c: [f32; 3],
+    corners: &[(f32, f32, f32, f32, f32); 4],
+    lights: [f32; 4],
+    tex: u8,
 ) {
-    let start = verts.len() as u32 / 6;
-    for (px, py, pz) in corners {
+    let start = verts.len() as u32 / VERT_STRIDE as u32;
+    for ((px, py, pz, u, v), l) in corners.iter().zip(lights.iter()) {
         verts.extend_from_slice(&[
             *px,
             *py,
             *pz,
-            c[0].min(1.0),
-            c[1].min(1.0),
-            c[2].min(1.0),
+            l.min(1.0),
+            *u,
+            *v,
+            tex as f32,
         ]);
     }
     idxs.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
 }
 
-/// For a face corner, evaluate the two side blocks and the corner block in
-/// the face plane. `signs` are the corner directions along the two tangent
-/// axes (each -1 or +1).
 /// For a face corner, evaluate the two side blocks and the corner block in
 /// the face plane. `signs` are the corner directions along the two tangent
 /// axes (per world axis, each -1 or +1; 0 on the normal axis).
@@ -441,7 +464,10 @@ fn ao_corners(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CHUNK, CHUNK_BLOCKS, WorldGen};
+    use crate::{
+        Block, TEX_FLOWER_RED, TEX_GLASS, TEX_GRASS_TOP, TEX_HIGHLIGHT, TEX_LOG_SIDE,
+        TEX_LOG_TOP, TEX_STONE, CHUNK, CHUNK_BLOCKS, WorldGen,
+    };
 
     fn region_for(gen: &WorldGen, cx: i32, cy: i32, cz: i32) -> Vec<u8> {
         // Assemble a 26^3 region from the generator (3x3x3 chunk neighbourhood).
@@ -467,14 +493,18 @@ mod tests {
         let region = region_for(&gen, cx, cy, cz);
         let mesh = build_chunk_mesh((0, 0, 0), &region);
         assert!(!mesh.is_empty(), "terrain chunk should produce faces");
-        assert_eq!(mesh.vertices.len() % 6, 0);
-        let vcount = mesh.vertices.len() as u32 / 6;
+        assert_eq!(mesh.vertices.len() % VERT_STRIDE, 0);
+        let vcount = mesh.vertices.len() as u32 / VERT_STRIDE as u32;
         assert!((mesh.indices.iter().copied().max().unwrap() as usize) < vcount as usize);
-        // Vertex colours (last 3 components) should be in [0,1].
-        for v in mesh.vertices.chunks(6) {
-            for c in &v[3..6] {
-                assert!((*c) >= 0.0 && (*c) <= 1.0, "colour out of range: {c}");
-            }
+        // Per-vertex attributes: light in [0,1], UV in [0,1], tex a valid id.
+        for v in mesh.vertices.chunks(VERT_STRIDE) {
+            assert!((0.0..=1.0).contains(&v[3]), "light out of range: {v:?}");
+            assert!((0.0..=1.0).contains(&v[4]), "uv.x out of range: {v:?}");
+            assert!((0.0..=1.0).contains(&v[5]), "uv.y out of range: {v:?}");
+            assert!(
+                (v[6] as usize) <= TEX_HIGHLIGHT as usize,
+                "unknown texture id: {v:?}"
+            );
         }
         let _ = CHUNK_BLOCKS;
     }
@@ -482,15 +512,15 @@ mod tests {
     #[test]
     fn highlight_is_a_24_vertex_cube_around_the_block() {
         let v = highlight_vertices((3, 4, 5));
-        assert_eq!(v.len(), 24 * 6);
-        // Every corner must hug the block (3..6) from just outside.
-        for c in v.chunks(6) {
+        assert_eq!(v.len(), 24 * VERT_STRIDE);
+        // Every corner must hug the block (3..6) from just outside, with
+        // full light and the highlight texture id.
+        for c in v.chunks(VERT_STRIDE) {
             assert!((2.99..6.01).contains(&c[0]), "x {} out of range", c[0]);
             assert!((2.99..6.01).contains(&c[1]), "y {} out of range", c[1]);
             assert!((2.99..6.01).contains(&c[2]), "z {} out of range", c[2]);
-            for col in &c[3..6] {
-                assert!((0.0..=1.0).contains(col));
-            }
+            assert_eq!(c[3], 1.0, "highlight light must be full");
+            assert_eq!(c[6], TEX_HIGHLIGHT as f32, "highlight tex id");
         }
     }
 
@@ -516,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_top_faces_are_bright_green_at_full_light() {
+    fn surface_top_faces_carry_full_light_and_grass_texture() {
         // Regression test: chunk vertices must be placed at
         // `origin + chunk-local`, not offset by the region margin. A +MARGIN
         // offset shifts every chunk's geometry and leaves players inside
@@ -529,17 +559,109 @@ mod tests {
         // The top face of the surface block at (8, h, 8) has corners at
         // y = h + 1, x in 8..10, z in 8..10.
         let mut found = 0u32;
-        for v in mesh.vertices.chunks(6) {
+        for v in mesh.vertices.chunks(VERT_STRIDE) {
             if v[1] == (h + 1) as f32 && (8.0..10.0).contains(&v[0]) && (8.0..10.0).contains(&v[2]) {
                 found += 1;
-                // Full sky light + top face + no AO => exactly the grass top
-                // colour (0.36, 0.65, 0.28).
-                assert!((v[3] - 0.36).abs() < 0.01, "r={} at {v:?}", v[3]);
-                assert!((v[4] - 0.65).abs() < 0.01, "g={} at {v:?}", v[4]);
-                assert!((v[5] - 0.28).abs() < 0.01, "b={} at {v:?}", v[5]);
+                // Full sky light + top face + no AO => light exactly 1.0,
+                // and the grass-top texture (the GPU samples it).
+                assert!((v[3] - 1.0).abs() < 1e-6, "light={} at {v:?}", v[3]);
+                assert_eq!(v[6], TEX_GRASS_TOP as f32, "tex at {v:?}");
             }
         }
         assert!(found >= 4, "expected the grass top face at spawn, found {found} corners");
+    }
+
+    /// A synthetic all-air region with one block of `b` at region-local
+    /// (13, 13, 13) (inside the 16^3 core, 5..21).
+    fn single_block_region(b: Block) -> Vec<u8> {
+        let mut region = vec![0u8; R * R * R];
+        region[idx(13, 13, 13)] = b.as_u8();
+        region
+    }
+
+    /// Face count of a mesh (each face = 4 vertices = 6 indices).
+    fn face_count(vertices: &[f32], indices: &[u32]) -> (u32, u32) {
+        (indices.len() as u32 / 6, vertices.len() as u32 / VERT_STRIDE as u32 / 4)
+    }
+
+    #[test]
+    fn glass_emits_faces_only_where_neighbour_is_not_solid() {
+        // A lone glass block: all 6 faces, all in the TRANSLUCENT sub-mesh
+        // (drawn after opaque with blending, no depth writes).
+        let mesh = build_chunk_mesh((0, 0, 0), &single_block_region(Block::Glass));
+        let (opaque_faces, _) = face_count(&mesh.vertices, &mesh.indices);
+        let (trans_faces, _) = face_count(&mesh.water_vertices, &mesh.water_indices);
+        assert_eq!(opaque_faces, 0, "glass has no opaque geometry");
+        assert_eq!(trans_faces, 6, "lone glass block shows all 6 faces");
+        assert_eq!(mesh.water_vertices.len() / VERT_STRIDE, 24);
+        // Every translucent vertex carries the glass texture id.
+        for v in mesh.water_vertices.chunks(VERT_STRIDE) {
+            assert_eq!(v[6], TEX_GLASS as f32);
+        }
+        // Glass against stone: the shared face is culled (stone is solid).
+        let mut region = single_block_region(Block::Glass);
+        region[idx(14, 13, 13)] = Block::Stone.as_u8();
+        let mesh = build_chunk_mesh((0, 0, 0), &region);
+        let (trans_faces, _) = face_count(&mesh.water_vertices, &mesh.water_indices);
+        assert_eq!(trans_faces, 5, "glass-stone face must be culled");
+        // Glass against glass: same rule (Minecraft-style).
+        let mut region = single_block_region(Block::Glass);
+        region[idx(14, 13, 13)] = Block::Glass.as_u8();
+        let mesh = build_chunk_mesh((0, 0, 0), &region);
+        let (trans_faces, _) = face_count(&mesh.water_vertices, &mesh.water_indices);
+        assert_eq!(trans_faces, 10, "glass-glass face must be culled");
+    }
+
+    #[test]
+    fn flower_decals_sample_the_flower_texture() {
+        let mesh = build_chunk_mesh((0, 0, 0), &single_block_region(Block::FlowerRed));
+        // Two quads (the plus), opaque pass, flower texture, UVs inside the
+        // two middle strips of the texture.
+        assert_eq!(mesh.indices.len(), 12);
+        assert!(mesh.water_indices.is_empty());
+        for v in mesh.vertices.chunks(VERT_STRIDE) {
+            assert_eq!(v[6], TEX_FLOWER_RED as f32);
+            // Each bar samples a strip: one of the UV axes is full [0,1],
+            // the other stays in the middle band [0.42, 0.58].
+            let (u, w) = (v[4], v[5]);
+            assert!((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&w));
+            assert!(
+                (0.42..=0.58).contains(&u) || (0.42..=0.58).contains(&w),
+                "one UV axis must stay in the flower strip: {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn solid_block_faces_carry_their_face_textures() {
+        // Log: top/bottom are the ring texture, sides are the bark texture.
+        let mesh = build_chunk_mesh((0, 0, 0), &single_block_region(Block::Log));
+        let mut tops = 0;
+        let mut sides = 0;
+        for v in mesh.vertices.chunks(VERT_STRIDE) {
+            match v[6] as u8 {
+                TEX_LOG_TOP => tops += 1,
+                TEX_LOG_SIDE => sides += 1,
+                other => panic!("unexpected texture {other} on log vertex {v:?}"),
+            }
+        }
+        // 2 ring faces * 4 verts + 4 bark faces * 4 verts.
+        assert_eq!((tops, sides), (8, 16));
+        // Stone: everything is the stone texture.
+        let mesh = build_chunk_mesh((0, 0, 0), &single_block_region(Block::Stone));
+        for v in mesh.vertices.chunks(VERT_STRIDE) {
+            assert_eq!(v[6], TEX_STONE as f32);
+        }
+    }
+
+    #[test]
+    fn water_stays_in_the_translucent_pass() {
+        let mesh = build_chunk_mesh((0, 0, 0), &single_block_region(Block::Water));
+        assert!(mesh.vertices.is_empty(), "water has no opaque geometry");
+        assert!(!mesh.water_vertices.is_empty(), "water must be translucent geometry");
+        for v in mesh.water_vertices.chunks(VERT_STRIDE) {
+            assert_eq!(v[6], crate::TEX_WATER as f32);
+        }
     }
 
 }

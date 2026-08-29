@@ -210,6 +210,35 @@ async fn end_to_end_single_player() {
         s.chunk_positions
     );
 
+    // 4b) Place with a selected block (protocol v4: the action carries the
+    // block id; the server validates it and re-sends the edited chunk).
+    // Aim down-forward at the ground in front of the standing player.
+    let placed_chunk = feet_chunk(&p);
+    send(
+        &mut sock,
+        &ClientMsg::Action(qwencraft_server::Action::Place {
+            yaw: p.yaw,
+            pitch: -0.7,
+            block: 11, // planks (a placeable id)
+        }),
+    );
+    // 4c) An invalid block id must be ignored: no crash, no edit.
+    send(
+        &mut sock,
+        &ClientMsg::Action(qwencraft_server::Action::Place {
+            yaw: p.yaw,
+            pitch: -0.7,
+            block: 250,
+        }),
+    );
+    let s = sample(&mut sock, 3.0);
+    assert!(s.player.is_some(), "server must stay alive after an invalid place");
+    assert!(
+        s.chunk_positions.contains(&placed_chunk),
+        "placed chunk region must be re-sent (got {} chunks)",
+        s.chunks
+    );
+
     // 5) The NPC load dial: set it and watch it take effect.
     send(&mut sock, &ClientMsg::SetNpcLoad { count: 8, spacing: 8.0 });
     let s = sample(&mut sock, 1.5);

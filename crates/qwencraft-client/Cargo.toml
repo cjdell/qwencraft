@@ -18,3 +18,12 @@ web-sys = {
     # feature unification from qwencraft-web).
     features = ["console", "HtmlCanvasElement", "Navigator", "Window"],
 }
+
+# Host-side WGSL validation (tests/wgsl_valid.rs). naga is wgpu's shader
+# front-end — the same family Dawn (browser WebGPU) uses — so the shader
+# module can be type-checked in `cargo test` without a browser. (naga-rs
+# is a hair more lenient than Dawn in one known case: it accepts a
+# two-arg `atan(y, x)`, which Dawn rejects — see textures.wgsl. The
+# browser tests remain the final authority.)
+[dev-dependencies]
+naga = { version = "27.0.3", features = ["wgsl-in"] }

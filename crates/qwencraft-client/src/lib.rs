@@ -1,9 +1,21 @@
 //! WebGPU (wgpu) renderer for Qwencraft.
 //!
-//! Chunks are meshed on the CPU (voxel lighting + AO baked into vertex
-//! colours, see `qwencraft_world::mesh`) and uploaded as static buffers;
-//! agents are spheres re-uploaded each frame. One shared pipeline renders
-//! everything (pos+colour vertices, distance fog in the fragment stage).
+//! Chunks are meshed on the CPU (world position + baked light scalar
+//! (voxel lighting + AO) + face UV + texture id, see
+//! `qwencraft_world::mesh`) and uploaded as static buffers; the fragment
+//! stage samples each block's procedural texture (see `textures.rs`).
+//! Agents are spheres with baked per-vertex colour, re-uploaded each
+//! frame.
+//!
+//! Pipelines:
+//! - `pipeline`: opaque terrain (`fs_main`), vertex layout [pos, light,
+//!   uv, tex] (7 floats);
+//! - `water_pipeline`: translucent pass for water + glass (`fs_water`,
+//!   per-texture alpha, src-alpha blend, no depth writes), same layout;
+//! - `line_pipeline`: the block highlight wireframe (`fs_main`, same
+//!   layout, line list, no cull);
+//! - `agent_pipeline`: agent spheres (`fs_agent`, the old pos+colour
+//!   layout — spheres are not blocks).
 //!
 //! This crate only compiles for wasm32 (WebGPU in the browser).
 
@@ -11,8 +23,14 @@
 
 mod shader;
 mod sphere;
+mod textures;
 
 use shader::SHADER;
+use textures::TEXTURES;
+
+/// Terrain vertex stride in bytes: [pos(3), light(1), uv(2), tex(1)]
+/// (must match `qwencraft_world::mesh::VERT_STRIDE`).
+const TERRAIN_VERTEX_STRIDE: u64 = 28;
 
 use wgpu::{
     Buffer, BufferUsages, Device, DeviceDescriptor, Instance, InstanceDescriptor, PipelineLayout,
@@ -69,13 +87,13 @@ impl TerrainChunk {
     /// the opaque part in both buffers, so the slot is contiguous).
     fn slot(&self) -> Slot {
         let (wv, wi) = match &self.water {
-            Some((w, i)) => (w.len() as u32 / 6, i.len() as u32),
+            Some((w, i)) => (w.len() as u32 / 7, i.len() as u32),
             None => (0, 0),
         };
         Slot {
             base_v: self.base_v,
             base_i: self.base_i,
-            v_count: self.verts.len() as u32 / 6 + wv,
+            v_count: self.verts.len() as u32 / 7 + wv,
             i_count: self.idxs.len() as u32 + wi,
         }
     }
@@ -96,11 +114,13 @@ pub struct Renderer {
     surface: Surface<'static>,
     surface_format: TextureFormat,
     pipeline: RenderPipeline,
-    /// Translucent water pipeline (src-alpha blend, no depth writes);
-    /// drawn after all opaque geometry.
+    /// Translucent pipeline (water + glass; src-alpha blend, per-texture
+    /// alpha, no depth writes); drawn after all opaque geometry.
     water_pipeline: RenderPipeline,
     /// Wireframe pipeline for the block highlight (line list, no cull).
     line_pipeline: RenderPipeline,
+    /// Agent-sphere pipeline (baked pos+colour vertices, `fs_agent`).
+    agent_pipeline: RenderPipeline,
     /// 24-vertex wireframe cube, re-uploaded when the target changes.
     highlight_vbo: Buffer,
     /// The block under the crosshair (server-computed); None = no target.
@@ -203,10 +223,12 @@ impl Renderer {
         let (width, height, css_width, css_height) = canvas_size(canvas);
         configure_surface(&surface, &device, surface_format, width, height);
 
-        // Pipeline: pos(3f) + color(3f) vertices, one uniform buffer.
+        // Pipeline: the module is the core shader + the procedural block
+        // textures (one WGSL function per block, see textures.rs); WGSL
+        // function order is irrelevant, so a plain concatenation works.
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("qwencraft-shader"),
-            source: ShaderSource::Wgsl(SHADER.into()),
+            source: ShaderSource::Wgsl(format!("{SHADER}{TEXTURES}").into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -228,9 +250,68 @@ impl Renderer {
             push_constant_ranges: &[],
         });
 
-        let pipeline = make_pipeline(&device, &shader, &layout, surface_format, "fs_main", false);
+        // Terrain vertex layout: [pos(3f), light(1f), uv(2f), tex(1f)]
+        // — 28 bytes, matching `qwencraft_world::mesh::VERT_STRIDE`.
+        let terrain_layout = [VertexBufferLayout {
+            array_stride: TERRAIN_VERTEX_STRIDE,
+            step_mode: VertexStepMode::Vertex,
+            attributes: &[
+                VertexAttribute {
+                    offset: 0,
+                    format: VertexFormat::Float32x3,
+                    shader_location: 0,
+                },
+                VertexAttribute {
+                    offset: 12,
+                    format: VertexFormat::Float32,
+                    shader_location: 1,
+                },
+                VertexAttribute {
+                    offset: 16,
+                    format: VertexFormat::Float32x2,
+                    shader_location: 2,
+                },
+                VertexAttribute {
+                    offset: 24,
+                    format: VertexFormat::Float32,
+                    shader_location: 3,
+                },
+            ],
+        }];
+
+        // Agent-sphere layout: the classic [pos(3f), color(3f)] — spheres
+        // carry baked shading, not block textures.
+        let agent_layout = [VertexBufferLayout {
+            array_stride: 24,
+            step_mode: VertexStepMode::Vertex,
+            attributes: &[
+                VertexAttribute {
+                    offset: 0,
+                    format: VertexFormat::Float32x3,
+                    shader_location: 0,
+                },
+                VertexAttribute {
+                    offset: 12,
+                    format: VertexFormat::Float32x3,
+                    shader_location: 1,
+                },
+            ],
+        }];
+
+        let pipeline =
+            make_pipeline(&device, &shader, &layout, surface_format, "vs_main", "fs_main", false, &terrain_layout);
         let water_pipeline =
-            make_pipeline(&device, &shader, &layout, surface_format, "fs_water", true);
+            make_pipeline(&device, &shader, &layout, surface_format, "vs_main", "fs_water", true, &terrain_layout);
+        let agent_pipeline = make_pipeline(
+            &device,
+            &shader,
+            &layout,
+            surface_format,
+            "vs_agent",
+            "fs_agent",
+            false,
+            &agent_layout,
+        );
 
         // Highlight: same vertices/shader as terrain, but line list with no
         // culling (lines are visible from both sides).
@@ -241,22 +322,7 @@ impl Renderer {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[VertexBufferLayout {
-                    array_stride: 24,
-                    step_mode: VertexStepMode::Vertex,
-                    attributes: &[
-                        VertexAttribute {
-                            offset: 0,
-                            format: VertexFormat::Float32x3,
-                            shader_location: 0,
-                        },
-                        VertexAttribute {
-                            offset: 12,
-                            format: VertexFormat::Float32x3,
-                            shader_location: 1,
-                        },
-                    ],
-                }],
+                buffers: &terrain_layout,
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -290,7 +356,7 @@ impl Renderer {
         });
         let highlight_vbo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("highlight-vertices"),
-            size: (24 * 24) as u64,
+            size: (24 * TERRAIN_VERTEX_STRIDE) as u64,
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -303,7 +369,7 @@ impl Renderer {
         });
         let terrain_vbo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("terrain-vertices"),
-            size: (VERT_CAP * 24) as u64,
+            size: (VERT_CAP as u64) * TERRAIN_VERTEX_STRIDE,
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -322,6 +388,7 @@ impl Renderer {
             pipeline,
             water_pipeline,
             line_pipeline,
+            agent_pipeline,
             highlight_vbo,
             highlight: None,
             bind_group_layout,
@@ -423,7 +490,7 @@ impl Renderer {
             return;
         }
         let mesh = qwencraft_world::mesh::build_chunk_mesh((pos.x * 16, pos.y * 16, pos.z * 16), &data);
-        let nv = (mesh.vertices.len() + mesh.water_vertices.len()) as u32 / 6;
+        let nv = (mesh.vertices.len() + mesh.water_vertices.len()) as u32 / 7;
         let ni = (mesh.indices.len() + mesh.water_indices.len()) as u32;
         if mesh.is_empty() {
             // A re-sent fully-air chunk (e.g. everything broken) drops the
@@ -466,12 +533,13 @@ impl Renderer {
         // Indices stay chunk-local; draw_indexed adds base_vertex to each.
         // Water is appended after the opaque part (its draw offsets the
         // base_vertex by the opaque vertex count).
-        let ov = mesh.vertices.len() as u32 / 6;
-        self.queue.write_buffer(&self.terrain_vbo, (base_v * 24) as u64, f32_bytes(&mesh.vertices));
+        let ov = mesh.vertices.len() as u32 / 7;
+        self.queue
+            .write_buffer(&self.terrain_vbo, (base_v as u64) * TERRAIN_VERTEX_STRIDE, f32_bytes(&mesh.vertices));
         if !mesh.water_vertices.is_empty() {
             self.queue.write_buffer(
                 &self.terrain_vbo,
-                ((base_v + ov) * 24) as u64,
+                ((base_v + ov) as u64) * TERRAIN_VERTEX_STRIDE,
                 f32_bytes(&mesh.water_vertices),
             );
         }
@@ -676,7 +744,9 @@ impl Renderer {
 
     /// Render one frame from the first-person `camera` (eye position, yaw,
     /// pitch in the server's convention).
-    pub fn render(&mut self, camera: [f32; 3], yaw: f32, pitch: f32) {
+    /// `time` is wall-clock seconds (drives the water texture's ripples;
+    /// pass 0.0 for still water).
+    pub fn render(&mut self, camera: [f32; 3], yaw: f32, pitch: f32, time: f32) {
         self.camera = camera;
         self.yaw = yaw;
         self.pitch = pitch;
@@ -695,7 +765,7 @@ impl Renderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        self.render_pass_into(&mut encoder, &view, &depth_view, self.width, self.height);
+        self.render_pass_into(&mut encoder, &view, &depth_view, self.width, self.height, time);
         self.queue.submit([encoder.finish()]);
         frame.present();
     }
@@ -728,6 +798,7 @@ impl Renderer {
         depth_view: &wgpu::TextureView,
         _w: u32,
         _h: u32,
+        time: f32,
     ) {
         let camera = self.camera;
         let aspect = (self.width as f32 / self.height as f32).max(0.1);
@@ -735,7 +806,7 @@ impl Renderer {
         self.queue.write_buffer(
             &self.uniform_buf,
             0,
-            &uniform_bytes(&vp, camera, FOG_START, FOG_END, SKY),
+            &uniform_bytes(&vp, camera, FOG_START, FOG_END, time, SKY),
         );
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("qwencraft-bg"),
@@ -789,6 +860,8 @@ impl Renderer {
         }
         // Agents: small, per-agent buffers (the NPC load test can push the
         // count into the thousands — expect the draw calls to dominate).
+        // Spheres carry baked colour, so they use their own pipeline.
+        pass.set_pipeline(&self.agent_pipeline);
         for m in self.agents.values() {
             pass.set_index_buffer(m.index.slice(..), wgpu::IndexFormat::Uint32);
             pass.set_vertex_buffer(0, m.vertex.slice(..));
@@ -810,7 +883,7 @@ impl Renderer {
             pass.set_vertex_buffer(0, self.terrain_vbo.slice(..));
             for t in &self.terrain {
                 if let Some((wv, wi)) = &t.water {
-                    let ov = t.verts.len() as u32 / 6;
+                    let ov = t.verts.len() as u32 / 7;
                     let oi = t.idxs.len() as u32;
                     pass.draw_indexed(
                         t.base_i + oi..t.base_i + oi + wi.len() as u32,
@@ -826,40 +899,33 @@ impl Renderer {
 
 }
 
-/// Build a terrain pipeline. `fs_entry` selects the opaque (`fs_main`)
-/// or water (`fs_water`) fragment entry; water blends with src-alpha and
-/// skips depth writes so it composites over opaque geometry.
+/// Build a pipeline. `vs_entry`/`fs_entry` pick the entry points (`vs_main`
+/// + `fs_main` for opaque terrain, `vs_main` + `fs_water` for the
+/// translucent pass, `vs_agent` + `fs_agent` for the baked-colour agent
+/// spheres); `water` enables src-alpha blending + no depth writes (the
+/// translucent pass composites over opaque geometry).
 fn make_pipeline(
     device: &Device,
     shader: &ShaderModule,
     layout: &PipelineLayout,
     surface_format: TextureFormat,
+    vs_entry: &str,
     fs_entry: &str,
     water: bool,
+    vertex_layout: &[VertexBufferLayout<'_>],
 ) -> RenderPipeline {
     device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: Some(if water { "qwencraft-water" } else { "qwencraft-pipeline" }),
+        label: Some(match (vs_entry, fs_entry) {
+            ("vs_agent", "fs_agent") => "qwencraft-agents",
+            (_, "fs_water") => "qwencraft-water",
+            _ => "qwencraft-pipeline",
+        }),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("vs_main"),
+            entry_point: Some(vs_entry),
             compilation_options: Default::default(),
-            buffers: &[VertexBufferLayout {
-                array_stride: 24,
-                step_mode: VertexStepMode::Vertex,
-                attributes: &[
-                    VertexAttribute {
-                        offset: 0,
-                        format: VertexFormat::Float32x3,
-                        shader_location: 0,
-                    },
-                    VertexAttribute {
-                        offset: 12,
-                        format: VertexFormat::Float32x3,
-                        shader_location: 1,
-                    },
-                ],
-            }],
+            buffers: vertex_layout,
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,

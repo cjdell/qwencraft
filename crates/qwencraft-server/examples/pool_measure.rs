@@ -56,8 +56,8 @@ fn view_demand(world: &mut World, center: ChunkPos) -> (usize, usize, u32) {
                 (pos.x * 16, pos.y * 16, pos.z * 16),
                 &data,
             );
-            let ov = mesh.vertices.len() / 6;
-            let wv = mesh.water_vertices.len() / 6;
+            let ov = mesh.vertices.len() / 7;
+            let wv = mesh.water_vertices.len() / 7;
             if ov + wv == 0 {
                 continue;
             }

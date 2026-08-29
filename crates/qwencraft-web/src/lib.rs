@@ -25,7 +25,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
     Element, HtmlCanvasElement, HtmlDivElement, HtmlElement, HtmlInputElement, KeyboardEvent,
-    MessageEvent, MouseEvent, Window,
+    MessageEvent, MouseEvent, Window, WheelEvent,
 };
 
 use qwencraft_client::Renderer;
@@ -34,7 +34,11 @@ use qwencraft_server::{
     Action, AgentState, Input, Key, KeySet, Server, ServerStats, Streamer, WorldUpdate,
 };
 use qwencraft_world::camera::view_projection;
-use qwencraft_world::ChunkPos;
+use qwencraft_world::{Block, ChunkPos, PLACEABLE};
+
+/// Number of hotbar slots (the 9 placeable-block window the player can
+/// select with the digit keys / mouse wheel).
+const HOTBAR_SLOTS: usize = 9;
 
 fn log(msg: &str) {
     web_sys::console::log_1(&JsValue::from_str(msg));
@@ -291,6 +295,16 @@ struct App {
     pending_npcs: Option<(u32, f32)>,
     /// Status line of the overlay's server-connect panel.
     server_status: HtmlDivElement,
+    // ---- Hotbar (block selection) ---------------------------------------
+    /// Selected hotbar slot (0-based into `PLACEABLE`'s first 9 entries).
+    selected_slot: usize,
+    /// The hotbar container (slots are built into it at startup).
+    hotbar: HtmlDivElement,
+    /// One slot element per `HOTBAR_SLOTS` (class "selected" marks the
+    /// active one).
+    hotbar_slots: Vec<HtmlElement>,
+    /// Label showing the selected block's name above the hotbar.
+    hotbar_name: HtmlDivElement,
     // ---- Options panel (player identity + server connection) -----------
     /// The player's display name (sanitised fallback "Player").
     player_name: String,
@@ -312,6 +326,8 @@ impl App {
         overlay: HtmlDivElement,
         server_status: HtmlDivElement,
         tags: HtmlDivElement,
+        hotbar: HtmlDivElement,
+        hotbar_name: HtmlDivElement,
         verify_mode: bool,
         walk_mode: bool,
         tag_log: bool,
@@ -380,8 +396,80 @@ impl App {
             player_color: [255, 255, 255],
             tags,
             tag_els: std::collections::HashMap::new(),
+            selected_slot: 0,
+            hotbar,
+            hotbar_slots: Vec::new(),
+            hotbar_name,
             _closures: Vec::new(),
         }
+    }
+
+    /// Build the hotbar's slots (one per `PLACEABLE` entry, up to
+    /// `HOTBAR_SLOTS`) and mark slot 0 selected. Slot backgrounds use the
+    /// block's CPU fallback colour (the texture's average — close enough
+    /// for a UI swatch; the real texture lives in the shader).
+    fn build_hotbar(&mut self) {
+        let doc = web_sys::window().expect("window").document().expect("document");
+        let mut slots = Vec::new();
+        for (i, block) in PLACEABLE.iter().take(HOTBAR_SLOTS).enumerate() {
+            let el: HtmlElement = doc
+                .create_element("div")
+                .expect("div")
+                .dyn_into()
+                .expect("div");
+            el.set_class_name("hotbar-slot");
+            let c = block.color_top();
+            el.style()
+                .set_property(
+                    "background",
+                    &format!(
+                        "rgb({},{},{})",
+                        (c[0] * 255.0) as u8,
+                        (c[1] * 255.0) as u8,
+                        (c[2] * 255.0) as u8
+                    ),
+                )
+                .ok();
+            let _ = el.set_attribute("data-block", &block.as_u8().to_string());
+            let _ = el.set_attribute("title", block.info().name);
+            if i == 0 {
+                let _ = el.class_list().add_1("selected");
+            }
+            self.hotbar.append_child(&el).expect("append slot");
+            slots.push(el);
+        }
+        self.hotbar_slots = slots;
+        self.set_hotbar_label();
+    }
+
+    /// Refresh the selected-block label above the hotbar.
+    fn set_hotbar_label(&mut self) {
+        let b = PLACEABLE[self.selected_slot];
+        self.hotbar_name.set_text_content(Some(b.info().name));
+    }
+
+    /// Select hotbar slot `i` (clamped); updates the DOM + label.
+    fn select_slot(&mut self, i: usize) {
+        if i >= HOTBAR_SLOTS {
+            return;
+        }
+        if i == self.selected_slot {
+            return;
+        }
+        for (j, el) in self.hotbar_slots.iter().enumerate() {
+            if j == i {
+                let _ = el.class_list().add_1("selected");
+            } else {
+                let _ = el.class_list().remove_1("selected");
+            }
+        }
+        self.selected_slot = i;
+        self.set_hotbar_label();
+    }
+
+    /// The block the player currently has selected (right-click places it).
+    fn selected_block(&self) -> Block {
+        PLACEABLE[self.selected_slot]
     }
 
     /// This page's own player id (the renderer skips it: first person).
@@ -823,7 +911,8 @@ impl App {
             // players are spheres like NPCs.
             r.set_agents(agents, own_id);
             r.set_highlight(player.target.map(|t| [t.x, t.y, t.z]));
-            r.render(cam, player.yaw, player.pitch);
+            // Wall-clock seconds drive the water texture's ripples.
+            r.render(cam, player.yaw, player.pitch, now as f32);
             let t_done = js_sys::Date::now();
             self.perf_tick_ms += t_mesh - t_tick;
             self.perf_mesh_ms += t_render - t_mesh;
@@ -1291,6 +1380,14 @@ pub fn start() -> Result<(), JsValue> {
         .get_element_by_id("tags")
         .and_then(|e| e.dyn_into::<HtmlDivElement>().ok())
         .expect("missing #tags");
+    let hotbar = document
+        .get_element_by_id("hotbar")
+        .and_then(|e| e.dyn_into::<HtmlDivElement>().ok())
+        .expect("missing #hotbar");
+    let hotbar_name = document
+        .get_element_by_id("hotbar-name")
+        .and_then(|e| e.dyn_into::<HtmlDivElement>().ok())
+        .expect("missing #hotbar-name");
 
     // In verify mode the headless test never gets pointer lock, so hide the
     // "click to play" overlay to let screenshots show the rendered canvas.
@@ -1310,11 +1407,16 @@ pub fn start() -> Result<(), JsValue> {
         overlay.clone(),
         server_status.clone(),
         tags.clone(),
+        hotbar.clone(),
+        hotbar_name.clone(),
         verify_mode,
         walk_mode,
         tag_log,
         npcs,
     )));
+    // Build the hotbar slots (block list comes from the shared registry,
+    // so a new block appears here automatically once it is placeable).
+    app.borrow_mut().build_hotbar();
     if let Some((c, s)) = npcs {
         log(&format!("Qwencraft: NPC load test armed: {c} agents @ {s:.0} m spacing"));
     }
@@ -1339,6 +1441,20 @@ pub fn start() -> Result<(), JsValue> {
                 // before it reaches the input (w/a/s/d are all game keys).
                 if event_target_is_text_input(&e) {
                     return;
+                }
+                // Hotbar: digit keys 1-9 select a slot (one-shot; repeats
+                // from key auto-repeat are harmless but needlessly touch
+                // the DOM).
+                if !e.repeat() {
+                    if let Some(d) = e.code().as_str().strip_prefix("Digit") {
+                        if let Ok(d) = d.parse::<usize>() {
+                            if d >= 1 && d <= HOTBAR_SLOTS {
+                                e.prevent_default();
+                                app.borrow_mut().select_slot(d - 1);
+                                return;
+                            }
+                        }
+                    }
                 }
                 match key_from_code(e.code().as_str()) {
                     // One-shot fly actions (F must ignore key auto-repeat;
@@ -1422,9 +1538,12 @@ pub fn start() -> Result<(), JsValue> {
                     return;
                 }
                 let (yaw, pitch) = (a.aim_yaw, a.aim_pitch);
+                // Right-click places the hotbar-selected block; the
+                // server validates the id.
+                let block = a.selected_block().as_u8();
                 match e.button() {
                     0 => a.actions.push(Action::Break { yaw, pitch }),
-                    2 => a.actions.push(Action::Place { yaw, pitch }),
+                    2 => a.actions.push(Action::Place { yaw, pitch, block }),
                     _ => {}
                 }
             }
@@ -1449,6 +1568,37 @@ pub fn start() -> Result<(), JsValue> {
         window
             .add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref())
             .expect("mousemove listener");
+        app.borrow_mut()
+            ._closures
+            .push(Box::into_raw(Box::new(cb)) as *mut _);
+
+        // Mouse wheel: cycle the hotbar selection (forward = next slot).
+        // Works whether or not the pointer is locked; ignored while
+        // typing in a text field (the options panel).
+        let cb = Closure::<dyn FnMut(WheelEvent)>::new({
+            let app = app.clone();
+            move |e: WheelEvent| {
+                let in_text = e
+                    .target()
+                    .and_then(|t| t.dyn_ref::<HtmlElement>().cloned())
+                    .is_some_and(|t| matches!(t.tag_name().as_str(), "INPUT" | "TEXTAREA"));
+                if in_text {
+                    return;
+                }
+                let dir = if e.delta_y() > 0.0 { 1 } else { -1 };
+                let mut a = app.borrow_mut();
+                let cur = a.selected_slot;
+                let next = if dir > 0 {
+                    (cur + 1) % HOTBAR_SLOTS
+                } else {
+                    (cur + HOTBAR_SLOTS - 1) % HOTBAR_SLOTS
+                };
+                a.select_slot(next);
+            }
+        });
+        window
+            .add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref())
+            .expect("wheel listener");
         app.borrow_mut()
             ._closures
             .push(Box::into_raw(Box::new(cb)) as *mut _);

@@ -11,9 +11,11 @@ N100 mini-PC.
 
 A voxel (Minecraft-style) engine written in Rust that runs in the browser.
 The world is generated procedurally from a seed, streamed on demand from an
-embedded server crate, and rendered with WebGPU: solid-colour blocks with
-per-vertex voxel lighting, ambient occlusion and distance fog, agents drawn
-as spheres, first-person keyboard + mouse controls.
+embedded server crate, and rendered with WebGPU: procedurally-textured blocks
+(every texture is a WGSL shader function — no image files), per-vertex voxel
+lighting, ambient occlusion and distance fog, agents drawn as spheres,
+first-person keyboard + mouse controls, and a hotbar for choosing what to
+build with.
 
 The landscape includes lakes and shorelines (translucent water you can
 swim through), procedural trees with trunks and canopies, sandy beaches,
@@ -99,7 +101,9 @@ clicking inside it never starts pointer lock.
 | `W A S D` | move / fly horizontally |
 | `Space` / `Shift` | jump / sprint — **up / down while flying** |
 | `Mouse` | look (pointer-locked) |
-| `Left click` / `Right click` | break / place the highlighted block |
+| `Left click` / `Right click` | break / place the highlighted block (with the hotbar's selected block) |
+| `1`–`9` | select hotbar slot 1–9 |
+| `Mouse wheel` | scroll the hotbar selection |
 | `Space` (in water) | swim up (falling in water is slowed; hold to surface) |
 | `F` | toggle **fly mode** (no gravity, no collision) |
 | `Q` / `E` | fly speed down / up (×1.5 steps, 5 → 500 blocks/s; hold to ramp) |
@@ -130,15 +134,53 @@ aim from the moment you clicked (the aim is stamped onto the action), so
 the highlighted block is always the one that gets broken or built
 against — even while you're turning fast.
 
+## Blocks & the hotbar
+
+Right-click places the block selected in the **hotbar** — a 9-slot strip
+along the bottom of the screen (the selected slot has a gold ring) showing
+the first 9 of the 13 placeable blocks; `1`–`9` or the mouse wheel
+change the selection (the wheel is ignored while typing in the start
+screen's options fields). The server validates the block id with the
+shared registry and ignores unknown ones, so a stale or tampered client
+can't corrupt the world.
+
+All block types live in **one place** — the registry in
+`qwencraft-world/src/block.rs` (`Block` enum + `BLOCKS` const table): each
+block's physics (solid/water/translucent/flower), its face texture ids,
+its CPU-side colours (dashboard/minimap), and its placeability. Terrain
+meshing, physics, the hotbar and the dashboard all read that table, so
+adding a block is: add the variant + table row, add its texture function
+or two, done.
+
+There are 17 blocks: the natural ones (grass, dirt, stone, sand, water,
+tree logs, leaves, snow-grass, red/yellow flowers) plus the buildable
+set — planks, cobblestone, brick, glass (translucent, rendered in the
+water blending pass with its own alpha), TNT and obsidian.
+
+**Procedural textures.** Each block face samples a `TEX_*` id that travels
+as a vertex attribute; the fragment stage dispatches to one **WGSL
+function per texture** (`qwencraft-client/src/textures.wgsl`): mottled
+noise for grass/dirt, ringed bark + growth-ring tops for logs, five-petal
+flowers, staggered planks, cobblestone with mortar, brick courses, a
+glinting glass pane, a labelled TNT side, glowing obsidian specks — with
+per-block random variation so neighbouring blocks don't look cloned.
+Water ripples with the wall-clock `time` uniform. The functions are kept
+in a small portable subset shared with GLSL ES 3.00 so the headless
+pixel-verification mirror (`qwencraft-web/src/verify_gl.rs`) stays a
+mechanical translation. The concatenated module is type-checked by naga
+in `cargo test` (`crates/qwencraft-client/tests/wgsl_valid.rs`) — the same
+front-end family Dawn (browser WebGPU) uses — before any browser ever sees
+it.
+
 ## Layout
 
 | crate / dir         | what it is                                                              |
 | ------------------- | ----------------------------------------------------------------------- |
-| `qwencraft-world`   | Block types, seeded noise/terrain, 16³ chunks with 26³ region payloads, chunk meshing (voxel lighting + AO), view-projection math + the minimap's column queries, shared math types |
+| `qwencraft-world`   | The **block registry** (all block types in one const table: physics, face texture ids, CPU colours, placeability), seeded noise/terrain, 16³ chunks with 26³ region payloads, chunk meshing (voxel lighting + AO), view-projection math + the minimap's column queries, shared math types |
 | `qwencraft-server`  | The authoritative game server: infinite lazy world (chunks generated on demand), agent simulation (player + NPCs) with a per-agent local block window, fixed-tick physics, delta-based world updates, NPC load test. Plus the wire `protocol` module (binary codec shared by both transports). Runs in-process in the browser *and* inside the headless server |
 | `qwencraft-net`     | Headless server, single port: WebSocket at `/ws` (`ws://`, `wss://` with `--cert`/`--key`), dashboard at `/dashboard/` (bare `/dashboard` 302-redirects to it), game page at `/`, plus `/api/*` + `/healthz`; one shared world for all connections, 60 Hz tick loop, per-connection streaming |
-| `qwencraft-client`  | WebGPU (wgpu 27) renderer: shared terrain-mesh buffer pool, the WGSL shader, sphere agents, fog, first-person camera |
-| `qwencraft-web`     | wasm glue: input (keyboard/pointer lock), HUD, main loop, backend abstraction (embedded server or remote over WebSocket) |
+| `qwencraft-client`  | WebGPU (wgpu 27) renderer: shared terrain-mesh buffer pool, the WGSL shader + the **procedural block textures** (one WGSL function per texture id, validated by naga in the host tests), sphere agents, fog, first-person camera |
+| `qwencraft-web`     | wasm glue: input (keyboard/pointer lock), **hotbar** (9-slot block selector), HUD, main loop, backend abstraction (embedded server or remote over WebSocket) |
 | `web/`              | `index.html` page hosting the wasm app                                  |
 | `scripts/`          | build / serve / verify / walk-stress / NPC-load / secure-context / remote-server tests |
 
@@ -176,12 +218,13 @@ WebSocket upgrade.
   client renders the latest snapshot it holds (at 60 Hz the difference is
   one tick, which reads as smooth).
 - **Wire protocol** (`qwencraft-server/src/protocol.rs`): little-endian
-  binary frames, versioned (currently 3). Server → client: `Hello` (seed +
+  binary frames, versioned (currently 4). Server → client: `Hello` (seed +
   your player id), player/agent state (agents carry name + colour), chunk
   regions, world stats, NPC load echo. Client → server: the player profile
   (name + colour, sent right after connect), input snapshots, actions
-  (break/place with stamped aim), chunk re-send requests (terrain-pool
-  eviction), NPC load changes.
+  (break; place with stamped aim **plus the selected block id**, validated
+  against the block registry on the server), chunk re-send requests
+  (terrain-pool eviction), NPC load changes.
 
 **Connecting the browser:** open **Options** on the start screen and type
 the server URL into the field (a bare `host[:port]` is fine — `/ws` is

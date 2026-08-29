@@ -888,6 +888,7 @@ name = "qwencraft-client"
 version = "0.1.0"
 dependencies = [
  "js-sys",
+ "naga",
  "qwencraft-server",
  "qwencraft-world",
  "wasm-bindgen",

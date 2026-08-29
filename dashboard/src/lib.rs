@@ -131,7 +131,7 @@ const TILES_PER_TICK: usize = 6;
 
 /// Top-face colour per block id (mirrors `qwencraft_world::Block::color_top`).
 fn block_color(b: u8) -> [u8; 3] {
-    const C: [[u8; 3]; 11] = [
+    const C: [[u8; 3]; 17] = [
         [255, 255, 255], //  air (unused)
         [92, 166, 71], //   grass
         [140, 99, 66], //   dirt
@@ -143,8 +143,14 @@ fn block_color(b: u8) -> [u8; 3] {
         [235, 240, 247], // snowgrass
         [214, 51, 46], //   flower red
         [235, 199, 56], //  flower yellow
+        [184, 140, 87], //  planks
+        [140, 143, 148], // cobblestone
+        [158, 77, 61], //   brick
+        [191, 217, 230], // glass
+        [217, 89, 64], //   tnt
+        [41, 26, 51], //    obsidian
     ];
-    C[(b as usize) % 11]
+    C[(b as usize) % 17]
 }
 
 fn fmt_uptime(secs: f64) -> String {

@@ -444,7 +444,7 @@ impl Server {
     /// can't move the target.
     fn apply_world_edit(&mut self, id: u32, action: Action) {
         let (eye, yaw, pitch) = match action {
-            Action::Break { yaw, pitch } | Action::Place { yaw, pitch } => {
+            Action::Break { yaw, pitch } | Action::Place { yaw, pitch, .. } => {
                 let idx = self.agent_index(id);
                 let p = &self.agents[idx];
                 (p.eye(), yaw, pitch)
@@ -468,7 +468,13 @@ impl Server {
                         ));
                     }
                 }
-                Action::Place { .. } => {
+                Action::Place { block, .. } => {
+                    // The client's hotbar picks the block; the server
+                    // validates the id (unknown ids are a stale/malicious
+                    // client — ignore the action, don't corrupt the world).
+                    if !Block::from_u8(block).is_placeable() {
+                        return;
+                    }
                     // Don't place inside an agent.
                     let blocked = self.agents.iter().any(|a| {
                         let p = a.pos;
@@ -480,12 +486,13 @@ impl Server {
                             && prev.z as f32 + 1.0 >= p.z - 0.3
                     });
                     if prev.y >= 0 && prev.y < WORLD_HEIGHT && !blocked {
-                        let dirty = self.world.set_block(prev, Block::Stone);
+                        let b = Block::from_u8(block);
+                        let dirty = self.world.set_block(prev, b);
                         self.invalidate_caches_at(prev);
                         self.dirty.extend(dirty);
                         self.emit(format!(
-                            "player {id} placed Stone at ({}, {}, {})",
-                            prev.x, prev.y, prev.z
+                            "player {id} placed {:?} at ({}, {}, {})",
+                            b, prev.x, prev.y, prev.z
                         ));
                     }
                 }
@@ -865,7 +872,7 @@ mod tests {
                             (pos.x * 16, pos.y * 16, pos.z * 16),
                             &data,
                         );
-                        v += mesh.vertices.len() / 6 + mesh.water_vertices.len() / 6;
+                        v += mesh.vertices.len() / 7 + mesh.water_vertices.len() / 7;
                         i += mesh.indices.len() + mesh.water_indices.len();
                     }
                 }
@@ -1277,7 +1284,13 @@ mod tests {
             .world
             .raycast(&s.agents[0].eye(), &dir, 6.0)
             .expect("ground behind the hole should be in view");
-        s.push_action(Action::Place { yaw, pitch: TEST_PITCH });
+        // The hotbar picks the block: place planks and assert the *selected*
+        // block lands (not a hardcoded stone).
+        s.push_action(Action::Place {
+            yaw,
+            pitch: TEST_PITCH,
+            block: Block::Planks as u8,
+        });
         tick_n(&mut s, 2);
         // Placement is skipped when the cell would intersect an agent.
         let blocked = s.agents().iter().any(|a| {
@@ -1290,8 +1303,21 @@ mod tests {
                 && (prev.z as f32) + 1.0 >= p.z - 0.3
         });
         assert!(
-            blocked || s.world.block_at(prev) == Block::Stone,
-            "block must be placed against the face"
+            blocked || s.world.block_at(prev) == Block::Planks,
+            "the selected block must be placed against the face"
+        );
+        // Unknown block ids are ignored (a stale/malicious client must not
+        // corrupt the world).
+        s.push_action(Action::Place {
+            yaw,
+            pitch: TEST_PITCH,
+            block: 250,
+        });
+        tick_n(&mut s, 2);
+        assert_ne!(
+            s.world.block_at(prev),
+            Block::Air,
+            "an invalid block id must not break or overwrite anything"
         );
     }
 

@@ -35,7 +35,11 @@ use qwencraft_world::{BlockPos, ChunkPos};
 /// first-person sphere), `AgentState` carries a `name` (rendered as a tag
 /// above other players' spheres), and clients send `Profile` (name +
 /// sphere colour) so the shared world shows who is who.
-pub const PROTOCOL_VERSION: u8 = 3;
+///
+/// v4: `Action::Place` carries the selected `block` id (the hotbar: the
+/// server validates it — unknown ids are ignored). The wire id is the
+/// `Block` enum discriminant shared with the client.
+pub const PROTOCOL_VERSION: u8 = 4;
 
 // ---- client -> server message types --------------------------------------
 const T_INPUT: u8 = 0x01;
@@ -128,10 +132,11 @@ impl ClientMsg {
                         p.f32(*yaw);
                         p.f32(*pitch);
                     }
-                    Action::Place { yaw, pitch } => {
+                    Action::Place { yaw, pitch, block } => {
                         p.u8(A_PLACE);
                         p.f32(*yaw);
                         p.f32(*pitch);
+                        p.u8(*block);
                     }
                     Action::ToggleFly => p.u8(A_TOGGLE_FLY),
                     Action::FlyFaster => p.u8(A_FLY_FASTER),
@@ -192,6 +197,7 @@ impl ClientMsg {
                     A_PLACE => Action::Place {
                         yaw: d.f32()?,
                         pitch: d.f32()?,
+                        block: d.u8()?,
                     },
                     A_TOGGLE_FLY => Action::ToggleFly,
                     A_FLY_FASTER => Action::FlyFaster,
@@ -617,6 +623,7 @@ mod tests {
             ClientMsg::Action(Action::Place {
                 yaw: -1.5,
                 pitch: 1.55,
+                block: 4,
             }),
             ClientMsg::Action(Action::ToggleFly),
             ClientMsg::Action(Action::FlyFaster),

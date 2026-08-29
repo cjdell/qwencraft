@@ -67,7 +67,7 @@ writes temp files):
 
 | Command | What it does |
 |---|---|
-| `cargo test` | All host unit tests (80: world 33 incl. the terrain-pool allocator tests, server 39, net e2e 4 incl. a wss TLS round-trip, a two-client shared-world test, and a dashboard HTTP test, net lib 4 — the map). The only place Rust tests run — **wasm tests can't execute here**. |
+| `cargo test` | All host unit tests (93: world 44 incl. the terrain-pool allocator tests, client 2 — naga validation of the WGSL shader module + texture-function census, server 39, net e2e 4 incl. a wss TLS round-trip, a two-client shared-world test, and a dashboard HTTP test, net lib 4 — the map). The only place Rust tests run — **wasm tests can't execute here** (but the WGSL *is* checked here, see the client tests). |
 | `./scripts/build.sh` | Release build → `web/dist` (wasm-bindgen 0.2.100). |
 | `./scripts/serve.sh` | Serve `web/dist` at `http://localhost:8080` (python3). |
 | `./scripts/serve.sh --https` | Same over TLS with a self-signed cert (`.certs/`, generated once via openssl). **Required for LAN play** — WebGPU needs a secure context. |
@@ -83,15 +83,20 @@ writes temp files):
 
 ```
 crates/
-  qwencraft-world/    PURE, no deps. Blocks, seeded noise, terrain
-                      generation (water/trees/snow/flowers/sand), chunk
-                      meshing with voxel lighting+AO, raycasting,
-                      camera matrices + view-projection math, the
-                      minimap's per-column top-block queries (column_top,
-                      sharing top_block/sub_top_block with the generator),
-                      and Vec3 (shared math type). The WGSL shader source
-                      lives in the client. Host-testable — put
-                      geometry/logic tests here.
+  qwencraft-world/    PURE, no deps. The BLOCK REGISTRY (block.rs —
+                      single source of truth for all 17 block types:
+                      Block enum + BLOCKS const with physics, face
+                      texture ids, CPU colours, placeability, PLACEABLE),
+                      seeded noise, terrain generation (water/trees/snow/
+                      flowers/sand), chunk meshing with voxel
+                      lighting+AO (vertices carry [pos, light, uv, texId]),
+                      raycasting, camera matrices + view-projection math
+                      (uniform_bytes takes `time` for the water ripples),
+                      the minimap's per-column top-block queries
+                      (column_top, sharing top_block/sub_top_block with
+                      the generator), and Vec3 (shared math type). The
+                      WGSL shader + textures live in the client. Host-
+                      testable — put geometry/logic tests here.
   qwencraft-server/   Authoritative game state. Server { world, agents,
                       inputs/actions/targets per agent id }, fixed 60Hz
                       tick, physics (walk/jump/fly/swim), per-agent
@@ -110,11 +115,14 @@ crates/
                       (one viewer) and the net server (one per
                       connection) share the logic. protocol.rs = versioned
                       little-endian binary wire codec (ClientMsg/ServerMsg,
-                      encode/decode/decode_stream, currently v3: Hello
+                      encode/decode/decode_stream, currently v4: Hello
                       carries the player id, agents carry name + colour,
-                      ClientMsg::Profile sends the player's name/colour)
-                      shared by both transports; pure + host-testable, no
-                      deps.
+                      ClientMsg::Profile sends the player's name/colour,
+                      Action::Place carries the selected block id (u8 —
+                      the server validates it via
+                      Block::from_u8(...).is_placeable() and silently
+                      drops unknown ids)) shared by both transports;
+                      pure + host-testable, no deps.
   qwencraft-net/      HEADLESS server binary. tokio + tokio-tungstenite.
                       SINGLE PORT (one authority): dispatch_conn sniffs
                       the first bytes — TLS ClientHello → accept TLS
@@ -161,10 +169,20 @@ crates/
                       dashboard HTTP endpoints (single port, /dashboard/).
   qwencraft-client/   WebGPU renderer. Terrain buffer POOL (one 2M-vertex
                       vbo/ibo, chunks own index ranges, compaction when
-                      full), opaque+water pipelines (translucent water
-                      pass), the WGSL shader (shader.rs), agent spheres
+                      full), opaque+water pipelines (translucent water +
+                      glass pass, per-texture alpha), the WGSL shader
+                      (shader.wgsl) + PROCEDURAL BLOCK TEXTURES
+                      (textures.wgsl — one WGSL function per TEX_* id,
+                      sampled in the fragment stage; shader.rs/
+                      textures.rs just embed the files via include_str!
+                      and hold the module docs), agent spheres
                       (sphere.rs), wireframe block highlight,
-                      clear_terrain() for world switches.
+                      clear_terrain() for world switches. The crate only
+                      compiles for wasm32, BUT tests/wgsl_valid.rs is a
+                      host-runnable integration test (naga dev-dep) that
+                      type-checks the concatenated WGSL module + censuses
+                      the texture functions — the fast gate for shader
+                      edits (see the WGSL gotchas below).
   qwencraft-web/      wasm glue. Backend { Builtin { server, streamer },
                       Remote } — the frame loop talks only to the Backend;
                       builtin drives the embedded Server + Streamer
@@ -184,11 +202,18 @@ crates/
                       projected with the same view-projection). ?server=
                       accepts a bare host[:port] (normalise_ws_url
                       appends /ws); failed connect falls back to builtin.
+                      HOTBAR: 9-slot strip over the first 9 of the 13
+                      PLACEABLE blocks (DOM, built from the registry),
+                      digits 1–9 + mouse wheel select (wheel ignored in
+                      text inputs), right-click places the selected block.
                       verify_gl.rs = WebGL2 "shadow renderer" that
                       re-renders the scene for headless pixel
                       verification — behind the `verify` cargo feature
                       (scripts/build.sh enables it; drop it for a
-                      production build).
+                      production build). Its GLSL texture library must
+                      stay a MECHANICAL translation of textures.wgsl
+                      (same function per TEX_* id; see the WGSL/GLSL
+                      portability notes below).
 web/                  index.html (HUD, overlay) + dist/ (build output).
 dashboard/            STANDALONE cargo workspace (its dep graph must not
                       touch the main workspace's exact pins). Dioxus 0.7
@@ -261,6 +286,35 @@ is visible on the map within one tick.
   an edit is by design: the dirty window rebuilds on the next `update`.)
 - **WGSL uniform layout is vec4-only** (112 bytes, no hidden padding).
   Keep it that way or the render silently goes wrong.
+- **WGSL↔GLSL texture portability.** The procedural textures must exist
+  in two dialects: `crates/qwencraft-client/src/textures.wgsl` (the real
+  renderer) and the GLSL `TEX_LIB` in
+  `crates/qwencraft-web/src/verify_gl.rs` (the headless pixel check) as a
+  *mechanical translation* — same function per `TEX_*` id, same math.
+  The shared subset is fract/mix/smoothstep/step/sin/cos/atan/length/dot/
+  floor/abs, and every WGSL/GLSL divergence goes through a shared helper:
+  `tex_atan2` (WGSL has NO two-arg `atan(y,x)` — Dawn rejects it even
+  though naga accepts it) and `tex_fmod` (WGSL's float remainder is `%`,
+  GLSL ES 3.00's `%` is integer-only — its float remainder is `mod()`).
+  Other hard rules: WGSL `clamp` has **no scalar broadcasting** (bounds
+  must be `vec3<f32>` when the value is a vec3), bare `0.0`/`1.0`
+  literals are *abstract-float* and can't mix with concrete f32 args in a
+  call (write `0.0f`), and `smoothstep` edges must be **ascending**
+  (descending edges are undefined in WGSL — write
+  `1.0 - smoothstep(e1, e0, x)`, pixel-identical). The GLSL side must
+  compile under GLSL ES 3.00 (WebGL2) — no desktop-only builtins.
+  `cargo test` (the client's naga test) catches WGSL-side breakage
+  instantly; the GLSL side is caught by verify.sh's shadow renderer
+  (a GLSL compile error there shows up as "VERIFY_PIXELS gl context
+  unavailable").
+- **New texture ids need both sides + the dispatch.** Adding a `TEX_*`
+  id means: the WGSL function + a threshold branch in `sample_tex`
+  (and `tex_trans_alpha` if translucent), the GLSL mirror + the same
+  branches, and the `every_texture_function_is_defined` test's list if
+  the id maps to a new function. The dispatch is threshold-based
+  (`tex < 0.5`, `tex < 1.5`, …), NOT `tex == N.0` — the id travels as a
+  smoothly-interpolated varying and drifts ~1 ulp, so equality misses a
+  fraction of every face (this produced debug-magenta pixels once).
 - **Water faces are emitted only against air** and rendered in a separate
   translucent pass with no depth writes, after all opaque geometry.
 - **`build_chunk` on the client must drop the old pool entry before
@@ -332,6 +386,33 @@ These are properties of *this machine/headless setup*, not code bugs:
 
 ## Gotchas discovered the hard way
 
+- **Dawn reports ONE shader error per module** and wgpu's naga (in-wasm)
+  is more lenient than Dawn in at least one documented case (two-arg
+  `atan`), so an invalid WGSL module can sail through `Renderer::new`
+  ("renderer ready" is logged) and only surface later as console
+  "Error while parsing WGSL" + "Invalid ShaderModule" — while the app
+  keeps "rendering" (headless can't composite the WebGPU canvas, and
+  verify.sh's pixels come from the GLSL shadow path, so it stays green
+  with a broken WebGPU shader). Grep the chrome logs for `WGSL` when in
+  doubt; fix shader bugs against `cargo test` (naga) first, then the
+  browser. (This is why verify.sh passing ≠ the WGSL is valid.)
+- **remote_test.sh must not reuse a stale server binary.** The binary
+  EMBEDS web/dist + dashboard/dist via `include_dir!`, which cargo does
+  not fingerprint — a binary built before the latest web/dist serves a
+  stale game page *and* (worse) a stale wire protocol: a v3 server + v4
+  client just logs "server speaks protocol 3, client has 4 — closing"
+  and falls back to builtin, so the whole remote scenario under test
+  never runs while most checks still look plausible. The script now
+  detects any file in web/dist or dashboard/dist newer than the binary,
+  touches `crates/qwencraft-net/src/lib.rs`, and rebuilds. (Same reason
+  as the dashboard dist rule below.)
+- **remote_test.sh starts the browsers SEQUENTIALLY** (first browser
+  connects, then the second starts): newcomers spawn 1.6 blocks in front
+  of the existing player's view (`Server::add_player`), so ONLY the first
+  player can see the other's name tag — the newcomer's tag is behind its
+  camera (`project_point` → `None` → hidden) and never produces a TAGS
+  telemetry line. Letting both race to connect made the tag-position
+  check order-dependent and flaky.
 - `web-sys` `Navigator::gpu()` needs an unstable cfg flag — use
   `js_sys::Reflect::get(&navigator.into(), &JsValue::from_str("gpu"))`
   instead. `Window::navigator()` returns `Navigator` directly (not

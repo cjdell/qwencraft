@@ -41,8 +41,10 @@ pub enum Action {
     /// after the click — that lag is what made edits land off-target while
     /// moving).
     Break { yaw: f32, pitch: f32 },
-    /// Place a stone block against the targeted face (same aim semantics).
-    Place { yaw: f32, pitch: f32 },
+    /// Place the selected `block` against the targeted face (same aim
+    /// semantics). The server validates the id — unknown ids are ignored
+    /// (a stale client can't corrupt the world).
+    Place { yaw: f32, pitch: f32, block: u8 },
     /// Toggle the player's fly mode.
     ToggleFly,
     /// Increase the fly speed (x FLY_STEP, clamped).
