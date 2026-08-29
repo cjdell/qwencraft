@@ -19,7 +19,7 @@
 //! fixed-layout values plus one large byte blob (chunk regions).
 
 use crate::{Action, AgentState, ServerStats};
-use qwencraft_world::{BlockPos, ChunkPos};
+use qwencraft_world::{BlockPos, ChunkPos, Vec3};
 
 /// Protocol layout version. The server announces it in `ServerMsg::Hello`;
 /// the client refuses to play against a mismatch. Bump on any layout change.
@@ -48,7 +48,14 @@ use qwencraft_world::{BlockPos, ChunkPos};
 /// ever saw it — eviction reports only cover chunks the client once held,
 /// so without a reconciliation a lost spawn view stays invisible until a
 /// block edit forces a re-send.
-pub const PROTOCOL_VERSION: u8 = 5;
+///
+/// v6: the browser console API (`window.qwc`): `GetBlock`/`BlockAt`
+/// (authoritative block reads — the client never answers them from its
+/// own streamed copy) and `SetBlock`/`Teleport` (console block edits and
+/// player teleports; the server applies them with the same world-write
+/// path as player edits). The client stays a pure forwarder (golden
+/// rule 4 holds for the console too).
+pub const PROTOCOL_VERSION: u8 = 6;
 
 // ---- client -> server message types --------------------------------------
 const T_INPUT: u8 = 0x01;
@@ -57,6 +64,9 @@ const T_EVICTED: u8 = 0x03;
 const T_SET_NPC_LOAD: u8 = 0x04;
 const T_PROFILE: u8 = 0x05;
 const T_RESYNC: u8 = 0x06;
+const T_GET_BLOCK: u8 = 0x07;
+const T_SET_BLOCK: u8 = 0x08;
+const T_TELEPORT: u8 = 0x09;
 
 // ---- server -> client message types --------------------------------------
 const T_HELLO: u8 = 0x10;
@@ -65,6 +75,7 @@ const T_AGENTS: u8 = 0x12;
 const T_CHUNK: u8 = 0x13;
 const T_STATS: u8 = 0x14;
 const T_NPC_LOAD: u8 = 0x15;
+const T_BLOCK_AT: u8 = 0x16;
 
 // ---- Action discriminants (payload of T_ACTION) ---------------------------
 const A_BREAK: u8 = 0;
@@ -111,6 +122,16 @@ pub enum ClientMsg {
     /// per-viewer `chunks_sent` (from `Stats`) and no chunk has arrived
     /// for several seconds.
     Resync(Vec<ChunkPos>),
+    /// Console API (`qwc.getBlock`): read the block at `pos` from the
+    /// authoritative world. Answered with `ServerMsg::BlockAt`.
+    GetBlock { pos: BlockPos },
+    /// Console API (`qwc.setBlock`): write `block` (registry id) at `pos`.
+    /// The server validates it and re-sends the dirty chunks to every
+    /// viewer that holds them — the same world-write path as player edits.
+    SetBlock { pos: BlockPos, block: u8 },
+    /// Console API (`qwc.setPlayerPos`): teleport this player's feet to
+    /// `pos` (the server clamps y into the world and zeroes velocity).
+    Teleport { pos: Vec3 },
 }
 
 /// Messages the server sends to the client.
@@ -130,6 +151,8 @@ pub enum ServerMsg {
     Stats(ServerStats),
     /// The NPC load dial changed (count, spacing).
     NpcLoad { count: u32, spacing: f32 },
+    /// Answer to `ClientMsg::GetBlock`: the authoritative block at `pos`.
+    BlockAt { pos: BlockPos, block: u8 },
 }
 
 impl ClientMsg {
@@ -198,6 +221,25 @@ impl ClientMsg {
                     p.i32(c.z);
                 }
                 T_RESYNC
+            }
+            ClientMsg::GetBlock { pos } => {
+                p.i32(pos.x);
+                p.i32(pos.y);
+                p.i32(pos.z);
+                T_GET_BLOCK
+            }
+            ClientMsg::SetBlock { pos, block } => {
+                p.i32(pos.x);
+                p.i32(pos.y);
+                p.i32(pos.z);
+                p.u8(*block);
+                T_SET_BLOCK
+            }
+            ClientMsg::Teleport { pos } => {
+                p.f32(pos.x);
+                p.f32(pos.y);
+                p.f32(pos.z);
+                T_TELEPORT
             }
         };
         p.frame(ty)
@@ -284,6 +326,16 @@ impl ClientMsg {
                 }
                 ClientMsg::Resync(v)
             }
+            T_GET_BLOCK => ClientMsg::GetBlock {
+                pos: BlockPos::new(d.i32()?, d.i32()?, d.i32()?),
+            },
+            T_SET_BLOCK => ClientMsg::SetBlock {
+                pos: BlockPos::new(d.i32()?, d.i32()?, d.i32()?),
+                block: d.u8()?,
+            },
+            T_TELEPORT => ClientMsg::Teleport {
+                pos: Vec3::new(d.f32()?, d.f32()?, d.f32()?),
+            },
             _ => return None,
         };
         if !d.exhausted() {
@@ -360,6 +412,13 @@ impl ServerMsg {
                 p.f32(*spacing);
                 T_NPC_LOAD
             }
+            ServerMsg::BlockAt { pos, block } => {
+                p.i32(pos.x);
+                p.i32(pos.y);
+                p.i32(pos.z);
+                p.u8(*block);
+                T_BLOCK_AT
+            }
         };
         p.frame(ty)
     }
@@ -429,6 +488,10 @@ impl ServerMsg {
                 let spacing = d.f32()?;
                 ServerMsg::NpcLoad { count, spacing }
             }
+            T_BLOCK_AT => ServerMsg::BlockAt {
+                pos: BlockPos::new(d.i32()?, d.i32()?, d.i32()?),
+                block: d.u8()?,
+            },
             _ => return None,
         };
         if !d.exhausted() {
@@ -698,6 +761,16 @@ mod tests {
                 ChunkPos::new(0, 1, -77),
                 ChunkPos::new(123, 2, 50),
             ]),
+            ClientMsg::GetBlock {
+                pos: BlockPos::new(-3, 42, 77),
+            },
+            ClientMsg::SetBlock {
+                pos: BlockPos::new(0, 0, -1),
+                block: 16,
+            },
+            ClientMsg::Teleport {
+                pos: crate::Vec3::new(-12.5, 34.25, 99.125),
+            },
         ];
         for m in &msgs {
             let enc = m.encode();
@@ -740,6 +813,10 @@ mod tests {
             ServerMsg::NpcLoad {
                 count: 64,
                 spacing: 16.0,
+            },
+            ServerMsg::BlockAt {
+                pos: BlockPos::new(8, 30, -12),
+                block: 3,
             },
         ];
         for m in &msgs {

@@ -28,13 +28,15 @@ use web_sys::{
     MessageEvent, MouseEvent, Window, WheelEvent,
 };
 
+use js_sys::Function;
+
 use qwencraft_client::Renderer;
 use qwencraft_server::protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
 use qwencraft_server::{
-    Action, AgentState, Input, Key, KeySet, Server, ServerStats, Streamer, WorldUpdate,
+    Action, AgentState, Input, Key, KeySet, Server, ServerStats, Streamer, Vec3, WorldUpdate,
 };
 use qwencraft_world::camera::view_projection;
-use qwencraft_world::{Block, ChunkPos, PLACEABLE};
+use qwencraft_world::{Block, BlockPos, BLOCKS, ChunkPos, PLACEABLE};
 
 /// Number of hotbar slots (the 9 placeable-block window the player can
 /// select with the digit keys / mouse wheel).
@@ -53,6 +55,16 @@ const RESYNC_COOLDOWN_MS: f64 = 10_000.0;
 
 fn log(msg: &str) {
     web_sys::console::log_1(&JsValue::from_str(msg));
+}
+
+/// Result of a console `getBlock` request (see `Backend::console_get_block`).
+enum ConsoleGetBlock {
+    /// Built-in: the authoritative answer, synchronously.
+    Answered(Block),
+    /// Remote: the request was sent; the answer arrives as `BlockAt`.
+    RequestSent,
+    /// Remote: no live connection (yet).
+    NotConnected,
 }
 
 /// Which server backs the game: the embedded one, or a headless one over
@@ -175,6 +187,63 @@ impl Backend {
             Backend::Remote(r) => {
                 if r.connected {
                     r.send(ClientMsg::Evicted(evicted));
+                }
+            }
+        }
+    }
+
+    /// Console `qwc.getBlock`: the built-in backend answers synchronously
+    /// from the embedded world; the remote backend round-trips the server
+    /// (the answer arrives as `ServerMsg::BlockAt`). Reads are never
+    /// answered from this client's own streamed copy — the server stays
+    /// the source of truth (golden rule 4).
+    fn console_get_block(&mut self, pos: BlockPos) -> ConsoleGetBlock {
+        match self {
+            Backend::Builtin { server, .. } => ConsoleGetBlock::Answered(server.block_at(pos)),
+            Backend::Remote(r) => {
+                if r.connected {
+                    r.send(ClientMsg::GetBlock { pos });
+                    ConsoleGetBlock::RequestSent
+                } else {
+                    ConsoleGetBlock::NotConnected
+                }
+            }
+        }
+    }
+
+    /// Console `qwc.setBlock`: built-in applies it to the embedded server;
+    /// remote sends `SetBlock` (the server applies it on the same
+    /// world-write path as a player edit and re-sends the dirty chunks to
+    /// every viewer that holds them on the next tick).
+    fn console_set_block(&mut self, pos: BlockPos, block: Block) -> Result<(), String> {
+        match self {
+            Backend::Builtin { server, .. } => server.console_edit_block(0, pos, block),
+            Backend::Remote(r) => {
+                if r.connected {
+                    r.send(ClientMsg::SetBlock {
+                        pos,
+                        block: block.as_u8(),
+                    });
+                    Ok(())
+                } else {
+                    Err("not connected to a server".to_string())
+                }
+            }
+        }
+    }
+
+    /// Console `qwc.setPlayerPos`: built-in teleports the embedded player;
+    /// remote sends `Teleport` (the server clamps y into the world and
+    /// zeroes velocity — the next PlayerState carries the new position).
+    fn console_teleport(&mut self, pos: Vec3) -> Result<(), String> {
+        match self {
+            Backend::Builtin { server, .. } => server.console_teleport(0, pos),
+            Backend::Remote(r) => {
+                if r.connected {
+                    r.send(ClientMsg::Teleport { pos });
+                    Ok(())
+                } else {
+                    Err("not connected to a server".to_string())
                 }
             }
         }
@@ -313,6 +382,12 @@ struct App {
 
     // Remote-server bookkeeping (the live link itself lives in `backend`).
     next_link_id: u32,
+    /// Pending `qwc.getBlock` round-trips (remote mode): (owning link id,
+    /// requested position, promise). Settled FIFO per position when the
+    /// `BlockAt` answer arrives; rejected when the link dies (a replaced
+    /// or dropped link will never answer them).
+    pending_blocks: Vec<(u32, BlockPos, JsPromise)>,
+
     /// NPC load armed via `?npcs=`, applied once a remote connection says
     /// Hello (the built-in backend already got it in `App::new`).
     pending_npcs: Option<(u32, f32)>,
@@ -415,6 +490,7 @@ impl App {
             #[cfg(feature = "verify")]
             gl_verify: None,
             next_link_id: 0,
+            pending_blocks: Vec::new(),
             pending_npcs: npcs,
             server_status,
             player_name: "Player".to_string(),
@@ -626,6 +702,20 @@ impl App {
         }
     }
 
+    /// Reject every pending `qwc.getBlock` promise owned by remote link
+    /// `id` (a closed or replaced link will never answer them).
+    fn reject_pending_blocks(&mut self, link_id: u32, reason: &str) {
+        let mut i = 0;
+        while i < self.pending_blocks.len() {
+            if self.pending_blocks[i].0 == link_id {
+                let (_, _, promise) = self.pending_blocks.remove(i);
+                promise.reject(reason);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     /// Update the connect panel's status line (and the console log).
     fn set_server_status(&mut self, msg: &str) {
         self.server_status.set_text_content(Some(msg));
@@ -648,6 +738,10 @@ impl App {
     /// Apply decoded server messages to the remote link `id`.
     fn apply_remote_messages(&mut self, id: u32, msgs: Vec<ServerMsg>, url: &str) {
         let mut hello_seed: Option<u64> = None;
+        // `BlockAt` answers are collected here and settle the matching
+        // pending `qwc.getBlock` promises after the link's state is done
+        // (the pending list lives on the App, not the link).
+        let mut block_ats: Vec<(BlockPos, u8)> = Vec::new();
         if let Backend::Remote(r) = &mut self.backend {
             if r.id != id {
                 return;
@@ -734,10 +828,24 @@ impl App {
                         }
                     }
                     ServerMsg::NpcLoad { count, spacing } => r.npc_load = (count, spacing),
+                    ServerMsg::BlockAt { pos, block } => block_ats.push((pos, block)),
                 }
             }
         } else {
             return;
+        }
+        // Settle the pending `qwc.getBlock` promises (FIFO per requested
+        // position: an answer matches the oldest outstanding request for
+        // that exact position on this link).
+        for (pos, block) in block_ats {
+            if let Some(i) = self
+                .pending_blocks
+                .iter()
+                .position(|(link, p, _)| *link == id && *p == pos)
+            {
+                let (_, _, promise) = self.pending_blocks.remove(i);
+                promise.resolve(block_obj(pos, Block::from_u8(block)));
+            }
         }
         if let Some(seed) = hello_seed {
             self.set_server_status(&format!("connected: {url} (seed {seed})"));
@@ -1224,6 +1332,11 @@ fn connect_remote(app: &Rc<RefCell<App>>, raw_url: &str) {
         let app_cb = app.clone();
         let cb = Closure::<dyn FnMut()>::new(move || {
             let mut a = app_cb.borrow_mut();
+            // Settle any `qwc.getBlock` promises this link will never
+            // answer. Done BEFORE the id check: the close also fires when
+            // the link is replaced by a new connection, which skips the
+            // rest of this handler.
+            a.reject_pending_blocks(id, "connection lost");
             if a.remote_id() != id {
                 return;
             }
@@ -1429,6 +1542,386 @@ fn parse_color_triple(s: &str) -> Option<[u8; 3]> {
     Some([parts[0], parts[1], parts[2]])
 }
 
+// ---- Browser console API (window.qwc) ------------------------------------
+//
+// A small JS API on `window` for inspecting and driving the game from the
+// browser console. Golden rule 4 holds: the client never mutates world
+// state itself — every write goes through the authoritative server
+// (built-in: a direct `Server` call; remote: protocol v6
+// `GetBlock`/`SetBlock`/`Teleport` messages), and reads are authoritative
+// too (`getBlock` round-trips the server even when this client already
+// streams that chunk).
+
+/// A JS Promise with Rust-side handles to settle it later. The
+/// `Promise::new` executor runs synchronously and hands over the browser's
+/// resolve/reject functions; stashing them lets a later event (the
+/// WebSocket `BlockAt` answer to a `qwc.getBlock` request) settle it.
+struct JsPromise {
+    promise: js_sys::Promise,
+    resolve: Function,
+    reject: Function,
+}
+
+impl JsPromise {
+    fn new() -> Self {
+        let (mut r, mut j) = (None, None);
+        let promise = js_sys::Promise::new(&mut |res, rej| {
+            r = Some(res);
+            j = Some(rej);
+        });
+        Self {
+            promise,
+            resolve: r.expect("the Promise executor must run synchronously"),
+            reject: j.expect("the Promise executor must run synchronously"),
+        }
+    }
+
+    fn resolve(&self, value: JsValue) {
+        let _ = self.resolve.call1(&JsValue::NULL, &value);
+    }
+
+    fn reject(&self, reason: &str) {
+        let _ = self.reject.call1(&JsValue::NULL, &JsValue::from_str(reason));
+    }
+}
+
+/// A promise already rejected (bad console arguments).
+fn rejected_promise(reason: &str) -> JsValue {
+    let p = JsPromise::new();
+    p.reject(reason);
+    p.promise.into()
+}
+
+/// Wrap a `Vec<JsValue>`-taking closure in a proper variadic JS function
+/// `(...args) => closure(args)`. A bare `into_js_value()` would expose the
+/// raw wasm adapter, which expects the arguments as ONE array — calling
+/// `qwc.getBlock(1, 2, 3)` from JS would then pass `undefined`. The wrapper
+/// also takes ownership of the closure (JS-GC lifetime: the wasm side is
+/// reclaimed when `window.qwc` drops the function).
+fn to_variadic_js(cb: Closure<dyn FnMut(Vec<JsValue>) -> JsValue>) -> Result<JsValue, JsValue> {
+    // factory: (cb) => (...args) => cb(args)
+    let make = js_sys::Function::new_no_args("return (cb) => (...args) => cb(args)");
+    let make: Function = make.call0(&JsValue::NULL)?.dyn_into()?;
+    make.call1(&JsValue::NULL, &cb.into_js_value())
+}
+
+/// `(x, y, z)` console arguments as integer block coordinates.
+fn parse_xyz_i32(args: &[JsValue]) -> Option<BlockPos> {
+    if args.len() < 3 {
+        return None;
+    }
+    let i32_arg = |v: &JsValue| -> Option<i32> {
+        let n = v.as_f64()?;
+        if !n.is_finite() || n.fract() != 0.0 {
+            return None;
+        }
+        i32::try_from(n as i64).ok()
+    };
+    Some(BlockPos::new(i32_arg(&args[0])?, i32_arg(&args[1])?, i32_arg(&args[2])?))
+}
+
+/// `(x, y, z)` console arguments as floating-point world coordinates
+/// (teleports accept fractional positions).
+fn parse_xyz_f32(args: &[JsValue]) -> Option<Vec3> {
+    if args.len() < 3 {
+        return None;
+    }
+    let f_arg = |v: &JsValue| -> Option<f32> {
+        let n = v.as_f64()?;
+        n.is_finite().then_some(n as f32)
+    };
+    Some(Vec3::new(f_arg(&args[0])?, f_arg(&args[1])?, f_arg(&args[2])?))
+}
+
+/// The `setBlock` block argument: a registry name (any case, e.g. "stone",
+/// "air") or a numeric id (0..=16 — the whole registry, not just the
+/// hotbar: the server accepts console edits for every block).
+fn parse_block_arg(v: &JsValue) -> Option<Block> {
+    if let Some(n) = v.as_f64() {
+        if n.is_finite() && n.fract() == 0.0 && (0.0..=16.0).contains(&n) {
+            return Some(Block::from_u8(n as u8));
+        }
+        return None;
+    }
+    let s = v.as_string()?.trim().to_lowercase();
+    BLOCKS
+        .iter()
+        .find(|b| b.name.to_lowercase() == s)
+        .map(|b| Block::from_u8(b.id))
+}
+
+/// The JS value for a block read: `{x, y, z, id, name}`.
+fn block_obj(pos: BlockPos, block: Block) -> JsValue {
+    let o = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&o, &JsValue::from_str("x"), &JsValue::from_f64(pos.x as f64));
+    let _ = js_sys::Reflect::set(&o, &JsValue::from_str("y"), &JsValue::from_f64(pos.y as f64));
+    let _ =
+        js_sys::Reflect::set(&o, &JsValue::from_str("z"), &JsValue::from_f64(pos.z as f64));
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("id"),
+        &JsValue::from_f64(block.as_u8() as f64),
+    );
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("name"),
+        &JsValue::from_str(block.info().name),
+    );
+    o.into()
+}
+
+/// The console usage help (logged on startup and by `qwc.help()`).
+fn console_greeting() -> &'static str {
+    "Qwencraft console API — window.qwc:
+  qwc.getBlock(x, y, z)        → Promise<{x, y, z, id, name}>
+  qwc.setBlock(x, y, z, block) → Promise (block: a name like \"stone\" or an id; \"air\" breaks)
+  qwc.getPlayer()              → {x, y, z, yaw, pitch, onGround, fly, flySpeed, name}
+  qwc.setPlayerPos(x, y, z)    → Promise (teleport; y is the feet height)
+  qwc.listBlocks()             → [{id, name, placeable, solid, water}, …]
+  qwc.help()                   → show this help again"
+}
+
+/// Install the browser console API on `window.qwc` and log the usage
+/// greeting. All writes go through the authoritative server and all reads
+/// are authoritative (see the section notes above).
+fn install_console_api(app: &Rc<RefCell<App>>) -> Result<(), JsValue> {
+    // qwc.getBlock(x, y, z) → Promise<{x, y, z, id, name}>.
+    // Built-in: answered synchronously from the embedded world. Remote:
+    // a round-trip — the promise is parked in `pending_blocks` and settled
+    // when the `BlockAt` answer arrives (or rejected when the link dies).
+    let get_block = {
+        let app = app.clone();
+        Closure::<dyn FnMut(Vec<JsValue>) -> JsValue>::new(
+            move |args: Vec<JsValue>| -> JsValue {
+                let Some(pos) = parse_xyz_i32(&args) else {
+                    return rejected_promise(
+                        "getBlock(x, y, z) — three integer coordinates expected",
+                    );
+                };
+            let mut a = app.borrow_mut();
+            let p = JsPromise::new();
+            match a.backend.console_get_block(pos) {
+                ConsoleGetBlock::Answered(block) => p.resolve(block_obj(pos, block)),
+                ConsoleGetBlock::RequestSent => {
+                    let link = a.remote_id();
+                    let pending: JsValue = p.promise.clone().into();
+                    a.pending_blocks.push((link, pos, p));
+                    return pending;
+                }
+                ConsoleGetBlock::NotConnected => {
+                    p.reject("not connected to a server")
+                }
+            }
+            p.promise.into()
+            },
+        )
+    };
+
+    // qwc.setBlock(x, y, z, block) → Promise<{x, y, z, id, name}>.
+    // Resolves once the server has applied the edit (built-in: immediately;
+    // remote: when the message is queued — the world update then arrives
+    // via the normal chunk stream).
+    let set_block = {
+        let app = app.clone();
+        Closure::<dyn FnMut(Vec<JsValue>) -> JsValue>::new(
+            move |args: Vec<JsValue>| -> JsValue {
+                let Some(pos) = parse_xyz_i32(&args) else {
+                    return rejected_promise(
+                        "setBlock(x, y, z, block) — three integer coordinates + a block expected",
+                    );
+                };
+            let Some(block) = args.get(3).and_then(parse_block_arg) else {
+                return rejected_promise(
+                    "setBlock: block must be a name (\"stone\", \"air\", …) or an id (0-16) — see qwc.listBlocks()",
+                );
+            };
+            let mut a = app.borrow_mut();
+            let p = JsPromise::new();
+            match a.backend.console_set_block(pos, block) {
+                Ok(()) => p.resolve(block_obj(pos, block)),
+                Err(e) => p.reject(&e),
+            }
+            p.promise.into()
+            },
+        )
+    };
+
+    // qwc.getPlayer() → the latest player state (synchronous: the client
+    // already holds it — the camera source of truth).
+    let get_player = {
+        let app = app.clone();
+        Closure::<dyn FnMut(Vec<JsValue>) -> JsValue>::new(
+            move |_args: Vec<JsValue>| -> JsValue {
+                let a = app.borrow();
+            let p = a.backend.player_state();
+            let o = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("x"),
+                &JsValue::from_f64(p.pos.x as f64),
+            );
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("y"),
+                &JsValue::from_f64(p.pos.y as f64),
+            );
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("z"),
+                &JsValue::from_f64(p.pos.z as f64),
+            );
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("yaw"),
+                &JsValue::from_f64(p.yaw as f64),
+            );
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("pitch"),
+                &JsValue::from_f64(p.pitch as f64),
+            );
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("onGround"),
+                &JsValue::from_bool(p.on_ground),
+            );
+            let _ =
+                js_sys::Reflect::set(&o, &JsValue::from_str("fly"), &JsValue::from_bool(p.fly));
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("flySpeed"),
+                &JsValue::from_f64(p.fly_speed as f64),
+            );
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("name"),
+                &JsValue::from_str(&p.name),
+            );
+            o.into()
+            },
+        )
+    };
+
+    // qwc.setPlayerPos(x, y, z) → Promise (teleport; the server clamps y
+    // into the world and the next PlayerState carries the new position).
+    let set_player_pos = {
+        let app = app.clone();
+        Closure::<dyn FnMut(Vec<JsValue>) -> JsValue>::new(
+            move |args: Vec<JsValue>| -> JsValue {
+                let Some(pos) = parse_xyz_f32(&args) else {
+                    return rejected_promise(
+                        "setPlayerPos(x, y, z) — three numbers expected (y is the feet height)",
+                    );
+                };
+            let mut a = app.borrow_mut();
+            let p = JsPromise::new();
+            match a.backend.console_teleport(pos) {
+                Ok(()) => {
+                    let o = js_sys::Object::new();
+                    let _ = js_sys::Reflect::set(&o, &JsValue::from_str("ok"), &JsValue::from_bool(true));
+                    let _ = js_sys::Reflect::set(
+                        &o,
+                        &JsValue::from_str("x"),
+                        &JsValue::from_f64(pos.x as f64),
+                    );
+                    let _ = js_sys::Reflect::set(
+                        &o,
+                        &JsValue::from_str("y"),
+                        &JsValue::from_f64(pos.y as f64),
+                    );
+                    let _ = js_sys::Reflect::set(
+                        &o,
+                        &JsValue::from_str("z"),
+                        &JsValue::from_f64(pos.z as f64),
+                    );
+                    p.resolve(o.into());
+                }
+                Err(e) => p.reject(&e),
+            }
+            p.promise.into()
+            },
+        )
+    };
+
+    // qwc.listBlocks() → the whole registry (id, name, physics flags).
+    let list_blocks =
+        Closure::<dyn FnMut(Vec<JsValue>) -> JsValue>::new(
+            move |_args: Vec<JsValue>| -> JsValue {
+                let arr = js_sys::Array::new();
+            for b in BLOCKS.iter() {
+                let o = js_sys::Object::new();
+                let _ = js_sys::Reflect::set(
+                    &o,
+                    &JsValue::from_str("id"),
+                    &JsValue::from_f64(b.id as f64),
+                );
+                let _ = js_sys::Reflect::set(
+                    &o,
+                    &JsValue::from_str("name"),
+                    &JsValue::from_str(b.name),
+                );
+                let _ = js_sys::Reflect::set(
+                    &o,
+                    &JsValue::from_str("placeable"),
+                    &JsValue::from_bool(b.placeable),
+                );
+                let _ =
+                    js_sys::Reflect::set(&o, &JsValue::from_str("solid"), &JsValue::from_bool(b.solid));
+                let _ =
+                    js_sys::Reflect::set(&o, &JsValue::from_str("water"), &JsValue::from_bool(b.water));
+                let _ = arr.push(&o.into());
+            }
+            arr.into()
+            },
+        );
+
+    // qwc.help() → log the usage again.
+    let help = Closure::<dyn FnMut(Vec<JsValue>) -> JsValue>::new(
+        move |_args: Vec<JsValue>| -> JsValue {
+            log(console_greeting());
+            JsValue::UNDEFINED
+        },
+    );
+
+    let api = js_sys::Object::new();
+    // Each closure is wrapped into a variadic JS function and handed to the
+    // JS GC (see `to_variadic_js`): the functions live on `window.qwc` for
+    // the life of the page, and the wasm side is reclaimed when JS drops
+    // them.
+    js_sys::Reflect::set(
+        &api,
+        &JsValue::from_str("getBlock"),
+        &to_variadic_js(get_block)?,
+    )?;
+    js_sys::Reflect::set(
+        &api,
+        &JsValue::from_str("setBlock"),
+        &to_variadic_js(set_block)?,
+    )?;
+    js_sys::Reflect::set(
+        &api,
+        &JsValue::from_str("getPlayer"),
+        &to_variadic_js(get_player)?,
+    )?;
+    js_sys::Reflect::set(
+        &api,
+        &JsValue::from_str("setPlayerPos"),
+        &to_variadic_js(set_player_pos)?,
+    )?;
+    js_sys::Reflect::set(
+        &api,
+        &JsValue::from_str("listBlocks"),
+        &to_variadic_js(list_blocks)?,
+    )?;
+    js_sys::Reflect::set(&api, &JsValue::from_str("help"), &to_variadic_js(help)?)?;
+
+    let window: Window = web_sys::window().expect("no window");
+    js_sys::Reflect::set(&JsValue::from(window), &JsValue::from_str("qwc"), &api)?;
+
+    log(console_greeting());
+    Ok(())
+}
+
 #[wasm_bindgen(start)]
 pub fn start() -> Result<(), JsValue> {
     let window: Window = web_sys::window().expect("no window");
@@ -1525,6 +2018,8 @@ pub fn start() -> Result<(), JsValue> {
     // Build the hotbar slots (block list comes from the shared registry,
     // so a new block appears here automatically once it is placeable).
     app.borrow_mut().build_hotbar();
+    // Browser console API (window.qwc) + the usage greeting in the console.
+    install_console_api(&app)?;
     if let Some((c, s)) = npcs {
         log(&format!("Qwencraft: NPC load test armed: {c} agents @ {s:.0} m spacing"));
     }

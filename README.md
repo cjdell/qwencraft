@@ -158,6 +158,28 @@ tree logs, leaves, snow-grass, red/yellow flowers) plus the buildable
 set — planks, cobblestone, brick, glass (translucent, rendered in the
 water blending pass with its own alpha), TNT and obsidian.
 
+## Browser console API (`window.qwc`)
+
+Open the browser devtools console and you'll find a usage greeting plus a
+small API on `window.qwc` for inspecting and driving the game. Everything
+goes through the authoritative server (built-in: direct calls; remote:
+the protocol's `GetBlock`/`SetBlock`/`Teleport` messages), so the client
+still never mutates world state itself:
+
+| call | result |
+| --- | ------ |
+| `qwc.getBlock(x, y, z)` | `Promise<{x, y, z, id, name}>` — the authoritative block at that position (round-trips the server, even on a remote connection) |
+| `qwc.setBlock(x, y, z, block)` | `Promise<{x, y, z, id, name}>` — writes the block; `block` is a name (`"stone"`, `"air"` to break, any case) or a registry id. The whole registry is accepted — including things the hotbar can't place, like water |
+| `qwc.getPlayer()` | `{x, y, z, yaw, pitch, onGround, fly, flySpeed, name}` — the latest player state (synchronous) |
+| `qwc.setPlayerPos(x, y, z)` | `Promise` — teleports the player (feet at `y`; the server clamps y into the world) |
+| `qwc.listBlocks()` | `[{id, name, placeable, solid, water}, …]` |
+| `qwc.help()` | re-logs the usage |
+
+Edits made from the console behave exactly like in-game edits: the dirty
+chunks re-send to every viewer that holds them (other players in the
+shared world see them), they land in the delta layer, and they show up in
+the dashboard event log.
+
 **Procedural textures.** Each block face samples a `TEX_*` id that travels
 as a vertex attribute; the fragment stage dispatches to one **WGSL
 function per texture** (`qwencraft-client/src/textures.wgsl`): mottled
@@ -219,13 +241,15 @@ WebSocket upgrade.
   client renders the latest snapshot it holds (at 60 Hz the difference is
   one tick, which reads as smooth).
 - **Wire protocol** (`qwencraft-server/src/protocol.rs`): little-endian
-  binary frames, versioned (currently 5). Server → client: `Hello` (seed +
+  binary frames, versioned (currently 6). Server → client: `Hello` (seed +
   your player id), player/agent state (agents carry name + colour), chunk
-  regions, world stats, NPC load echo. Client → server: the player profile
+  regions, world stats, NPC load echo, and `BlockAt` (the answer to a
+  console `getBlock`). Client → server: the player profile
   (name + colour, sent right after connect), input snapshots, actions
   (break; place with stamped aim **plus the selected block id**, validated
   against the block registry on the server), chunk re-send requests
-  (terrain-pool eviction), NPC load changes, and **resync** — the client
+  (terrain-pool eviction), NPC load changes, the console API's
+  `GetBlock`/`SetBlock`/`Teleport`, and **resync** — the client
   reports the set of chunks it holds whenever its receive count falls far
   behind the server's send count with nothing arriving for a few seconds
   (the signature of a burst lost in transit on a flaky link); the server

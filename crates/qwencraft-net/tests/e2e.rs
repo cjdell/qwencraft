@@ -32,6 +32,8 @@ struct Sample {
     /// client sees every player's name).
     player_names: Vec<String>,
     npc_load: Option<(u32, f32)>,
+    /// Console `getBlock` answers (position, block id), in arrival order.
+    block_ats: Vec<(BlockPos, u8)>,
 }
 
 impl Default for Sample {
@@ -44,6 +46,7 @@ impl Default for Sample {
             players: 0,
             player_names: Vec::new(),
             npc_load: None,
+            block_ats: Vec::new(),
         }
     }
 }
@@ -74,6 +77,7 @@ fn sample(sock: &mut Sock, secs: f32) -> Sample {
                                 }
                             }
                         }
+                        ServerMsg::BlockAt { pos, block } => s.block_ats.push((pos, block)),
                         ServerMsg::Hello { .. } => {}
                     }
                 }
@@ -322,6 +326,90 @@ async fn resync_resends_lost_chunks() {
         missing.is_empty(),
         "resync must re-send every chunk the client reported missing ({} not re-sent, first few: {missing:?})",
         missing.len()
+    );
+
+    drop(sock);
+}
+
+/// Console API over the wire (protocol v6): `qwc.getBlock` round-trips to
+/// the authoritative world, `qwc.setBlock` lands in the shared world (the
+/// edited chunk re-sends), and `qwc.setPlayerPos` teleports the player.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn console_get_set_block_and_teleport() {
+    let ep = serve(ServerOptions {
+        seed: SEED,
+        port: 0,
+        ..Default::default()
+    })
+    .await
+    .expect("serve");
+    let addr = ep.addr;
+    let (mut sock, _) = connect(&format!("ws://{addr}/ws")).expect("connect");
+    let player_id = expect_hello(&mut sock, "console");
+    assert_eq!(player_id, 0);
+
+    // Let the spawn view settle; the player is standing (no input sent).
+    let s = sample(&mut sock, 2.0);
+    let p = s.player.expect("no player state");
+    assert!(p.on_ground, "player should be standing for the block reads");
+
+    // 1) GetBlock at the block under the feet: the answer must come back
+    // as a BlockAt for exactly that position (non-air: standing on it).
+    let under = BlockPos::new(p.pos.x as i32, p.pos.y as i32 - 1, p.pos.z as i32);
+    send(&mut sock, &ClientMsg::GetBlock { pos: under });
+    let s = sample(&mut sock, 2.0);
+    let answer = s
+        .block_ats
+        .iter()
+        .find(|(q, _)| *q == under)
+        .expect("server must answer GetBlock with a BlockAt for that position");
+    assert_ne!(answer.1, 0, "the block under a standing player must not be air");
+
+    // 2) SetBlock: write stone a few blocks above the ground, then read it
+    // back through the authoritative read (and the edited chunk region
+    // re-sends, so the edit renders for this and every other viewer).
+    let edit = BlockPos::new(under.x, under.y + 3, under.z);
+    send(&mut sock, &ClientMsg::SetBlock { pos: edit, block: 3 }); // stone
+    send(&mut sock, &ClientMsg::GetBlock { pos: edit });
+    let s = sample(&mut sock, 3.0);
+    assert_eq!(
+        s.block_ats.iter().find(|(q, _)| *q == edit).map(|(_, b)| *b),
+        Some(3),
+        "the console edit must be readable back (block_ats: {:?})",
+        s.block_ats
+    );
+    let edit_chunk = ChunkPos::of(edit);
+    assert!(
+        s.chunk_positions.contains(&edit_chunk),
+        "the edited chunk region must re-send after the console edit"
+    );
+    // Out-of-world y is a no-op: the server stays alive and answers reads.
+    send(
+        &mut sock,
+        &ClientMsg::SetBlock {
+            pos: BlockPos::new(under.x, 9999, under.z),
+            block: 3,
+        },
+    );
+    let s = sample(&mut sock, 1.0);
+    assert!(s.player.is_some(), "server must stay alive after a rejected edit");
+
+    // 3) Teleport: the next PlayerState must be at the destination (no
+    // input is flowing, so only the teleport moves the player).
+    let target = Vec3::new(p.pos.x, p.pos.y, p.pos.z + 40.0);
+    send(&mut sock, &ClientMsg::Teleport { pos: target });
+    let s = sample(&mut sock, 1.5);
+    let p2 = s.player.expect("no player state after teleport");
+    assert!(
+        (p2.pos.z - target.z).abs() < 3.0,
+        "teleport should have moved the player to z≈{:.0} (was {:.0}, now {:.0})",
+        target.z,
+        p.pos.z,
+        p2.pos.z
+    );
+    assert!(
+        (p2.pos.x - target.x).abs() < 1.0,
+        "teleport x must hold (no horizontal input)"
     );
 
     drop(sock);

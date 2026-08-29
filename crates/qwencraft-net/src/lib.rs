@@ -44,6 +44,7 @@ use qwencraft_server::protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
 use qwencraft_server::{
     Action, Input, KeySet, Server, Streamer, WorldUpdate, TICK_HZ,
 };
+use qwencraft_world::Block;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -561,6 +562,27 @@ fn apply_inbound(world: &Mutex<WorldState>, player_id: u32, m: ClientMsg) {
                 eprintln!(
                     "[qwencraft-net] player {player_id}: resync — {n} chunk regions re-sent (transit loss detected)"
                 );
+            }
+        }
+        ClientMsg::GetBlock { pos } => {
+            // Console API: answer from the authoritative world (the client
+            // never reads its own streamed copy), to this connection only.
+            let block = server.block_at(pos);
+            if let Some(conn) = players.get(&player_id) {
+                let _ = conn.tx.send(ServerMsg::BlockAt { pos, block: block.as_u8() });
+            }
+        }
+        ClientMsg::SetBlock { pos, block } => {
+            // Console API: the same world-write path as a player edit
+            // (dirty chunks re-send to every viewer holding them on the
+            // next tick); the server validates and reports rejections.
+            if let Err(e) = server.console_edit_block(player_id, pos, Block::from_u8(block)) {
+                eprintln!("[qwencraft-net] player {player_id}: console edit rejected: {e}");
+            }
+        }
+        ClientMsg::Teleport { pos } => {
+            if let Err(e) = server.console_teleport(player_id, pos) {
+                eprintln!("[qwencraft-net] player {player_id}: teleport rejected: {e}");
             }
         }
     }

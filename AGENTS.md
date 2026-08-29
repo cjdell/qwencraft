@@ -116,7 +116,7 @@ crates/
                       (one viewer) and the net server (one per
                       connection) share the logic. protocol.rs = versioned
                       little-endian binary wire codec (ClientMsg/ServerMsg,
-                      encode/decode/decode_stream, currently v5: Hello
+                      encode/decode/decode_stream, currently v6: Hello
                       carries the player id, agents carry name + colour,
                       ClientMsg::Profile sends the player's name/colour,
                       Action::Place carries the selected block id (u8 —
@@ -127,9 +127,16 @@ crates/
                       — the server re-sends every ready chunk in view the
                       client doesn't have (the streamer's `sent` set can't
                       know a chunk was lost before the client ever saw it
-                      — eviction reports only cover chunks once held))
-                      shared by both transports;
-                      pure + host-testable, no deps.
+                      — eviction reports only cover chunks once held),
+                      and the browser console API (window.qwc): GetBlock/
+                      BlockAt (authoritative reads — answered from the
+                      world, never from the client's own streamed copy),
+                      SetBlock and Teleport (applied via
+                      Server::console_edit_block / console_teleport —
+                      the same world-write path as player edits, but the
+                      whole registry is accepted, not just is_placeable)
+                      shared by both transports; pure + host-testable, no
+                      deps.
   qwencraft-net/      HEADLESS server binary. tokio + tokio-tungstenite.
                       SINGLE PORT (one authority): dispatch_conn sniffs
                       the first bytes — TLS ClientHello → accept TLS
@@ -229,6 +236,25 @@ crates/
                       PLACEABLE blocks (DOM, built from the registry),
                       digits 1–9 + mouse wheel select (wheel ignored in
                       text inputs), right-click places the selected block.
+                      CONSOLE API (window.qwc): getBlock (Promise —
+                      builtin answers synchronously, remote round-trips
+                      GetBlock→BlockAt via pending_blocks, FIFO per pos,
+                      rejected when the link dies), setBlock (name or id;
+                      whole registry, server-side validation), getPlayer
+                      (sync from the latest state), setPlayerPos (teleport),
+                      listBlocks, help; a usage greeting is logged on
+                      startup (install_console_api). Promises are made
+                      with js_sys::Promise::new — its executor runs
+                      synchronously and hands over the resolve/reject
+                      functions (stashed in JsPromise). Closures become variadic JS functions
+                      via to_variadic_js: a bare Closure::into_js_value()
+                      exposes the RAW wasm adapter, which expects the
+                      Vec<JsValue> arguments as a single array —
+                      qwc.getBlock(1,2,3) from JS would pass undefined
+                      and crash in passArrayJsValueToWasm. (wasm-bindgen
+                      0.2.100 removed JsValue::from_fn — into_js_value is
+                      the current way to expose a Closure as a JS
+                      function.)
                       verify_gl.rs = WebGL2 "shadow renderer" that
                       re-renders the scene for headless pixel
                       verification — behind the `verify` cargo feature

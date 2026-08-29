@@ -511,6 +511,60 @@ impl Server {
         std::mem::take(&mut self.dirty)
     }
 
+    /// Read the block at `pos` (materialising its chunk on demand).
+    /// Authoritative for the client's console `getBlock` in both
+    /// transports — the client never answers block reads from its own
+    /// streamed copy.
+    pub fn block_at(&mut self, pos: BlockPos) -> Block {
+        self.world.block_at(pos)
+    }
+
+    /// Console block edit (protocol v6 `SetBlock`, `qwc.setBlock`): write
+    /// `block` at `pos` for player `id`. Same world-write path as a player
+    /// edit — delta layer, dirty tracking (viewers holding the chunk get
+    /// the region re-sent on the next tick), and every agent's local block
+    /// window invalidated. Unlike the player's `Place` action it accepts
+    /// the whole registry (0..=16) — including Air (break) and
+    /// non-placeables like Water — because it is an operator/debug tool,
+    /// not gameplay.
+    pub fn console_edit_block(&mut self, id: u32, pos: BlockPos, block: Block) -> Result<(), String> {
+        if !pos.in_world_y() {
+            return Err(format!(
+                "y {} is outside the world (0..{})",
+                pos.y, WORLD_HEIGHT
+            ));
+        }
+        let dirty = self.world.set_block(pos, block);
+        self.invalidate_caches_at(pos);
+        self.dirty.extend(dirty);
+        self.emit(format!(
+            "player {id} set {block:?} at ({}, {}, {}) via console",
+            pos.x, pos.y, pos.z
+        ));
+        Ok(())
+    }
+
+    /// Console teleport (protocol v6 `Teleport`, `qwc.setPlayerPos`): move
+    /// player `id`'s feet to `pos`. Y is clamped into the world and the
+    /// velocity zeroed, so the next tick settles the agent (it falls to
+    /// the ground, or keeps flying). The local block window rebuilds on
+    /// the next step (its centre cell changed).
+    pub fn console_teleport(&mut self, id: u32, pos: Vec3) -> Result<(), String> {
+        if !pos.x.is_finite() || !pos.y.is_finite() || !pos.z.is_finite() {
+            return Err("position must be finite numbers".to_string());
+        }
+        let idx = self.agent_index(id);
+        let y = pos.y.clamp(0.0, (WORLD_HEIGHT - 1) as f32);
+        self.agents[idx].pos = Vec3::new(pos.x, y, pos.z);
+        self.agents[idx].vel = Vec3::default();
+        self.agents[idx].on_ground = false;
+        self.emit(format!(
+            "player {id} teleported to ({:.0}, {:.0}, {:.0}) via console",
+            pos.x, y, pos.z
+        ));
+        Ok(())
+    }
+
     /// The configured NPC load (count, spacing in blocks).
     pub fn npc_load_config(&self) -> (u32, f32) {
         (self.npc_count, self.npc_spacing)
@@ -1839,5 +1893,93 @@ mod tests {
             rx.try_iter().any(|e| e == "player 0 switched to walk mode"),
             "expected a walk-mode event"
         );
+    }
+
+    /// Console API (protocol v6): block edits and teleports are authoritative
+    /// server operations with the same world-write path as player edits.
+    #[test]
+    fn console_block_edit_and_teleport() {
+        let mut s = Server::new(1337);
+        let p0 = s.player_state().pos;
+
+        // GetBlock: a block in the air above the player reads back as Air.
+        let air = BlockPos::new(p0.x as i32, p0.y as i32 + 4, p0.z as i32);
+        assert_eq!(s.block_at(air), Block::Air);
+
+        // SetBlock: write stone (a placeable) and read it back through the
+        // authoritative read; the edit must dirty its chunk (so viewers
+        // holding it get the region re-sent).
+        s.console_edit_block(0, air, Block::Stone).unwrap();
+        assert_eq!(s.block_at(air), Block::Stone);
+        assert!(!s.drain_dirty().is_empty(), "the edit must dirty its chunk");
+
+        // SetBlock: the console is wider than the hotbar — Air breaks, and
+        // non-placeables (Water) are accepted too.
+        s.console_edit_block(0, air, Block::Air).unwrap();
+        assert_eq!(s.block_at(air), Block::Air);
+        s.console_edit_block(0, air, Block::Water).unwrap();
+        assert_eq!(s.block_at(air), Block::Water);
+        s.console_edit_block(0, air, Block::Air).unwrap();
+        s.drain_dirty();
+
+        // Out-of-world y is rejected (no edit, no delta).
+        let deltas_before = s.world.delta_count();
+        assert!(s.console_edit_block(0, BlockPos::new(8, WORLD_HEIGHT, 8), Block::Stone).is_err());
+        assert!(s.console_edit_block(0, BlockPos::new(8, -1, 8), Block::Stone).is_err());
+        assert_eq!(s.world.delta_count(), deltas_before);
+
+        // Teleport: the player moves, and the next ticks keep them alive at
+        // the destination (the physics settles them onto the ground).
+        let dest = Vec3::new(p0.x + 12.5, p0.y, p0.z + 7.5);
+        s.console_teleport(0, dest).unwrap();
+        assert!((s.player_state().pos.x - dest.x).abs() < 1e-3);
+        tick_n(&mut s, 60);
+        let p1 = s.player_state().pos;
+        assert!((p1.x - dest.x).abs() < 3.0, "no horizontal input: x must hold");
+        assert!(p1.y >= 0.0, "settled y must be in the world");
+
+        // Teleport: out-of-range y clamps into the world (not an error).
+        s.console_teleport(0, Vec3::new(dest.x, 10_000.0, dest.z)).unwrap();
+        assert!(s.player_state().pos.y <= (WORLD_HEIGHT - 1) as f32);
+        s.console_teleport(0, Vec3::new(dest.x, -50.0, dest.z)).unwrap();
+        assert!(s.player_state().pos.y >= 0.0);
+
+        // Teleport: NaN is rejected.
+        assert!(s.console_teleport(0, Vec3::new(f32::NAN, 10.0, 10.0)).is_err());
+    }
+
+    /// Console edits must reach every viewer holding the chunk (the shared
+    /// world sees `qwc.setBlock` from any connection, like a player edit).
+    #[test]
+    fn console_edit_resends_to_other_viewers() {
+        let mut s = Server::new_world(1337);
+        let a = s.add_player();
+        let b = s.add_player();
+        let mut st_a = Streamer::new();
+        let mut st_b = Streamer::new();
+        for _ in 0..180 {
+            s.tick(1.0 / 60.0);
+            let va = s.agent_state(a).pos;
+            let vb = s.agent_state(b).pos;
+            st_a.tick(s.world_mut(), va);
+            st_b.tick(s.world_mut(), vb);
+            let _ = st_a.take();
+            let _ = st_b.take();
+        }
+        let pa = s.agent_state(a);
+        let edited = BlockPos::new(pa.pos.x as i32, pa.pos.y as i32 - 1, pa.pos.z as i32);
+        let chunk = ChunkPos::of(edited);
+        s.console_edit_block(a, edited, Block::Obsidian).unwrap();
+        let dirty = s.drain_dirty();
+        st_b.apply_edits(s.world(), &dirty);
+        let resent = st_b.take();
+        assert!(
+            resent
+                .iter()
+                .any(|u| matches!(u, WorldUpdate::Chunk { pos, .. } if *pos == chunk)),
+            "viewer B must receive the console edit's chunk (got {} resends)",
+            resent.len()
+        );
+        assert_eq!(s.world.block_at(edited), Block::Obsidian);
     }
 }
