@@ -6,6 +6,7 @@
 //! reads while the server task ticks in the background.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use qwencraft_net::{serve, ServerOptions};
@@ -97,6 +98,25 @@ fn send(sock: &mut Sock, msg: &ClientMsg) {
         .expect("send");
 }
 
+/// A throwaway data directory for one test: the server's world save lives
+/// here, and tests must never share a save (parallel tests + restart
+/// round-trips). Fresh each call (tag + pid + nanos is unique).
+fn test_data_dir(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "qwencraft-net-test-{}-{}-{}",
+        tag,
+        std::process::id(),
+        nanos
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+
 /// First frame must be the binary Hello; return the player id it carries
 /// (the client uses it to skip rendering its own sphere).
 fn expect_hello(sock: &mut Sock, name: &str) -> u32 {
@@ -148,6 +168,7 @@ async fn end_to_end_single_player() {
     let ep = serve(ServerOptions {
         seed: SEED,
         port: 0, // single port: /ws + /dashboard + game client
+        data_dir: test_data_dir("single"),
         ..Default::default()
     })
     .await
@@ -281,6 +302,7 @@ async fn resync_resends_lost_chunks() {
     let ep = serve(ServerOptions {
         seed: SEED,
         port: 0,
+        data_dir: test_data_dir("resync"),
         ..Default::default()
     })
     .await
@@ -345,6 +367,7 @@ async fn console_get_set_block_and_teleport() {
     let ep = serve(ServerOptions {
         seed: SEED,
         port: 0,
+        data_dir: test_data_dir("console"),
         ..Default::default()
     })
     .await
@@ -426,6 +449,7 @@ async fn two_connections_share_one_world() {
     let ep = serve(ServerOptions {
         seed: SEED,
         port: 0, // single port: /ws + /dashboard + game client
+        data_dir: test_data_dir("shared"),
         ..Default::default()
     })
     .await
@@ -537,6 +561,7 @@ async fn wss_serves_encrypted_sessions() {
         cert: Some(cert.clone()),
         key: Some(key.clone()),
         debug: false,
+        data_dir: test_data_dir("wss"),
     })
     .await
     .expect("serve wss");
@@ -634,6 +659,7 @@ async fn dashboard_http_serves_status_map_and_assets() {
     let ep = serve(ServerOptions {
         seed: SEED,
         port: 0, // single port: /ws + /dashboard + game client
+        data_dir: test_data_dir("dashboard"),
         ..Default::default()
     })
     .await
@@ -734,4 +760,155 @@ async fn dashboard_http_serves_status_map_and_assets() {
     assert_eq!(code, 404);
 
     drop(sock);
+}
+
+/// World persistence end to end: edits made in one server process must
+/// survive a restart into a fresh process (same data dir). The save file is
+/// the seed + the world's block overrides (terrain is a pure function of
+/// the seed), so a restarted server replays the edits onto the same terrain
+/// and answers authoritative reads from them. A clean stop (`stop()`) flushes
+/// the final save; a seed mismatch must fail fast instead of loading a
+/// foreign world.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn world_edits_survive_restart() {
+    use qwencraft_server::save;
+
+    let data_dir = test_data_dir("restart");
+    let save_path = data_dir.join(save::SAVE_FILE_NAME);
+
+    // Session 1: connect, make two deterministic console edits, and read
+    // them back (proving they are live before the restart).
+    let edit_a = BlockPos::new(20, 40, 20);
+    let edit_b = BlockPos::new(21, 40, 20);
+    let ep = serve(ServerOptions {
+        seed: SEED,
+        port: 0,
+        data_dir: data_dir.clone(),
+        ..Default::default()
+    })
+    .await
+    .expect("serve session 1");
+    let (mut sock, _) = connect(&format!("ws://{}/ws", ep.addr)).expect("connect 1");
+    expect_hello(&mut sock, "session 1");
+    let _ = sample(&mut sock, 0.5);
+    send(&mut sock, &ClientMsg::SetBlock { pos: edit_a, block: 13 }); // brick
+    send(&mut sock, &ClientMsg::SetBlock { pos: edit_b, block: 6 }); // log
+    send(&mut sock, &ClientMsg::GetBlock { pos: edit_a });
+    send(&mut sock, &ClientMsg::GetBlock { pos: edit_b });
+    let s = sample(&mut sock, 2.0);
+    assert_eq!(
+        s.block_ats.iter().find(|(q, _)| *q == edit_a).map(|(_, b)| *b),
+        Some(13),
+        "session 1 must read back its own edit_a (block_ats: {:?})",
+        s.block_ats
+    );
+    assert_eq!(
+        s.block_ats.iter().find(|(q, _)| *q == edit_b).map(|(_, b)| *b),
+        Some(6),
+        "session 1 must read back its own edit_b (block_ats: {:?})",
+        s.block_ats
+    );
+    drop(sock);
+    // Clean stop: the tick loop takes a final save before returning. (The
+    // periodic save may not have fired in this short session — the final
+    // save is what makes restarts lossless.)
+    ep.shutdown.stop().await;
+    assert!(save_path.exists(), "clean stop must write the save file");
+    let (saved_seed, saved_edits) =
+        save::decode(&std::fs::read(&save_path).expect("read save")).expect("decode save");
+    assert_eq!(saved_seed, SEED, "save must carry the world's seed");
+    assert!(
+        saved_edits.iter().any(|e| e.pos == edit_a && e.block.as_u8() == 13)
+            && saved_edits.iter().any(|e| e.pos == edit_b && e.block.as_u8() == 6),
+        "save must contain both edits (got {:?})",
+        saved_edits
+    );
+
+    // Session 2: a FRESH server on the same data dir. It replays the save
+    // into fresh terrain; the edits must read back as saved, and untouched
+    // terrain must still be pure (a control read at a non-edited spot).
+    let control = BlockPos::new(22, 40, 20);
+    let ep2 = serve(ServerOptions {
+        seed: SEED,
+        port: 0,
+        data_dir: data_dir.clone(),
+        ..Default::default()
+    })
+    .await
+    .expect("serve session 2");
+    let (mut sock2, _) = connect(&format!("ws://{}/ws", ep2.addr)).expect("connect 2");
+    expect_hello(&mut sock2, "session 2");
+    let _ = sample(&mut sock2, 0.5);
+    send(&mut sock2, &ClientMsg::GetBlock { pos: edit_a });
+    send(&mut sock2, &ClientMsg::GetBlock { pos: edit_b });
+    send(&mut sock2, &ClientMsg::GetBlock { pos: control });
+    let s2 = sample(&mut sock2, 2.0);
+    assert_eq!(
+        s2.block_ats.iter().find(|(q, _)| *q == edit_a).map(|(_, b)| *b),
+        Some(13),
+        "edit_a must survive the restart (block_ats: {:?})",
+        s2.block_ats
+    );
+    assert_eq!(
+        s2.block_ats.iter().find(|(q, _)| *q == edit_b).map(|(_, b)| *b),
+        Some(6),
+        "edit_b must survive the restart (block_ats: {:?})",
+        s2.block_ats
+    );
+    // The control position was never edited: it must still be pure terrain
+    // — computed here from the seed directly (the world crate is pure).
+    let expected_control = qwencraft_server::World::new(SEED).block_at(control).as_u8();
+    assert_eq!(
+        s2.block_ats.iter().find(|(q, _)| *q == control).map(|(_, b)| *b),
+        Some(expected_control),
+        "untouched terrain must be intact after the restart (block_ats: {:?})",
+        s2.block_ats
+    );
+    drop(sock2);
+    ep2.shutdown.stop().await;
+}
+
+/// A save is bound to the seed that generated its terrain. Starting a server
+/// with a DIFFERENT seed against an existing save must fail fast (not
+/// silently replay edits onto the wrong world).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_seed_mismatch_fails_fast() {
+    use qwencraft_server::save;
+
+    let data_dir = test_data_dir("seedmismatch");
+    let save_path = data_dir.join(save::SAVE_FILE_NAME);
+    // Write a save bound to SEED directly (no session needed).
+    std::fs::write(
+        &save_path,
+        save::encode(SEED, &[qwencraft_server::Edit {
+            pos: BlockPos::new(5, 30, 5),
+            block: qwencraft_world::Block::Stone,
+        }]),
+    )
+    .expect("write save");
+
+    // Same seed: loads fine.
+    let ok = serve(ServerOptions {
+        seed: SEED,
+        port: 0,
+        data_dir: data_dir.clone(),
+        ..Default::default()
+    })
+    .await
+    .expect("matching seed must load the save");
+    ok.shutdown.stop().await;
+
+    // Different seed: must refuse to start.
+    let err = serve(ServerOptions {
+        seed: SEED + 1,
+        port: 0,
+        data_dir: data_dir.clone(),
+        ..Default::default()
+    })
+    .await
+    .expect_err("a seed mismatch must fail fast");
+    assert!(
+        err.contains("seed"),
+        "the error should mention the seed mismatch (got: {err})"
+    );
 }

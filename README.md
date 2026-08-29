@@ -208,8 +208,9 @@ still never mutates world state itself:
 
 Edits made from the console behave exactly like in-game edits: the dirty
 chunks re-send to every viewer that holds them (other players in the
-shared world see them), they land in the delta layer, and they show up in
-the dashboard event log.
+shared world see them), they are recorded in the override layer (the
+world's persistent state — see the headless server's save file), and they
+show up in the dashboard event log.
 
 **Procedural textures.** Each block face samples a `TEX_*` id that travels
 as a vertex attribute; the fragment stage dispatches to one **WGSL
@@ -232,7 +233,7 @@ it.
 | ------------------- | ----------------------------------------------------------------------- |
 | `qwencraft-world`   | The **block registry** (all block types in one const table: physics, face texture ids, CPU colours, placeability), seeded noise/terrain, 16³ chunks with 26³ region payloads, chunk meshing (voxel lighting + AO), view-projection math + the minimap's column queries, shared math types |
 | `qwencraft-server`  | The authoritative game server: infinite lazy world (chunks generated on demand), agent simulation (player + NPCs) with a per-agent local block window, fixed-tick physics, delta-based world updates, NPC load test. Plus the wire `protocol` module (binary codec shared by both transports). Runs in-process in the browser *and* inside the headless server |
-| `qwencraft-net`     | Headless server, single port: WebSocket at `/ws` (`ws://`, `wss://` with `--cert`/`--key`), dashboard at `/dashboard/` (bare `/dashboard` 302-redirects to it), game page at `/`, plus `/api/*` + `/healthz`; one shared world for all connections, 60 Hz tick loop, per-connection streaming |
+| `qwencraft-net`     | Headless server, single port: WebSocket at `/ws` (`ws://`, `wss://` with `--cert`/`--key`), dashboard at `/dashboard/` (bare `/dashboard` 302-redirects to it), game page at `/`, plus `/api/*` + `/healthz`; one shared world for all connections, 60 Hz tick loop, per-connection streaming, periodic + shutdown world save/restore (`--data-dir`) |
 | `qwencraft-client`  | WebGPU (wgpu 27) renderer: shared terrain-mesh buffer pool, the WGSL shader + the **procedural block textures** (one WGSL function per texture id, validated by naga in the host tests), sphere agents, fog, first-person camera |
 | `qwencraft-web`     | wasm glue: input (keyboard/pointer lock), **hotbar** (9-slot block selector), HUD, main loop, backend abstraction (embedded server or remote over WebSocket) |
 | `web/`              | `index.html` page hosting the wasm app                                  |
@@ -271,6 +272,17 @@ WebSocket upgrade.
   independent of the client's frame rate and streams state snapshots; the
   client renders the latest snapshot it holds (at 60 Hz the difference is
   one tick, which reads as smooth).
+- **The world persists across restarts.** Terrain is a pure function of
+  the seed, so the world's entire persistent state is the sparse set of
+  blocks players have edited (the *override layer* in `World`). The server
+  snapshots that (seed + overrides, one small record per edited block —
+  see `qwencraft-server/src/save.rs`) to `world.save` in `--data-dir`
+  (default `./data`) every few seconds / 64 edits and on a clean stop
+  (Ctrl-C), atomically (temp file + rename — a crash never leaves a torn
+  save). On start, an existing save is replayed onto fresh terrain, so
+  players' builds survive a restart. The save is bound to its seed: a
+  mismatched `--seed` fails fast at startup. (Agents are not yet
+  persisted — players re-join at spawn.)
 - **Wire protocol** (`qwencraft-server/src/protocol.rs`): little-endian
   binary frames, versioned (currently 6). Server → client: `Hello` (seed +
   your player id), player/agent state (agents carry name + colour), chunk

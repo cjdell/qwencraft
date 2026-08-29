@@ -79,9 +79,14 @@ export TMPDIR="${TMPDIR:-/tmp}"
 PROF_DIR="${TMPDIR}/qwencraft-remote-chrome-prof"
 rm -rf "$PROF_DIR"
 mkdir -p "$PROF_DIR"
+# Fresh per-run world save dir (the server persists block edits there; a
+# stale save from a previous run must not leak into this scenario).
+SAVE_DIR="${TMPDIR}/qwencraft-remote-save"
+rm -rf "$SAVE_DIR"
+mkdir -p "$SAVE_DIR"
 
 echo "==> headless server on ws://127.0.0.1:${WS_PORT}/ws (seed ${SEED})"
-"$SRV_BIN" --seed "$SEED" --port "$WS_PORT" --bind 127.0.0.1 >"$WS_LOG" 2>&1 &
+"$SRV_BIN" --seed "$SEED" --port "$WS_PORT" --bind 127.0.0.1 --data-dir "$SAVE_DIR" >"$WS_LOG" 2>&1 &
 SRV=$!
 python3 -m http.server "$PORT" --directory web/dist --bind 127.0.0.1 >/dev/null 2>&1 &
 HTTP=$!

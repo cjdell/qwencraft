@@ -20,7 +20,9 @@
 #[cfg(not(target_arch = "wasm32"))]
 const USAGE: &str = "\
 usage: qwencraft-net [options]
-  --seed N       world seed (default 1337)
+  --seed N       world seed (default 1337). Must match the seed of an
+                 existing save file in --data-dir (the save is bound to the
+                 seed that generated its terrain).
   --port N       listen port (default 9000; 0 = let the OS pick). One port
                  hosts everything: WebSocket at /ws, dashboard at /dashboard,
                  game client at /
@@ -28,6 +30,11 @@ usage: qwencraft-net [options]
   --cert FILE    TLS certificate (PEM) — with --key, the port speaks
                  wss:// + https://
   --key FILE     TLS private key (PEM, RSA or PKCS#8)
+  --data-dir DIR directory for the world save file (default ./data; the
+                 save is DIR/world.save). The world's block edits are
+                 snapshotted there periodically and on clean shutdown;
+                 on start, an existing save is replayed into the fresh
+                 terrain.
   --debug        log per-second per-player streaming telemetry to stderr
   -h, --help     this help";
 
@@ -73,6 +80,10 @@ fn parse_opts(args: &[String]) -> Result<qwencraft_net::ServerOptions, String> {
             "--key" => {
                 opts.key = Some(std::path::PathBuf::from(next_value(args, &mut i, "--key")?))
             }
+            "--data-dir" => {
+                opts.data_dir =
+                    std::path::PathBuf::from(next_value(args, &mut i, "--data-dir")?)
+            }
             "--debug" => opts.debug = true,
             other => return Err(format!("unknown option {other:?} (see --help)")),
         }
@@ -99,7 +110,10 @@ async fn main() {
             eprintln!("qwencraft-net: ready (connect a browser to {ws}://{a}{})", qwencraft_net::WS_PATH);
             eprintln!("qwencraft-net: dashboard at {http}://{a}/dashboard/ · game client at {http}://{a}/");
             let _ = tokio::signal::ctrl_c().await;
-            eprintln!("qwencraft-net: shutting down");
+            eprintln!("qwencraft-net: shutting down (saving world)");
+            // Clean stop: the tick loop takes a final world save before it
+            // returns; only then does the runtime tear the rest down.
+            endpoints.shutdown.stop().await;
         }
         Err(e) => {
             eprintln!("qwencraft-net: {e}");

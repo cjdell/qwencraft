@@ -60,8 +60,14 @@ for d in /nix/store/*/share/vulkan/icd.d; do
 done
 export VK_ICD_FILENAMES="${VK_ICD:-}"
 
+# Fresh per-run world save dir (see remote_test.sh — a stale save must not
+# leak into this scenario).
+SAVE_DIR="${TMPDIR:-/tmp}/qwencraft-wan-save"
+rm -rf "$SAVE_DIR"
+mkdir -p "$SAVE_DIR"
+
 echo "==> transit-loss test: server :${WS_PORT}  proxy :${PROXY_PORT} (rtt=${RTT_MS}ms, drop 4MB of frames after 80KB)  page :${PORT}"
-"$SRV_BIN" --seed "$SEED" --port "$WS_PORT" --bind 127.0.0.1 --debug >"$WS_LOG" 2>&1 &
+"$SRV_BIN" --seed "$SEED" --port "$WS_PORT" --bind 127.0.0.1 --debug --data-dir "$SAVE_DIR" >"$WS_LOG" 2>&1 &
 SRV=$!
 openssl req -x509 -newkey rsa:2048 -keyout "$PROF_DIR/wan.key" -out "$PROF_DIR/wan.crt" -days 1 -nodes -subj "/CN=127.0.0.1" >/dev/null 2>&1
 python3 -m http.server "$PORT" --directory web/dist --bind 127.0.0.1 >/dev/null 2>&1 &

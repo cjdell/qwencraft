@@ -47,9 +47,14 @@ export TMPDIR="${TMPDIR:-/tmp}"
 PROF_DIR="${TMPDIR}/qwencraft-dashboard-chrome-prof"
 rm -rf "$PROF_DIR"
 mkdir -p "$PROF_DIR"
+# Fresh per-run world save dir (see remote_test.sh — a stale save must not
+# leak into this scenario).
+SAVE_DIR="${TMPDIR}/qwencraft-dashboard-save"
+rm -rf "$SAVE_DIR"
+mkdir -p "$SAVE_DIR"
 
 echo "==> headless server (ws://127.0.0.1:${WS_PORT}/ws + /dashboard, seed ${SEED})"
-"$SRV_BIN" --seed "$SEED" --port "$WS_PORT" --bind 127.0.0.1 >"$SRV_LOG" 2>&1 &
+"$SRV_BIN" --seed "$SEED" --port "$WS_PORT" --bind 127.0.0.1 --data-dir "$SAVE_DIR" >"$SRV_LOG" 2>&1 &
 SRV=$!
 cleanup() { kill "$SRV" 2>/dev/null || true; }
 trap cleanup EXIT

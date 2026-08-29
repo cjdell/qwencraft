@@ -67,7 +67,7 @@ writes temp files):
 
 | Command | What it does |
 |---|---|
-| `cargo test` | All host unit tests (106: world 45 incl. the terrain-pool allocator tests and the face-UV-span test, client 2 — naga validation of the WGSL shader module + texture-function census, server 49 incl. the resync repair test and the analog-stick (touch joystick) input tests, net e2e 6 incl. a wss TLS round-trip, a two-client shared-world test, a dashboard HTTP test, and a resync-over-a-real-socket test, net lib 4 — the map). The only place Rust tests run — **wasm tests can't execute here** (but the WGSL *is* checked here, see the client tests). |
+| `cargo test` | All host unit tests (118: world 45 incl. the terrain-pool allocator tests and the face-UV-span test, client 2 — naga validation of the WGSL shader module + texture-function census, server 59 incl. the resync repair test, the analog-stick (touch joystick) input tests, the save-file codec tests, and the save/reload world-equivalence test, net e2e 8 incl. a wss TLS round-trip, a two-client shared-world test, a dashboard HTTP test, a resync-over-a-real-socket test, and the world-save restart + seed-mismatch tests, net lib 4 — the map). The only place Rust tests run — **wasm tests can't execute here** (but the WGSL *is* checked here, see the client tests). |
 | `./scripts/build.sh` | Release build → `web/dist` (wasm-bindgen 0.2.100). |
 | `./scripts/serve.sh` | Serve `web/dist` at `http://localhost:8080` (python3). |
 | `./scripts/serve.sh --https` | Same over TLS with a self-signed cert (`.certs/`, generated once via openssl). **Required for LAN play** — WebGPU needs a secure context. |
@@ -146,8 +146,29 @@ crates/
                       Server::console_edit_block / console_teleport —
                       the same world-write path as player edits, but the
                       whole registry is accepted, not just is_placeable)
-                      shared by both transports; pure + host-testable, no
-                      deps.
+                      shared by both transports. WORLD PERSISTENCE: World
+                      (world.rs) = lazily generated chunk buffers + the
+                      OVERRIDE LAYER (`overrides: HashMap<ChunkPos,
+                      HashMap<BlockPos, Block>>`) + an append-only `edits`
+                      history (the dashboard map streams from it).
+                      `set_block` records EVERY edit in the override layer
+                      whether or not the chunk is materialised (the buffer
+                      is a fast-read optimisation, not the record), and
+                      `generate` folds the overrides into fresh terrain.
+                      Terrain is a pure function of the seed, so seed +
+                      the last-wins override set IS the world's entire
+                      persistent state. save.rs = the pure save-file codec
+                      for exactly that (magic `QWCS` + version + seed +
+                      count + one 13-byte record per override — a
+                      last-wins SET: no order, no replay semantics, no
+                      history; decode rejects anything malformed — a
+                      corrupt save must fail loudly, never silently start
+                      fresh). World::load/apply_saved replays a save into
+                      a fresh world (override layer + edit history, so the
+                      map picks it up via the normal watermark sync);
+                      Server::new_world_loaded wraps that. save.rs is
+                      wasm-safe (no I/O); the file handling lives in
+                      qwencraft-net. Pure + host-testable, no deps.
   qwencraft-net/      HEADLESS server binary. tokio + tokio-tungstenite.
                       SINGLE PORT (one authority): dispatch_conn sniffs
                       the first bytes — TLS ClientHello → accept TLS
@@ -184,8 +205,31 @@ crates/
                       "server sent it, client never got it"). The
                       Server's event_sink (set by serve()) feeds the
                       EventLog (own mutex, cap 256 — must stay outside
-                      the world lock). examples/ws_probe.rs = tiny manual
-                      protocol probe (connect, decode Hello). HOST-ONLY:
+                      the world lock). WORLD SAVE (owned here; the codec
+                      is pure in qwencraft-server::save): serve() loads
+                      `--data-dir/world.save` BEFORE binding (absent →
+                      fresh world; corrupt → fail fast; seed mismatch →
+                      fail fast — the save is bound to the seed that
+                      generated its terrain) and replays it via
+                      Server::new_world_loaded. The tick loop snapshots
+                      the world's persistent state (seed + the complete
+                      last-wins override set) to the save file when new
+                      edits land and either 5 s elapsed or 64+ new edits
+                      accumulated — encoded under the world lock, written
+                      off the tick path via spawn_blocking, atomically
+                      (unique tmp + fsync + rename — a crash never leaves
+                      a torn save; a failed save leaves the last good
+                      snapshot and the trigger retries). A clean stop
+                      (main's ctrl_c → ServerEndpoints.shutdown.stop()
+                      → the tick loop's watch channel) awaits any
+                      in-flight save, takes one final snapshot (only when
+                      there are unsaved edits), and returns before the
+                      runtime tears the rest down. `--data-dir` defaults
+                      to ./data (gitignored); the test scripts point it at
+                      a fresh scratch dir per run so stale saves never
+                      leak into a scenario. examples/ws_probe.rs = tiny
+                      manual protocol probe (connect, decode Hello).
+                      HOST-ONLY:
                       deps are cfg(not(target_arch = "wasm32"))-gated so
                       the shared workspace wasm build stays green (empty
                       lib + stub bin on wasm). e2e tests (tests/e2e.rs)
@@ -195,8 +239,12 @@ crates/
                       edit sync), a wss round-trip with an
                       openssl-generated self-signed cert, the
                       dashboard HTTP endpoints (single port, /dashboard/),
-                      and resync (a client reporting a partial chunk set
-                      gets exactly the missing regions re-sent).
+                      resync (a client reporting a partial chunk set gets
+                      exactly the missing regions re-sent), and world
+                      persistence (edits survive a clean-stop + fresh
+                      server on the same data dir, read back via the
+                      authoritative GetBlock; a save whose seed doesn't
+                      match the --seed fails fast).
   qwencraft-client/   WebGPU renderer. Terrain buffer POOL (one 2M-vertex
                       vbo/ibo, chunks own index ranges, compaction when
                       full), opaque+water pipelines (translucent water +

@@ -6,7 +6,10 @@
 //!
 //! Key properties:
 //! - Infinite world, chunks generated lazily from a seed (never all at once).
-//! - World edits are stored as deltas and applied to chunks when they exist.
+//! - World edits are recorded in a sparse block-override layer (last-wins
+//!   per position) that is applied to chunks when they materialise; terrain
+//!   is a pure function of the seed, so seed + overrides IS the world's
+//!   persistent state (see [`save`]).
 //! - Each agent keeps a dense local block window (a small 3D volume of the
 //!   entire world around it) so steady-state physics lookups are served from
 //!   the window and never touch the full chunk buffers.
@@ -14,6 +17,7 @@
 pub mod agent;
 pub mod local_block_cache;
 pub mod protocol;
+pub mod save;
 pub mod world;
 
 mod input;
@@ -128,6 +132,17 @@ pub struct Server {
 }
 
 impl Server {
+    /// Create a world from a seed and saved block overrides (from a save
+    /// file — see [`save`]) and no agents. The overrides are replayed into
+    /// the fresh world: they live in the override layer (applied when
+    /// chunks materialise) and in the edit history, so the dashboard map
+    /// picks them up through its normal sync path.
+    pub fn new_world_loaded(seed: u64, saved: &[Edit]) -> Self {
+        let mut s = Self::new_world(seed);
+        s.world.apply_saved(saved);
+        s
+    }
+
     /// Create a world with the given seed and no agents. Network servers use
     /// this and add one player per connection ([`Self::add_player`]).
     pub fn new_world(seed: u64) -> Self {
@@ -695,7 +710,7 @@ impl Server {
         ServerStats {
             chunks_generated: self.world.chunks_generated(),
             chunks_sent,
-            deltas: self.world.delta_count(),
+            deltas: self.world.override_count(),
             agents: self.agents.len(),
             npcs,
             cache,
@@ -1418,7 +1433,7 @@ mod tests {
         }
         let dirty = s.world.set_block(target, Block::Air);
         assert!(dirty.contains(&qwencraft_world::ChunkPos::of(target)));
-        assert!(s.world.delta_count() >= 1, "delta should be stored");
+        assert!(s.world.override_count() >= 1, "override should be recorded");
         assert_eq!(s.world.block_at(target), Block::Air);
         // Regenerating the chunk must keep the delta applied.
         s.world.generate(qwencraft_world::ChunkPos::of(target));
@@ -1947,11 +1962,11 @@ mod tests {
         s.console_edit_block(0, air, Block::Air).unwrap();
         s.drain_dirty();
 
-        // Out-of-world y is rejected (no edit, no delta).
-        let deltas_before = s.world.delta_count();
+        // Out-of-world y is rejected (no edit, no override).
+        let overrides_before = s.world.override_count();
         assert!(s.console_edit_block(0, BlockPos::new(8, WORLD_HEIGHT, 8), Block::Stone).is_err());
         assert!(s.console_edit_block(0, BlockPos::new(8, -1, 8), Block::Stone).is_err());
-        assert_eq!(s.world.delta_count(), deltas_before);
+        assert_eq!(s.world.override_count(), overrides_before);
 
         // Teleport: the player moves, and the next ticks keep them alive at
         // the destination (the physics settles them onto the ground).

@@ -42,7 +42,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use qwencraft_server::protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
 use qwencraft_server::{
-    Action, Input, KeySet, Server, Streamer, WorldUpdate, TICK_HZ,
+    save, Action, Edit, Input, KeySet, Server, Streamer, WorldUpdate, TICK_HZ,
 };
 use qwencraft_world::Block;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
@@ -57,7 +57,8 @@ pub const WS_PATH: &str = "/ws";
 /// Server options (see [`serve`]).
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
-    /// World seed.
+    /// World seed. If a save file exists in [`Self::data_dir`], its seed
+    /// must match (the save is bound to the seed that generated it).
     pub seed: u64,
     /// Interface to bind.
     pub bind: IpAddr,
@@ -71,6 +72,10 @@ pub struct ServerOptions {
     pub key: Option<PathBuf>,
     /// Per-second per-player streaming telemetry to stderr (`--debug`).
     pub debug: bool,
+    /// Directory holding the world save file (`world.save`). Created on
+    /// first save. The world's block edits are snapshotted here
+    /// periodically and on clean shutdown (see [`serve`]).
+    pub data_dir: PathBuf,
 }
 
 impl Default for ServerOptions {
@@ -82,15 +87,91 @@ impl Default for ServerOptions {
             cert: None,
             key: None,
             debug: false,
+            data_dir: PathBuf::from("data"),
         }
     }
 }
 
-/// The actual bound address after [`serve`].
+/// The actual bound address after [`serve`], plus the shutdown handle.
 pub struct ServerEndpoints {
     /// The single TCP port: `ws://addr/ws`, `http://addr/dashboard/`,
     /// `http://addr/` (game client).
     pub addr: SocketAddr,
+    /// Signals a clean stop and waits for it (including the final world
+    /// save). Dropping it without [`ServerShutdown::stop`] lets the runtime
+    /// tear the loops down without saving.
+    pub shutdown: ServerShutdown,
+}
+
+impl std::fmt::Debug for ServerEndpoints {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerEndpoints")
+            .field("addr", &self.addr)
+            .finish()
+    }
+}
+
+/// Clean-stop handle for the shared-world tick loop (returned by [`serve`]).
+pub struct ServerShutdown {
+    stop: tokio::sync::watch::Sender<bool>,
+    tick_task: tokio::task::JoinHandle<()>,
+}
+
+impl ServerShutdown {
+    /// Signal the tick loop to stop and wait for it to finish — including
+    /// the final world save. The rest of the server (accept/session loops)
+    /// is torn down by the runtime when the process exits.
+    pub async fn stop(self) {
+        let _ = self.stop.send(true);
+        let _ = self.tick_task.await;
+    }
+}
+
+/// How often the world is snapshotted to disk when new edits have landed
+/// (whichever comes first; a clean shutdown always saves, so a crash costs
+/// at most this much edit history).
+const SAVE_INTERVAL: Duration = Duration::from_secs(5);
+const SAVE_EVERY_EDITS: usize = 64;
+
+/// Read and validate the world save file at `path` (None when absent).
+///
+/// A save is bound to the seed that generated its terrain: a mismatched
+/// seed means the file belongs to a different world, and loading it would
+/// replay edits onto the wrong terrain. Fail fast with a clear message.
+fn load_save(path: &std::path::Path, seed: u64) -> Result<Option<Vec<Edit>>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let (saved_seed, edits) = save::decode(&bytes)
+        .map_err(|e| format!("corrupt save file {}: {e} — delete it to start a fresh world", path.display()))?;
+    if saved_seed != seed {
+        return Err(format!(
+            "save file {} was created with seed {saved_seed}, but the server was started with seed {seed} — delete the save or start with the matching seed",
+            path.display()
+        ));
+    }
+    Ok(Some(edits))
+}
+
+/// Atomically replace `path` with `bytes`: write a unique temp file in the
+/// same directory, fsync it, then rename over the target. The rename is
+/// atomic on POSIX, so a reader (or a concurrent saver) only ever sees a
+/// complete old or complete new save — never a torn one.
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "world.save".to_string());
+    let tmp = dir.join(format!("{name}.tmp-{}", std::process::id()));
+    let mut f = std::fs::File::create(&tmp)?;
+    std::io::Write::write_all(&mut f, bytes)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Bounded, thread-safe event log for the dashboard (join/leave, world
@@ -155,6 +236,14 @@ struct Conn {
 /// the current tokio runtime.
 pub async fn serve(opts: ServerOptions) -> Result<ServerEndpoints, String> {
     let tls = load_tls(&opts)?;
+
+    // Load the world save (if any) BEFORE binding: a corrupt or seed-
+    // mismatched save must fail fast, not mid-listen. The save stores the
+    // seed + the world's block overrides — terrain is a pure function of
+    // the seed, so that pair is the world's entire persistent state.
+    let save_path = opts.data_dir.join(save::SAVE_FILE_NAME);
+    let saved_edits = load_save(&save_path, opts.seed)?;
+
     let listener = TcpListener::bind((opts.bind, opts.port))
         .await
         .map_err(|e| format!("bind {}:{}: {e}", opts.bind, opts.port))?;
@@ -170,8 +259,19 @@ pub async fn serve(opts: ServerOptions) -> Result<ServerEndpoints, String> {
 
     let started = Instant::now();
     let events = Arc::new(EventLog::new());
+    let server = match &saved_edits {
+        Some(edits) => {
+            eprintln!(
+                "[qwencraft-net] loaded {} saved block edits from {}",
+                edits.len(),
+                save_path.display()
+            );
+            Server::new_world_loaded(opts.seed, edits)
+        }
+        None => Server::new_world(opts.seed),
+    };
     let world = Arc::new(Mutex::new(WorldState {
-        server: Server::new_world(opts.seed),
+        server,
         players: HashMap::new(),
         events: events.clone(),
         started,
@@ -196,18 +296,31 @@ pub async fn serve(opts: ServerOptions) -> Result<ServerEndpoints, String> {
 
     events.push(
         0.0,
-        format!(
-            "server started (seed {}, {scheme}://{addr}{WS_PATH})",
-            opts.seed
-        ),
+        match &saved_edits {
+            Some(edits) => format!(
+                "server started (seed {}, {scheme}://{addr}{WS_PATH}, {} saved edits loaded)",
+                opts.seed,
+                edits.len()
+            ),
+            None => format!("server started (seed {}, {scheme}://{addr}{WS_PATH})", opts.seed),
+        },
     );
 
-    // The single tick loop for the shared world.
-    {
-        let world = world.clone();
-        let map = map.clone();
-        tokio::spawn(tick_loop(world, map, debug));
-    }
+    // The single tick loop for the shared world (also owns the periodic
+    // world save and the final save on clean shutdown).
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let tick_task = tokio::spawn(tick_loop(
+        world.clone(),
+        map.clone(),
+        debug,
+        save_path.clone(),
+        opts.seed,
+        stop_rx,
+    ));
+    let shutdown = ServerShutdown {
+        stop: stop_tx,
+        tick_task,
+    };
     let seed = opts.seed;
     let world_accept = world.clone();
     tokio::spawn(async move {
@@ -229,7 +342,7 @@ pub async fn serve(opts: ServerOptions) -> Result<ServerEndpoints, String> {
         }
     });
 
-    Ok(ServerEndpoints { addr })
+    Ok(ServerEndpoints { addr, shutdown })
 }
 
 /// Route one accepted connection: read the first bytes, then
@@ -435,7 +548,21 @@ where
 /// then for each connected player streams the world around them and sends
 /// that player's state, all agents, and stats. New world edits are also
 /// forwarded to the dashboard map state (last-wins overlay).
-async fn tick_loop(world: Arc<Mutex<WorldState>>, map: Arc<Mutex<map::MapState>>, debug: bool) {
+///
+/// This loop owns the world save: when enough new edits have landed (or
+/// the save interval elapsed) it snapshots the world's persistent state
+/// (seed + block overrides) to `save_path` — encoded under the world lock,
+/// written off the tick path via `spawn_blocking`, atomically replaced.
+/// On a clean shutdown signal it awaits any in-flight save, takes one final
+/// snapshot, and returns (see [`ServerShutdown::stop`]).
+async fn tick_loop(
+    world: Arc<Mutex<WorldState>>,
+    map: Arc<Mutex<map::MapState>>,
+    debug: bool,
+    save_path: std::path::PathBuf,
+    seed: u64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / TICK_HZ as f64));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last = Instant::now();
@@ -446,11 +573,40 @@ async fn tick_loop(world: Arc<Mutex<WorldState>>, map: Arc<Mutex<map::MapState>>
     // How much of the world's (append-only) edit history has been synced to
     // the dashboard map already.
     let mut last_edit_seq = 0usize;
+    // World save state: how many edits the save file on disk covers, when
+    // the last save was attempted, and an in-flight save (edit count it
+    // covers + its blocking write handle).
+    let mut disk_edits = world.lock().unwrap().server.world().edits().len();
+    let mut last_save_try = Instant::now();
+    let mut saving: Option<(usize, tokio::task::JoinHandle<std::io::Result<()>>)> = None;
 
     loop {
-        tick.tick().await;
+        // A clean shutdown signal breaks out (the final save runs below);
+        // otherwise this yields at most one tick period.
+        tokio::select! {
+            _ = tick.tick() => {}
+            changed = shutdown.changed() => {
+                if changed.is_ok() && *shutdown.borrow_and_update() {
+                    break;
+                }
+            }
+        }
         let dt = last.elapsed().as_secs_f64();
         last = Instant::now();
+
+        // Reap a finished periodic save (a failed one leaves the on-disk
+        // file at the last good snapshot — the trigger below retries).
+        if let Some((count, h)) = saving.take() {
+            if h.is_finished() {
+                match h.await {
+                    Ok(Ok(())) => disk_edits = count,
+                    Ok(Err(e)) => eprintln!("[qwencraft-net] world save failed: {e}"),
+                    Err(e) => eprintln!("[qwencraft-net] world save task failed: {e}"),
+                }
+            } else {
+                saving = Some((count, h));
+            }
+        }
 
         let mut w = world.lock().unwrap();
         // Destructure into disjoint field references so the per-connection
@@ -500,6 +656,26 @@ async fn tick_loop(world: Arc<Mutex<WorldState>>, map: Arc<Mutex<map::MapState>>
             }
         }
 
+        // Periodic world save: snapshot the world's persistent state when
+        // new edits have landed and either the interval elapsed or a big
+        // enough batch accumulated. The snapshot is the COMPLETE override
+        // set (a set, not a journal), so skipping/missing a save costs
+        // nothing beyond the crash window.
+        let n_edits = server.world().edits().len();
+        if saving.is_none()
+            && n_edits > disk_edits
+            && (n_edits - disk_edits >= SAVE_EVERY_EDITS || last_save_try.elapsed() >= SAVE_INTERVAL)
+        {
+            let overrides: Vec<Edit> = server.world().overrides().collect();
+            let bytes = save::encode(seed, &overrides);
+            let path = save_path.clone();
+            saving = Some((
+                n_edits,
+                tokio::task::spawn_blocking(move || atomic_write(&path, &bytes)),
+            ));
+            last_save_try = Instant::now();
+        }
+
         tick_count += 1;
         if debug && tick_count % 60 == 0 { // one line per second at 60 Hz
             // Per-second per-player streaming telemetry: how many distinct
@@ -515,6 +691,36 @@ async fn tick_loop(world: Arc<Mutex<WorldState>>, map: Arc<Mutex<map::MapState>>
                     p.x, p.y, p.z
                 );
             }
+        }
+    }
+
+    // Clean shutdown: wait for any in-flight periodic save, then take one
+    // final snapshot (it may predate the newest edits — the last periodic
+    // save is only as fresh as the last tick that triggered it).
+    if let Some((_, h)) = saving.take() {
+        if let Err(e) = h.await {
+            eprintln!("[qwencraft-net] world save task failed: {e}");
+        }
+    }
+    let (n_edits, overrides) = {
+        let w = world.lock().unwrap();
+        let world = w.server.world();
+        (world.edits().len(), world.overrides().collect::<Vec<Edit>>())
+    };
+    if n_edits > disk_edits {
+        let bytes = save::encode(seed, &overrides);
+        let path = save_path.clone();
+        let write_path = path.clone();
+        match tokio::task::spawn_blocking(move || atomic_write(&write_path, &bytes)).await {
+            Ok(Ok(())) => {
+                eprintln!(
+                    "[qwencraft-net] world saved: {} edits → {}",
+                    n_edits,
+                    path.display()
+                );
+            }
+            Ok(Err(e)) => eprintln!("[qwencraft-net] final world save failed: {e}"),
+            Err(e) => eprintln!("[qwencraft-net] final world save task failed: {e}"),
         }
     }
 }

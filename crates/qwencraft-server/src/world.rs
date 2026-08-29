@@ -1,8 +1,14 @@
-//! The world: lazily generated chunk buffers + a delta layer for edits.
+//! The world: lazily generated chunk buffers + the block-override layer.
 //!
 //! Memory strategy: only chunks that are actually needed (streamed to a
-//! client or probed by an agent) are materialised. Edits to ungenerated
-//! chunks are stored as deltas and applied when the chunk is generated.
+//! client or probed by an agent) are materialised. Terrain is a pure
+//! function of (seed, coordinates), so the world's *persistent* state is
+//! just the sparse set of positions that deviate from generated terrain —
+//! the `overrides` map. Every edit is recorded there (whether or not the
+//! chunk is materialised) and applied when the chunk is generated; the
+//! chunk buffers are a fast-read optimisation on top, never the sole
+//! record. That is what makes the world saveable (see [`crate::save`]):
+//! the save file stores exactly the seed + the overrides.
 
 use std::collections::HashMap;
 
@@ -23,7 +29,7 @@ pub enum WorldUpdate {
 }
 
 /// A single block edit.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Edit {
     pub pos: BlockPos,
     pub block: Block,
@@ -31,11 +37,18 @@ pub struct Edit {
 
 pub struct World {
     gen: WorldGen,
-    /// Materialised chunk buffers.
+    /// Materialised chunk buffers (terrain + overrides folded in — a
+    /// fast-read optimisation, not the source of truth for edits).
     chunks: HashMap<ChunkPos, Vec<u8>>,
-    /// Pending edits for chunks that are not materialised yet, and the full
-    /// edit history (used to keep resends correct after edits).
-    deltas: HashMap<ChunkPos, HashMap<BlockPos, Block>>,
+    /// The world's complete last-wins record of every block edit:
+    /// chunk → (local position → block). `set_block` records here even
+    /// when the chunk is already materialised, so this sparse layer is
+    /// the world's entire persistent state (terrain is a pure function
+    /// of the seed) — the save file stores exactly it (see
+    /// [`crate::save`]).
+    overrides: HashMap<ChunkPos, HashMap<BlockPos, Block>>,
+    /// Append-only edit history (the dashboard map streams from it; each
+    /// entry is also in `overrides`, last-wins per position).
     edits: Vec<Edit>,
     /// Column-height cache: tree placement scans a 1-chunk halo around each
     /// chunk, and neighbouring chunks share most of those heights. Caching
@@ -49,9 +62,37 @@ impl World {
         Self {
             gen: WorldGen::new(seed),
             chunks: HashMap::new(),
-            deltas: HashMap::new(),
+            overrides: HashMap::new(),
             edits: Vec::new(),
             heights: HashMap::new(),
+        }
+    }
+
+    /// Create a world from a seed and replay the saved block overrides
+    /// (see [`Self::apply_saved`]).
+    pub fn load(seed: u64, saved: &[Edit]) -> Self {
+        let mut w = Self::new(seed);
+        w.apply_saved(saved);
+        w
+    }
+
+    /// Replay saved block overrides (from a save file) into the world.
+    /// Each entry lands in the override layer (applied when its chunk
+    /// materialises) and in the append-only edit history, so consumers
+    /// of [`Self::edits`] (the dashboard map) see them through the
+    /// normal sync path. Last-wins per position, so the order of `saved`
+    /// is irrelevant.
+    pub fn apply_saved(&mut self, saved: &[Edit]) {
+        for e in saved {
+            if !e.pos.in_world_y() {
+                continue; // defensive: saves only hold in-world positions
+            }
+            let c = ChunkPos::of(e.pos);
+            self.overrides
+                .entry(c)
+                .or_default()
+                .insert(e.pos.local(), e.block);
+            self.edits.push(*e);
         }
     }
 
@@ -73,8 +114,21 @@ impl World {
         self.chunks.len()
     }
 
-    pub fn delta_count(&self) -> usize {
-        self.deltas.values().map(|d| d.len()).sum()
+    /// Number of recorded block overrides (the world's persistent state,
+    /// last-wins per position — distinct from the append-only history in
+    /// [`Self::edits`], which keeps one entry per edit).
+    pub fn override_count(&self) -> usize {
+        self.overrides.values().map(|d| d.len()).sum()
+    }
+
+    /// The complete set of block overrides as (world position, block) —
+    /// the world's persistent state (terrain is a pure function of the
+    /// seed). The save file stores exactly this (see [`crate::save`]).
+    pub fn overrides(&self) -> impl Iterator<Item = Edit> + '_ {
+        self.overrides.iter().flat_map(|(c, m)| {
+            m.iter()
+                .map(|(l, b)| Edit { pos: BlockPos::from_chunk(*c, *l), block: *b })
+        })
     }
 
     pub fn edits(&self) -> &[Edit] {
@@ -92,8 +146,8 @@ impl World {
             return;
         }
         let mut data = self.gen.generate_chunk_cached(c.x, c.y, c.z, &mut self.heights).to_vec();
-        // Apply pending deltas for this chunk.
-        if let Some(d) = self.deltas.get(&c) {
+        // Fold in the recorded overrides for this chunk.
+        if let Some(d) = self.overrides.get(&c) {
             for (local, block) in d {
                 if local.x >= 0
                     && local.x < CHUNK
@@ -131,8 +185,8 @@ impl World {
         }
         let c = ChunkPos::of(pos);
         let local = pos.local();
-        // Deltas win over generated data.
-        if let Some(d) = self.deltas.get(&c) {
+        // Overrides win over generated data.
+        if let Some(d) = self.overrides.get(&c) {
             if let Some(b) = d.get(&local) {
                 return Some(*b);
             }
@@ -160,16 +214,16 @@ impl World {
             || local.y == 0
             || local.y == CHUNK - 1;
 
+        // The override layer is the source of truth: every edit is
+        // recorded there whether or not the chunk is materialised (this
+        // is what makes the world saveable — see `crate::save`).
+        self.overrides
+            .entry(c)
+            .or_default()
+            .insert(local, block);
         if let Some(data) = self.chunks.get_mut(&c) {
+            // Keep the materialised buffer fresh for the fast-read path.
             data[chunk_index(local)] = block.as_u8();
-            if let Some(d) = self.deltas.get_mut(&c) {
-                d.remove(&local);
-            }
-        } else {
-            self.deltas
-                .entry(c)
-                .or_default()
-                .insert(local, block);
         }
 
         let mut dirty = vec![c];
@@ -245,9 +299,9 @@ impl World {
                             out[dst..dst + len].copy_from_slice(&data[src..src + len]);
                         }
                     }
-                    // Pending edits for this chunk override the copy.
-                    if let Some(deltas) = self.deltas.get(&nc) {
-                        for (local, block) in deltas {
+                    // Recorded overrides for this chunk override the copy.
+                    if let Some(overrides) = self.overrides.get(&nc) {
+                        for (local, block) in overrides {
                             let lx = local.x + (nx0 - rx0);
                             let ly = local.y + (ny0 - ry0);
                             let lz = local.z + (nz0 - rz0);
@@ -357,7 +411,7 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qwencraft_world::{Block, BlockPos, ChunkPos};
+    use qwencraft_world::{Block, BlockPos, ChunkPos, WORLD_HEIGHT};
 
     /// The crosshair raycast must floor the eye into its containing cell,
     /// not truncate toward zero. For a negative eye coordinate this used to
@@ -471,5 +525,104 @@ mod tests {
         );
         assert_eq!(r2[region_index(nlocal)], Block::Stone.as_u8());
         assert_eq!(r2, region_reference(&world, c));
+    }
+
+    /// The override layer must survive a save/reload for BOTH edit targets:
+    /// chunks that are materialised when edited (previously the edit was
+    /// folded into the buffer and dropped from the record — a saved world
+    /// would have silently lost it) and chunks that are not. A loaded
+    /// world must be indistinguishable from the original for block reads.
+    #[test]
+    fn saved_overrides_roundtrip() {
+        let mut w = World::new(1337);
+        let mut edits = Vec::new();
+        // A far column: edit before anything generates its chunk.
+        let (fx, fz) = (200, 200);
+        let fh = w.height_at(fx, fz);
+        let far = BlockPos::new(fx, fh, fz);
+        w.set_block(far, Block::Air);
+        edits.push(Edit { pos: far, block: Block::Air });
+        // A near column: force the chunk materialised, then edit it.
+        let (nx, nz) = (8, 8);
+        let c = ChunkPos::of(BlockPos::new(nx, 0, nz));
+        w.generate(c);
+        assert!(w.contains(&c));
+        let nh = w.height_at(nx, nz);
+        let near = BlockPos::new(nx, nh + 1, nz);
+        w.set_block(near, Block::Obsidian);
+        edits.push(Edit { pos: near, block: Block::Obsidian });
+        // Edit the same near position again: last-wins.
+        let near2 = BlockPos::new(nx, nh + 2, nz);
+        w.set_block(near2, Block::Glass);
+        w.set_block(near, Block::Stone); // replaces the obsidian
+        edits.push(Edit { pos: near2, block: Block::Glass });
+        edits.push(Edit { pos: near, block: Block::Stone });
+        // Sanity: the live world sees all of it.
+        assert_eq!(w.block_at(far), Block::Air);
+        assert_eq!(w.block_at(near), Block::Stone);
+        assert_eq!(w.block_at(near2), Block::Glass);
+        // The override iterator is a complete, last-wins record.
+        let saved: Vec<Edit> = w.overrides().collect();
+        assert_eq!(saved.len(), 3, "three distinct positions edited");
+        // Reload into a fresh world: no chunks materialised, lazy only.
+        let mut r = World::load(1337, &saved);
+        for p in [far, near, near2] {
+            assert_eq!(
+                r.block_at(p),
+                w.block_at(p),
+                "reload must match the original at {p:?}"
+            );
+        }
+        // A wide sample around both edited columns must agree too (terrain
+        // is pure, overrides were replayed).
+        for x in (fx - 2)..=(fx + 2) {
+            for z in (fz - 2)..=(fz + 2) {
+                for y in (fh - 3)..=fh + 3 {
+                    let p = BlockPos::new(x, y.max(0), z);
+                    assert_eq!(r.block_at(p), w.block_at(p), "mismatch at {p:?}");
+                }
+            }
+        }
+        for x in (nx - 2)..=(nx + 2) {
+            for z in (nz - 2)..=(nz + 2) {
+                for y in (nh - 1)..=nh + 4 {
+                    let p = BlockPos::new(x, y.max(0), z);
+                    assert_eq!(r.block_at(p), w.block_at(p), "mismatch at {p:?}");
+                }
+            }
+        }
+        // The streamed region of the edited (materialised-then-saved) chunk
+        // must carry the overrides on the reloaded world. Generate the
+        // full 3x3x3 neighbourhood in BOTH worlds (region() samples unknown
+        // chunks as air, so the generated sets must match).
+        let rc = ChunkPos::of(near2);
+        for dy in [-1i32, 0, 1] {
+            for dz in [-1i32, 0, 1] {
+                for dx in [-1i32, 0, 1] {
+                    let n = ChunkPos::new(rc.x + dx, rc.y + dy, rc.z + dz);
+                    w.generate(n);
+                    r.generate(n);
+                }
+            }
+        }
+        assert_eq!(r.region(rc), w.region(rc), "region must carry loaded overrides");
+    }
+
+    /// Out-of-world entries in a save are skipped defensively (a save is
+    /// only written from `set_block`, which never records them).
+    #[test]
+    fn apply_saved_skips_out_of_world() {
+        let mut w = World::new(1337);
+        let ok = BlockPos::new(8, 30, 8);
+        let bad_hi = BlockPos::new(8, WORLD_HEIGHT, 8);
+        let bad_lo = BlockPos::new(8, -1, 8);
+        w.apply_saved(&[
+            Edit { pos: ok, block: Block::Tnt },
+            Edit { pos: bad_hi, block: Block::Tnt },
+            Edit { pos: bad_lo, block: Block::Tnt },
+        ]);
+        assert_eq!(w.block_at(ok), Block::Tnt);
+        assert_eq!(w.override_count(), 1);
+        assert_eq!(w.edits().len(), 1);
     }
 }
