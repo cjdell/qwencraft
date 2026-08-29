@@ -174,7 +174,7 @@ check "server saw the client"          grep -q "joined (shared world seed ${SEED
 # NPCs in net mode).
 check "second browser connected"       grep -q "Qwencraft: remote server connected (seed ${SEED}, player" "$LOG2"
 check "shared world saw two players"   grep -q ", 2 online)" "$WS_LOG"
-check "first browser rendered 2 players" grep -q "POOL chunks=[0-9]* missing=[0-9]* agents=2" "$LOG"
+check "first browser rendered 2 players" grep -q "POOL chunks=[0-9]* missing=[0-9]* sent=[0-9]* agents=2" "$LOG"
 # Name tags: each browser must create a tag for the OTHER player (the shared
 # world streams the full agent list to both) and position it on screen
 # (TAGS telemetry, ?taglog=1 — the position must be finite CSS pixels).

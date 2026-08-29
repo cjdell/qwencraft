@@ -40,6 +40,17 @@ use qwencraft_world::{Block, ChunkPos, PLACEABLE};
 /// select with the digit keys / mouse wheel).
 const HOTBAR_SLOTS: usize = 9;
 
+// Transit-loss reconciliation thresholds (the Stats branch of
+// `apply_remote_messages`): if the server's per-viewer send count is more
+// than RESYNC_GAP_CHUNKS beyond the distinct chunks we actually hold, and
+// nothing has arrived for RESYNC_STALE_MS, the gap is a loss (a healthy
+// but slow link keeps chunks arriving, so it can't false-positive); a
+// resync is at most once per RESYNC_COOLDOWN_MS (a spurious one is a
+// no-op: the server only re-queues what we don't have).
+const RESYNC_GAP_CHUNKS: i64 = 32;
+const RESYNC_STALE_MS: f64 = 5000.0;
+const RESYNC_COOLDOWN_MS: f64 = 10_000.0;
+
 fn log(msg: &str) {
     web_sys::console::log_1(&JsValue::from_str(msg));
 }
@@ -185,6 +196,16 @@ struct RemoteLink {
     /// until it arrives.
     player_id: u32,
     seed: Option<u64>,
+    /// Every chunk position received from this server (de-duplicated).
+    /// Transit-loss detection: the server's per-viewer `chunks_sent`
+    /// (Stats) must stay within in-flight margin of this set — a growing
+    /// gap with no arrivals means a burst was lost in flight (see the
+    /// Stats branch of `apply_remote_messages` and `ClientMsg::Resync`).
+    have: std::collections::HashSet<ChunkPos>,
+    /// Wall-clock ms (`js_sys::Date`) of the last chunk message received.
+    last_chunk_ms: f64,
+    /// Wall-clock ms of the last `Resync` sent (cooldown).
+    last_resync_ms: f64,
     /// Chunk updates received, waiting for the frame loop.
     inbound: Vec<WorldUpdate>,
     /// Latest server state (the rendering source of truth).
@@ -239,6 +260,8 @@ struct App {
     /// `?taglog=1`: log name-tag screen positions every 5 s (headless
     /// verification that tags track their players).
     tag_log: bool,
+    /// `?dbg=1`: verbose chunk-receive/eviction trace (WAN debugging).
+    dbg: bool,
     /// Wall-clock ms of the last TAGS telemetry line.
     last_tag_log_at: f64,
     // Walk-mode steering state: if less than 1 block of horizontal progress
@@ -331,6 +354,7 @@ impl App {
         verify_mode: bool,
         walk_mode: bool,
         tag_log: bool,
+        dbg: bool,
         npcs: Option<(u32, f32)>,
     ) -> Self {
         #[cfg(not(feature = "verify"))]
@@ -349,6 +373,7 @@ impl App {
             builtin_seed: seed,
             walk_mode,
             tag_log,
+            dbg,
             last_tag_log_at: 0.0,
             walk_anchor: [0.0; 2],
             walk_fly: false,
@@ -655,9 +680,59 @@ impl App {
                     ServerMsg::PlayerState(s) => r.player = s,
                     ServerMsg::Agents(v) => r.agents = v,
                     ServerMsg::Chunk { pos, data } => {
+                        if self.dbg {
+                            log(&format!("DBG recv chunk ({},{},{})", pos.x, pos.y, pos.z));
+                        }
+                        // Transit-loss bookkeeping (see `have`'s docs).
+                        r.have.insert(pos);
+                        r.last_chunk_ms = js_sys::Date::now();
                         r.inbound.push(WorldUpdate::Chunk { pos, data })
                     }
-                    ServerMsg::Stats(s) => r.stats = s,
+                    ServerMsg::Stats(s) => {
+                        r.stats = s;
+                        // Transit-loss reconciliation (see `have`'s docs):
+                        // the server's per-viewer send count and the
+                        // distinct chunks we actually hold must stay within
+                        // in-flight margin. A large gap that PERSISTS with
+                        // no chunk arrivals means the burst was lost in
+                        // flight — request a resync; the server re-sends
+                        // every ready chunk in view we don't have.
+                        // Keep `have` bounded over long sessions: it only
+                        // ever matters within the view (the server's resync
+                        // window), so forget the rest once it grows large.
+                        if r.have.len() > 8192 {
+                            let cell = [
+                                (r.player.pos.x / 16.0).floor() as i32,
+                                (r.player.pos.y / 16.0).floor() as i32,
+                                (r.player.pos.z / 16.0).floor() as i32,
+                            ];
+                            r.have.retain(|c| {
+                                (c.x - cell[0])
+                                    .abs()
+                                    .max((c.y - cell[1]).abs())
+                                    .max((c.z - cell[2]).abs())
+                                    <= qwencraft_server::VIEW_RADIUS + 2
+                            });
+                        }
+                        let now = js_sys::Date::now();
+                        let gap = s.chunks_sent as i64 - r.have.len() as i64;
+                        if r.connected
+                            && gap > RESYNC_GAP_CHUNKS
+                            && now - r.last_chunk_ms > RESYNC_STALE_MS
+                            && now - r.last_resync_ms > RESYNC_COOLDOWN_MS
+                        {
+                            let have: Vec<ChunkPos> = r.have.iter().copied().collect();
+                            r.last_resync_ms = now;
+                            log(&format!(
+                                "Qwencraft: {} chunks missing (server sent {}, holding {}) and none arrived for {:.0}s — requesting resync",
+                                gap,
+                                s.chunks_sent,
+                                have.len(),
+                                (now - r.last_chunk_ms) / 1000.0
+                            ));
+                            r.send(ClientMsg::Resync(have));
+                        }
+                    }
                     ServerMsg::NpcLoad { count, spacing } => r.npc_load = (count, spacing),
                 }
             }
@@ -802,6 +877,9 @@ impl App {
         let t_mesh = js_sys::Date::now();
 
         let updates = self.backend.take_world_updates();
+        if self.dbg && !updates.is_empty() {
+            log(&format!("DBG frame: {} chunks to mesh", updates.len()));
+        }
         #[cfg(feature = "verify")]
         if self.verify_mode {
             for u in &updates {
@@ -904,6 +982,20 @@ impl App {
             // player walks back over the terrain.
             let evicted = r.take_evicted();
             if !evicted.is_empty() {
+                if self.dbg {
+                    let list: Vec<String> = evicted
+                        .iter()
+                        .map(|c| format!("({},{},{})", c.x, c.y, c.z))
+                        .collect();
+                    log(&format!(
+                        "DBG evict {} cam=({:.0},{:.0},{:.0}): {}",
+                        evicted.len(),
+                        player.pos.x,
+                        player.pos.y,
+                        player.pos.z,
+                        list.join(" ")
+                    ));
+                }
                 self.backend.report_evicted(evicted);
             }
             let t_render = js_sys::Date::now();
@@ -1018,10 +1110,17 @@ impl App {
                 // on this.
                 if let Some(r) = &self.renderer {
                     let missing = r.missing_visible(6).len();
+                    // `sent` is the server-side per-viewer count (remote) or
+                    // the local streamer's count (built-in). `sent - chunks`
+                    // beyond a few in-flight regions means chunks were sent
+                    // but never landed in the pool (lost in transit or
+                    // dropped on ingest) — the signature of the
+                    // "floating in space" spawn bug.
                     log(&format!(
-                        "POOL chunks={} missing={} agents={} free={}",
+                        "POOL chunks={} missing={} sent={} agents={} free={}",
                         r.chunk_count(),
                         missing,
+                        stats.chunks_sent,
                         stats.agents,
                         r.free_slots()
                     ));
@@ -1066,6 +1165,9 @@ fn connect_remote(app: &Rc<RefCell<App>>, raw_url: &str) {
             connected: false,
             player_id: u32::MAX,
             seed: None,
+            have: std::collections::HashSet::new(),
+            last_chunk_ms: 0.0,
+            last_resync_ms: 0.0,
             inbound: Vec::new(),
             player: AgentState::default(),
             agents: Vec::new(),
@@ -1185,13 +1287,15 @@ fn key_from_code(code: &str) -> Option<Key> {
     }
 }
 
-fn params_from_url() -> (u64, bool, bool, bool, Option<(u32, f32)>, Option<String>) {
+fn params_from_url() -> (u64, bool, bool, bool, Option<(u32, f32)>, Option<String>, bool) {
     let mut seed = 1337u64;
     let mut verify = false;
     let mut walk = false;
     // `taglog=1` makes the app log name-tag positions every 5 s (headless
     // verification that tags track their players).
     let mut tag_log = false;
+    // `dbg=1` logs a verbose chunk-receive/eviction trace (WAN debugging).
+    let mut dbg = false;
     // `npcs=COUNT[:SPACING]` starts the app with an NPC load already
     // spawned (headless load testing without a keyboard).
     let mut npcs: Option<(u32, f32)> = None;
@@ -1211,6 +1315,8 @@ fn params_from_url() -> (u64, bool, bool, bool, Option<(u32, f32)>, Option<Strin
                 walk = true;
             } else if part.strip_prefix("taglog=").is_some_and(|v| v != "0") {
                 tag_log = true;
+            } else if part.strip_prefix("dbg=").is_some_and(|v| v != "0") {
+                dbg = true;
             } else if let Some(v) = part.strip_prefix("npcs=") {
                 if !v.is_empty() && v != "0" {
                     let (cs, ss) = match v.split_once(':') {
@@ -1234,7 +1340,7 @@ fn params_from_url() -> (u64, bool, bool, bool, Option<(u32, f32)>, Option<Strin
             }
         }
     }
-    (seed, verify, walk, tag_log, npcs, server)
+    (seed, verify, walk, tag_log, npcs, server, dbg)
 }
 
 /// Accept `ws://…`, `wss://…`, or bare `host:port` (scheme implied by the
@@ -1341,7 +1447,8 @@ pub fn start() -> Result<(), JsValue> {
         .and_then(|e| e.dyn_into::<HtmlDivElement>().ok())
         .expect("missing #overlay");
 
-    let (seed, verify_mode, walk_mode, tag_log, npcs, server_url_param) = params_from_url();
+    let (seed, verify_mode, walk_mode, tag_log, npcs, server_url_param, dbg) =
+        params_from_url();
     log(&format!("Qwencraft: app started (seed {seed})"));
 
     let server_input = document
@@ -1412,6 +1519,7 @@ pub fn start() -> Result<(), JsValue> {
         verify_mode,
         walk_mode,
         tag_log,
+        dbg,
         npcs,
     )));
     // Build the hotbar slots (block list comes from the shared registry,

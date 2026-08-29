@@ -28,6 +28,7 @@ usage: qwencraft-net [options]
   --cert FILE    TLS certificate (PEM) — with --key, the port speaks
                  wss:// + https://
   --key FILE     TLS private key (PEM, RSA or PKCS#8)
+  --debug        log per-second per-player streaming telemetry to stderr
   -h, --help     this help";
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -72,6 +73,7 @@ fn parse_opts(args: &[String]) -> Result<qwencraft_net::ServerOptions, String> {
             "--key" => {
                 opts.key = Some(std::path::PathBuf::from(next_value(args, &mut i, "--key")?))
             }
+            "--debug" => opts.debug = true,
             other => return Err(format!("unknown option {other:?} (see --help)")),
         }
     }

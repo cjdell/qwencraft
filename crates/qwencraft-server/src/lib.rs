@@ -767,9 +767,48 @@ impl Streamer {
         }
     }
 
+    /// Re-send everything this viewer should hold but doesn't (client
+    /// reported via `ClientMsg::Resync` after detecting transit loss).
+    /// Same window as the send pass, but uncap-rate-limited: this is a
+    /// repair path, and the missing set is (usually) small. `have` is the
+    /// complete set of chunks the client holds; every ready chunk in the
+    /// view radius outside it is queued for (re-)delivery and marked sent.
+    /// Returns the number of regions queued.
+    pub fn resync(&mut self, world: &World, viewpoint: Vec3, have: &[ChunkPos]) -> usize {
+        let have_set: std::collections::HashSet<ChunkPos> = have.iter().copied().collect();
+        let pc = ChunkPos::of(BlockPos::new(viewpoint.x as i32, 0, viewpoint.z as i32));
+        let mut n = 0usize;
+        for dx in -VIEW_RADIUS..=VIEW_RADIUS {
+            for dz in -VIEW_RADIUS..=VIEW_RADIUS {
+                if dx * dx + dz * dz > (VIEW_RADIUS + 1) * (VIEW_RADIUS + 1) {
+                    continue;
+                }
+                for cy in 0..(WORLD_HEIGHT / qwencraft_world::CHUNK) {
+                    let c = ChunkPos::new(pc.x + dx, cy, pc.z + dz);
+                    if c.guaranteed_air() || have_set.contains(&c) {
+                        continue;
+                    }
+                    if Self::region_ready(world, c) {
+                        let region = world.region(c);
+                        self.sent.insert(c);
+                        self.queue.push(WorldUpdate::Chunk { pos: c, data: region });
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
     /// How many distinct chunk regions this viewer has been sent.
     pub fn sent_count(&self) -> usize {
         self.sent.len()
+    }
+
+    /// How many regions are queued for delivery (not yet drained via
+    /// [`Self::take`]) — telemetry for slow-connection diagnostics.
+    pub fn queued_count(&self) -> usize {
+        self.queue.len()
     }
 
     /// Whether the region for `pos` is recorded as already sent to this
@@ -944,6 +983,56 @@ mod tests {
                 .any(|u| matches!(u, WorldUpdate::Chunk { pos, .. } if *pos == far)),
             "an evicted chunk outside the view must not be re-sent"
         );
+    }
+
+    #[test]
+    fn resync_resends_only_the_chunks_the_viewer_lacks() {
+        let mut s = Server::new(1337);
+        let mut st = Streamer::new();
+        for _ in 0..240 {
+            // 4s: generation + streaming of the spawn view (per-viewer).
+            s.tick(1.0 / 60.0);
+            let vp = s.player_state().pos;
+            st.tick(s.world_mut(), vp);
+        }
+        st.take(); // drain the normal stream
+        let p = s.player_state().pos;
+        // Enumerate the full ready view: a resync with an empty have-set
+        // queues exactly the ready chunks in view radius.
+        let full_count = st.resync(s.world(), p, &[]);
+        let full: Vec<ChunkPos> = st
+            .take()
+            .into_iter()
+            .map(|u| match u {
+                WorldUpdate::Chunk { pos, .. } => pos,
+            })
+            .collect();
+        assert_eq!(full.len(), full_count);
+        assert!(full.len() > 50, "the view must be non-trivial ({} chunks)", full.len());
+        // Simulate transit loss: the viewer only kept the first half of
+        // what the server sent; the resync must re-send exactly the rest.
+        let half = full.len() / 2;
+        let have: Vec<ChunkPos> = full.iter().take(half).copied().collect();
+        let missing: Vec<ChunkPos> = full.iter().skip(half).copied().collect();
+        let n = st.resync(s.world(), p, &have);
+        let got: Vec<ChunkPos> = st
+            .take()
+            .into_iter()
+            .map(|u| match u {
+                WorldUpdate::Chunk { pos, .. } => pos,
+            })
+            .collect();
+        assert_eq!(got.len(), n, "queued count must match what take() drains");
+        assert_eq!(
+            got.len(),
+            missing.len(),
+            "only the chunks the viewer lacks may be re-sent (got {}, expected {})",
+            got.len(),
+            missing.len()
+        );
+        for m in &missing {
+            assert!(got.contains(m), "missing chunk {m:?} must be re-sent");
+        }
     }
 
     #[test]

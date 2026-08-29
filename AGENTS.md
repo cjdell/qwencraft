@@ -67,7 +67,7 @@ writes temp files):
 
 | Command | What it does |
 |---|---|
-| `cargo test` | All host unit tests (94: world 45 incl. the terrain-pool allocator tests and the face-UV-span test, client 2 — naga validation of the WGSL shader module + texture-function census, server 39, net e2e 4 incl. a wss TLS round-trip, a two-client shared-world test, and a dashboard HTTP test, net lib 4 — the map). The only place Rust tests run — **wasm tests can't execute here** (but the WGSL *is* checked here, see the client tests). |
+| `cargo test` | All host unit tests (96: world 45 incl. the terrain-pool allocator tests and the face-UV-span test, client 2 — naga validation of the WGSL shader module + texture-function census, server 40 incl. the resync repair test, net e2e 5 incl. a wss TLS round-trip, a two-client shared-world test, a dashboard HTTP test, and a resync-over-a-real-socket test, net lib 4 — the map). The only place Rust tests run — **wasm tests can't execute here** (but the WGSL *is* checked here, see the client tests). |
 | `./scripts/build.sh` | Release build → `web/dist` (wasm-bindgen 0.2.100). |
 | `./scripts/serve.sh` | Serve `web/dist` at `http://localhost:8080` (python3). |
 | `./scripts/serve.sh --https` | Same over TLS with a self-signed cert (`.certs/`, generated once via openssl). **Required for LAN play** — WebGPU needs a secure context. |
@@ -76,6 +76,7 @@ writes temp files):
 | `./scripts/npc_test.sh [COUNT] [SPACING]` | Headless NPC load test (`?npcs=COUNT:SPACING`); asserts boot with the load, live count in the HUD, and that steady-state physics runs on the per-agent local block window (hit rate ≥ 99%, solid fallbacks at spawn-tick scale). |
 | `./scripts/secure_context_test.sh` | LAN-HTTP (graceful "WebGPU unavailable" message, no panic) + HTTPS startup on localhost and LAN IP. |
 | `./scripts/remote_test.sh` | Headless-server e2e: standalone `qwencraft-net` (single port, `?server=ws://…/ws`) + **two** Chromium browsers in the same shared world; asserts both connect, the server sees both, the first browser renders both players (`POOL … agents=2`), streamed world, GPU pixel readback. |
+| `./scripts/wan_resync_test.sh [RTT_MS]` | Deterministic TRANSIT-LOSS test: headless Chromium → `wan_proxy.py` (TLS end, 200 ms RTT, drops ~4 MB of **whole WS frames** from the middle of the initial chunk burst) → `qwencraft-net`; asserts the drop happens, the client detects the gap and requests a resync, the server re-sends exactly the missing regions, and the view recovers (final `POOL chunks=` ≥ 250). Real-time (no virtual time — the resync timers use wall-clock `Date.now()` and a live 60 Hz socket never quiesces). |
 | `./scripts/build_dashboard.sh` | Builds the dashboard (its own wasm workspace) → `dashboard/dist` (wasm-bindgen + html/css). The dist is **embedded into the `qwencraft-net` binary and committed** — after running it, rebuild `qwencraft-net` and commit `dashboard/dist`. |
 | `./scripts/dashboard_test.sh` | Dashboard e2e: single-port curl checks (`/healthz`, `/api/status`, `/api/map`, `/dashboard/*` assets, game at `/`, 426 on `/ws` over plain HTTP, 404) + headless Chromium on `/dashboard/` (DOM shows the live server, screenshot shows the rendered minimap). |
 
@@ -115,13 +116,19 @@ crates/
                       (one viewer) and the net server (one per
                       connection) share the logic. protocol.rs = versioned
                       little-endian binary wire codec (ClientMsg/ServerMsg,
-                      encode/decode/decode_stream, currently v4: Hello
+                      encode/decode/decode_stream, currently v5: Hello
                       carries the player id, agents carry name + colour,
                       ClientMsg::Profile sends the player's name/colour,
                       Action::Place carries the selected block id (u8 —
                       the server validates it via
                       Block::from_u8(...).is_placeable() and silently
-                      drops unknown ids)) shared by both transports;
+                      drops unknown ids), ClientMsg::Resync carries the
+                      client's complete chunk set for transit-loss repair
+                      — the server re-sends every ready chunk in view the
+                      client doesn't have (the streamer's `sent` set can't
+                      know a chunk was lost before the client ever saw it
+                      — eviction reports only cover chunks once held))
+                      shared by both transports;
                       pure + host-testable, no deps.
   qwencraft-net/      HEADLESS server binary. tokio + tokio-tungstenite.
                       SINGLE PORT (one authority): dispatch_conn sniffs
@@ -153,7 +160,10 @@ crates/
                       overlay — never touches the world lock) computing
                       the topmost block per column from pure terrain +
                       the world's edit history (exact modulo
-                      flowers/canopy overhang — see its tests). The
+                      flowers/canopy overhang — see its tests). `--debug`
+                      logs per-second per-player streaming telemetry to
+                      stderr (sent/queue/pos — the tool that pinpoints
+                      "server sent it, client never got it"). The
                       Server's event_sink (set by serve()) feeds the
                       EventLog (own mutex, cap 256 — must stay outside
                       the world lock). examples/ws_probe.rs = tiny manual
@@ -165,8 +175,10 @@ crates/
                       single player (incl. Profile name/colour broadcast),
                       two clients sharing one world (see each other +
                       edit sync), a wss round-trip with an
-                      openssl-generated self-signed cert, and the
-                      dashboard HTTP endpoints (single port, /dashboard/).
+                      openssl-generated self-signed cert, the
+                      dashboard HTTP endpoints (single port, /dashboard/),
+                      and resync (a client reporting a partial chunk set
+                      gets exactly the missing regions re-sent).
   qwencraft-client/   WebGPU renderer. Terrain buffer POOL (one 2M-vertex
                       vbo/ibo, chunks own index ranges, compaction when
                       full), opaque+water pipelines (translucent water +
@@ -199,9 +211,20 @@ crates/
                       when building the agent list (the local player is
                       the camera; other players are rendered as spheres
                       with floating DOM name tags — #tags container,
-                      projected with the same view-projection). ?server=
+                      projected with the same view-projection). RemoteLink
+                      keeps `have` (every chunk pos ever received,
+                      de-duped, trimmed to view+2 past 8192) and
+                      reconciles against the server's per-viewer
+                      `chunks_sent` (Stats): gap > 32 chunks with no
+                      chunk arriving for 5 s (10 s cooldown) sends
+                      ClientMsg::Resync(have) — the transit-loss repair
+                      (a healthy-but-slow link keeps chunks arriving, so
+                      it can't false-positive; a spurious resync is a
+                      server-side no-op). ?server=
                       accepts a bare host[:port] (normalise_ws_url
                       appends /ws); failed connect falls back to builtin.
+                      ?dbg=1 logs a verbose chunk-receive/eviction trace
+                      (WAN debugging).
                       HOTBAR: 9-slot strip over the first 9 of the 13
                       PLACEABLE blocks (DOM, built from the registry),
                       digits 1–9 + mouse wheel select (wheel ignored in
@@ -230,6 +253,11 @@ dashboard/            STANDALONE cargo workspace (its dep graph must not
                       start(), called from index.html after init()).
 scripts/              build.sh, serve.sh, verify.sh, walk_test.sh,
                       secure_context_test.sh, remote_test.sh,
+                      wan_proxy.py (TLS-terminating WAN emulator: burst
+                      RTT + rate limit + optional whole-WS-frame drops;
+                      one thread per connection, no asyncio),
+                      wan_resync_test.sh (deterministic transit-loss
+                      test — see DoD item 6b),
                       build_dashboard.sh, dashboard_test.sh.
 ```
 
@@ -447,6 +475,24 @@ These are properties of *this machine/headless setup*, not code bugs:
   sent-based count reads ~200+ "missing" on a perfectly healthy view.
   `known`-based reads 0. (This distinction is why the walk test asserts
   *sustained* missing, not a single high sample.)
+- **Transit-loss reconciliation (protocol v5 `Resync`)**: the streamer's
+  `sent` set marks chunks *queued*, not *received* — a burst lost in
+  flight before the client ever saw it is invisible to it (eviction
+  reports only cover chunks the client once held), so the spawn view can
+  stay a permanent hole on a flaky link until a block edit forces a
+  dirty re-send. The fix is a client→server reconciliation: the client
+  tracks `have` (distinct chunk positions received) and, when the
+  server's per-viewer `chunks_sent` (Stats) runs > 32 ahead with no chunk
+  arriving for 5 s (10 s cooldown), sends `ClientMsg::Resync(have)`;
+  `Streamer::resync` re-queues every ready chunk in the view radius not
+  in `have` — uncapped (repair path, usually a small set), same window
+  and readiness checks as the normal send pass. A healthy-but-slow link
+  can't false-positive (chunks keep arriving → `last_chunk_ms` stays
+  fresh), and a spurious resync is a no-op (the server only re-queues
+  what the client lacks). The `POOL` line's `sent=` field is this
+  server-side count — `sent - chunks` beyond a few in-flight regions is
+  the signature of this bug. `scripts/wan_resync_test.sh` proves the
+  whole loop over a real TLS socket with deterministic frame drops.
 - `std::time::Instant` **panics on wasm32** ("time not implemented on this
   platform") — the dashboard (and any wasm code) must time things with
   `js_sys::Date::now()` (f64 ms). A panic inside a spawned async task
@@ -500,6 +546,8 @@ These are properties of *this machine/headless setup*, not code bugs:
 5. For anything touching startup/context: `./scripts/secure_context_test.sh`.
 6. For anything touching the protocol, `qwencraft-net`, or the remote
    backend: `./scripts/remote_test.sh` — "ALL CHECKS PASSED".
+   6b. For anything touching streaming, resync, or the remote backend's
+   loss path: `./scripts/wan_resync_test.sh` — "TRANSIT-LOSS TEST PASSED".
 7. For anything touching `dashboard/` (or the dashboard HTTP side of
    `qwencraft-net`): `./scripts/build_dashboard.sh` + rebuild
    `qwencraft-net` + `./scripts/dashboard_test.sh` — "ALL CHECKS PASSED",

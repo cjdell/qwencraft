@@ -39,7 +39,16 @@ use qwencraft_world::{BlockPos, ChunkPos};
 /// v4: `Action::Place` carries the selected `block` id (the hotbar: the
 /// server validates it — unknown ids are ignored). The wire id is the
 /// `Block` enum discriminant shared with the client.
-pub const PROTOCOL_VERSION: u8 = 4;
+///
+/// v5: `Resync` (client → server): the client reports the set of chunk
+/// positions it holds; the server re-sends every ready chunk in the
+/// viewer's view radius the client doesn't have. This repairs bursts lost
+/// in transit (WAN flakiness, middleboxes, early-connection stalls): the
+/// streamer's `sent` set can't know a chunk was lost before the client
+/// ever saw it — eviction reports only cover chunks the client once held,
+/// so without a reconciliation a lost spawn view stays invisible until a
+/// block edit forces a re-send.
+pub const PROTOCOL_VERSION: u8 = 5;
 
 // ---- client -> server message types --------------------------------------
 const T_INPUT: u8 = 0x01;
@@ -47,6 +56,7 @@ const T_ACTION: u8 = 0x02;
 const T_EVICTED: u8 = 0x03;
 const T_SET_NPC_LOAD: u8 = 0x04;
 const T_PROFILE: u8 = 0x05;
+const T_RESYNC: u8 = 0x06;
 
 // ---- server -> client message types --------------------------------------
 const T_HELLO: u8 = 0x10;
@@ -93,6 +103,14 @@ pub enum ClientMsg {
     /// connect and on change; broadcast to everyone via the agent list so
     /// players can see each other (sphere + name tag).
     Profile { name: String, color: [u8; 3] },
+    /// Transit-loss reconciliation: the complete set of chunk positions
+    /// this client currently holds (ever received). The server re-sends
+    /// every ready chunk in this viewer's view radius that is not in the
+    /// set (bypassing the normal per-tick stream cap — this is a repair).
+    /// Sent when the client's receive count falls far behind the server's
+    /// per-viewer `chunks_sent` (from `Stats`) and no chunk has arrived
+    /// for several seconds.
+    Resync(Vec<ChunkPos>),
 }
 
 /// Messages the server sends to the client.
@@ -172,6 +190,15 @@ impl ClientMsg {
                 }
                 T_PROFILE
             }
+            ClientMsg::Resync(v) => {
+                p.u32(v.len() as u32);
+                for c in v {
+                    p.i32(c.x);
+                    p.i32(c.y);
+                    p.i32(c.z);
+                }
+                T_RESYNC
+            }
         };
         p.frame(ty)
     }
@@ -242,6 +269,20 @@ impl ClientMsg {
                 let name = String::from_utf8(d.bytes(len)?.to_vec()).ok()?;
                 let color = [d.u8()?, d.u8()?, d.u8()?];
                 ClientMsg::Profile { name, color }
+            }
+            T_RESYNC => {
+                let n = d.u32()? as usize;
+                if n > 65536 {
+                    return None; // implausible chunk set
+                }
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let x = d.i32()?;
+                    let y = d.i32()?;
+                    let z = d.i32()?;
+                    v.push(ChunkPos::new(x, y, z));
+                }
+                ClientMsg::Resync(v)
             }
             _ => return None,
         };
@@ -651,6 +692,12 @@ mod tests {
                 name: String::new(),
                 color: [0, 0, 0],
             },
+            ClientMsg::Resync(Vec::new()),
+            ClientMsg::Resync(vec![
+                ChunkPos::new(-3, 0, 5),
+                ChunkPos::new(0, 1, -77),
+                ChunkPos::new(123, 2, 50),
+            ]),
         ];
         for m in &msgs {
             let enc = m.encode();

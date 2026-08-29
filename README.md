@@ -47,6 +47,7 @@ nix develop
 ./scripts/npc_test.sh  # headless NPC load test (physics on cached surfaces)
 ./scripts/secure_context_test.sh  # secure-context / HTTPS regression test
 ./scripts/remote_test.sh          # headless-server + browser end-to-end test
+./scripts/wan_resync_test.sh      # deterministic transit-loss test (resync repair)
 ./scripts/dashboard_test.sh       # server dashboard end-to-end test
 cargo test             # host unit tests (worldgen, physics, streaming, …)
 
@@ -218,13 +219,20 @@ WebSocket upgrade.
   client renders the latest snapshot it holds (at 60 Hz the difference is
   one tick, which reads as smooth).
 - **Wire protocol** (`qwencraft-server/src/protocol.rs`): little-endian
-  binary frames, versioned (currently 4). Server → client: `Hello` (seed +
+  binary frames, versioned (currently 5). Server → client: `Hello` (seed +
   your player id), player/agent state (agents carry name + colour), chunk
   regions, world stats, NPC load echo. Client → server: the player profile
   (name + colour, sent right after connect), input snapshots, actions
   (break; place with stamped aim **plus the selected block id**, validated
   against the block registry on the server), chunk re-send requests
-  (terrain-pool eviction), NPC load changes.
+  (terrain-pool eviction), NPC load changes, and **resync** — the client
+  reports the set of chunks it holds whenever its receive count falls far
+  behind the server's send count with nothing arriving for a few seconds
+  (the signature of a burst lost in transit on a flaky link); the server
+  re-sends everything in view the client doesn't have, so a hole in the
+  terrain heals itself without a block edit. `--debug` on `qwencraft-net`
+  logs per-second per-player streaming telemetry (sent/queue/position) to
+  stderr for diagnosing exactly this class of problem.
 
 **Connecting the browser:** open **Options** on the start screen and type
 the server URL into the field (a bare `host[:port]` is fine — `/ws` is

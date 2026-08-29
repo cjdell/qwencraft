@@ -523,9 +523,10 @@ impl Renderer {
             self.evicted.push(pos);
             self.pool_full_warns += 1;
             if self.pool_full_warns == 1 || self.pool_full_warns % 120 == 0 {
-                web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(
-                    "Qwencraft: terrain pool full — chunk lost, requesting re-send",
-                ));
+                web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
+                    "Qwencraft: terrain pool full — chunk ({},{},{}) lost, requesting re-send",
+                    pos.x, pos.y, pos.z
+                )));
             }
             return;
         };

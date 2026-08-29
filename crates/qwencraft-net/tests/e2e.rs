@@ -262,6 +262,71 @@ async fn end_to_end_single_player() {
     drop(sock);
 }
 
+/// Transit-loss reconciliation: if the client reports (via `Resync`) that
+/// it only holds part of what the server sent, the server re-sends the
+/// missing chunks — without this, a burst lost in flight (WAN flakiness,
+/// early-connection stalls) stays a permanent hole until a block edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resync_resends_lost_chunks() {
+    let ep = serve(ServerOptions {
+        seed: SEED,
+        port: 0,
+        ..Default::default()
+    })
+    .await
+    .expect("serve");
+    let addr = ep.addr;
+    let (mut sock, _) = connect(&format!("ws://{addr}/ws")).expect("connect");
+    expect_hello(&mut sock, "resync");
+
+    // Let the initial stream settle (the spawn view streams in ~2 s).
+    let s = sample(&mut sock, 4.0);
+    let positions: Vec<ChunkPos> = {
+        let mut set: std::collections::HashSet<ChunkPos> = std::collections::HashSet::new();
+        for p in s.chunk_positions {
+            set.insert(p);
+        }
+        set.into_iter().collect()
+    };
+    assert!(
+        positions.len() > 50,
+        "the initial view must have streamed ({} chunks)",
+        positions.len()
+    );
+
+    // Simulate transit loss: the client "kept" only the even-indexed
+    // chunks and reports the survivors; the odd-indexed ones are the loss.
+    let have: Vec<ChunkPos> = positions.iter().enumerate().filter(|(i, _)| i % 2 == 0).map(|(_, p)| *p).collect();
+    let lost: Vec<ChunkPos> = positions.iter().enumerate().filter(|(i, _)| i % 2 == 1).map(|(_, p)| *p).collect();
+    send(&mut sock, &ClientMsg::Resync(have));
+
+    // The server re-sends the missing set (repair path: uncapped); the
+    // per-tick stream keeps the socket lively so this loop can't hang.
+    let start = Instant::now();
+    let mut got: std::collections::HashSet<ChunkPos> = std::collections::HashSet::new();
+    while start.elapsed() < Duration::from_secs(10) && got.len() < lost.len() {
+        match sock.read() {
+            Ok(Message::Binary(data)) => {
+                for m in ServerMsg::decode_stream(&data).0 {
+                    if let ServerMsg::Chunk { pos, .. } = m {
+                        got.insert(pos);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let missing: Vec<ChunkPos> = lost.iter().filter(|p| !got.contains(p)).copied().collect();
+    assert!(
+        missing.is_empty(),
+        "resync must re-send every chunk the client reported missing ({} not re-sent, first few: {missing:?})",
+        missing.len()
+    );
+
+    drop(sock);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_connections_share_one_world() {
     let ep = serve(ServerOptions {
@@ -377,6 +442,7 @@ async fn wss_serves_encrypted_sessions() {
         bind: "127.0.0.1".parse().unwrap(),
         cert: Some(cert.clone()),
         key: Some(key.clone()),
+        debug: false,
     })
     .await
     .expect("serve wss");

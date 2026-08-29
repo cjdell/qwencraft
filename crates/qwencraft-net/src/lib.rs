@@ -68,6 +68,8 @@ pub struct ServerOptions {
     pub cert: Option<PathBuf>,
     /// TLS private key (PEM, RSA or PKCS#8).
     pub key: Option<PathBuf>,
+    /// Per-second per-player streaming telemetry to stderr (`--debug`).
+    pub debug: bool,
 }
 
 impl Default for ServerOptions {
@@ -78,6 +80,7 @@ impl Default for ServerOptions {
             port: 9000,
             cert: None,
             key: None,
+            debug: false,
         }
     }
 }
@@ -172,6 +175,7 @@ pub async fn serve(opts: ServerOptions) -> Result<ServerEndpoints, String> {
         events: events.clone(),
         started,
     }));
+    let debug = opts.debug;
     // Dashboard map state (its own lock; computed off the tick path).
     let map = Arc::new(Mutex::new(map::MapState::new(opts.seed)));
 
@@ -201,7 +205,7 @@ pub async fn serve(opts: ServerOptions) -> Result<ServerEndpoints, String> {
     {
         let world = world.clone();
         let map = map.clone();
-        tokio::spawn(tick_loop(world, map));
+        tokio::spawn(tick_loop(world, map, debug));
     }
     let seed = opts.seed;
     let world_accept = world.clone();
@@ -430,10 +434,12 @@ where
 /// then for each connected player streams the world around them and sends
 /// that player's state, all agents, and stats. New world edits are also
 /// forwarded to the dashboard map state (last-wins overlay).
-async fn tick_loop(world: Arc<Mutex<WorldState>>, map: Arc<Mutex<map::MapState>>) {
+async fn tick_loop(world: Arc<Mutex<WorldState>>, map: Arc<Mutex<map::MapState>>, debug: bool) {
     let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / TICK_HZ as f64));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last = Instant::now();
+    let t0 = last;
+    let mut tick_count = 0u64;
     // Sentinel so the initial NPC load is echoed once to every connection.
     let mut last_npc_load: (u32, f32) = (u32::MAX, f32::NAN);
     // How much of the world's (append-only) edit history has been synced to
@@ -492,6 +498,23 @@ async fn tick_loop(world: Arc<Mutex<WorldState>>, map: Arc<Mutex<map::MapState>>
                 });
             }
         }
+
+        tick_count += 1;
+        if debug && tick_count % 60 == 0 { // one line per second at 60 Hz
+            // Per-second per-player streaming telemetry: how many distinct
+            // regions this viewer has been sent, how many are queued for
+            // delivery right now, and where the player is.
+            let t = t0.elapsed().as_secs_f64();
+            for (id, conn) in players.iter() {
+                let p = server.agent_state(*id).pos;
+                eprintln!(
+                    "[dbg] t={t:.1}s player {id}: sent={} queue={} pos=({:.0},{:.0},{:.0})",
+                    conn.streamer.sent_count(),
+                    conn.streamer.queued_count(),
+                    p.x, p.y, p.z
+                );
+            }
+        }
     }
 }
 
@@ -526,6 +549,19 @@ fn apply_inbound(world: &Mutex<WorldState>, player_id: u32, m: ClientMsg) {
             // Identity for the shared world: broadcast via the agent list
             // so every other client sees this player's name + sphere colour.
             server.set_profile(player_id, name, color);
+        }
+        ClientMsg::Resync(have) => {
+            // Transit-loss reconciliation: the client reports the chunks it
+            // holds; re-send everything in its view radius it doesn't (the
+            // streamer's sent set can't detect chunks lost before the
+            // client ever saw them — see ClientMsg::Resync).
+            if let Some(conn) = players.get_mut(&player_id) {
+                let vp = server.agent_state(player_id).pos;
+                let n = conn.streamer.resync(server.world(), vp, &have);
+                eprintln!(
+                    "[qwencraft-net] player {player_id}: resync — {n} chunk regions re-sent (transit loss detected)"
+                );
+            }
         }
     }
 }
