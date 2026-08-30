@@ -310,6 +310,20 @@ struct App {
     /// Seed of the built-in world (used when switching back to it).
     builtin_seed: u64,
     renderer: Option<Renderer>,
+    /// Chunk updates produced while the renderer was still initialising.
+    /// WebGPU device creation is async, and on a slow GPU (an Intel Xe
+    /// iGPU on Linux, or a SwiftShader fallback) it can outlast the first
+    /// streaming pass. They must be applied — in order — the moment the
+    /// pool exists: the streamer marks chunks sent when it queues them
+    /// (built-in) and the client records them in `have` on socket receipt
+    /// (remote), so dropping them would leave the spawn view a permanent
+    /// hole that is never re-sent.
+    pending_updates: Vec<WorldUpdate>,
+    /// The player's spawn xz (built-in: at world creation; remote: the
+    /// first PlayerState after Hello). Anchors the POOL line's
+    /// `spawn_near` telemetry — the 3x3-chunk box the streamer sends
+    /// first (nearest-first), which must be in the pool.
+    spawn_xz: Option<[f32; 2]>,
     hud: HtmlDivElement,
     overlay: HtmlDivElement,
     keys: KeySet,
@@ -487,6 +501,8 @@ impl App {
             pending_walk_turn: 0.0,
             pending_walk_jump: false,
             renderer: None,
+            pending_updates: Vec::new(),
+            spawn_xz: Some([spawn.x, spawn.z]),
             hud,
             overlay,
             keys: KeySet::default(),
@@ -754,10 +770,10 @@ impl App {
 
     /// Drop any remote link and return to a fresh built-in server.
     fn fallback_to_builtin(&mut self) {
-        self.backend = Backend::Builtin {
-            server: Server::new(self.builtin_seed),
-            streamer: Streamer::new(),
-        };
+        let server = Server::new(self.builtin_seed);
+        let spawn = server.player_state().pos;
+        self.backend = Backend::Builtin { server, streamer: Streamer::new() };
+        self.spawn_xz = Some([spawn.x, spawn.z]);
         // The previous world's terrain belongs to the old backend.
         if let Some(r) = self.renderer.as_mut() {
             r.clear_terrain();
@@ -830,7 +846,15 @@ impl App {
                             "Qwencraft: remote server connected (seed {seed}, player {player_id})"
                         ));
                     }
-                    ServerMsg::PlayerState(s) => r.player = s,
+                    ServerMsg::PlayerState(s) => {
+                        // The first state after Hello is the spawn position
+                        // (the player can't have moved yet): anchor for the
+                        // POOL line's spawn_near telemetry.
+                        if self.spawn_xz.is_none() {
+                            self.spawn_xz = Some([s.pos.x, s.pos.z]);
+                        }
+                        r.player = s;
+                    }
                     ServerMsg::Agents(v) => r.agents = v,
                     ServerMsg::Chunk { pos, data } => {
                         if self.dbg {
@@ -1048,7 +1072,13 @@ impl App {
         self.backend.tick(dt);
         let t_mesh = js_sys::Date::now();
 
-        let updates = self.backend.take_world_updates();
+        // Updates buffered while the renderer was still initialising come
+        // first (they are the oldest): applying them now closes the
+        // spawn-view hole that dropping them would make permanent (see
+        // `pending_updates`).
+        let mut updates = std::mem::take(&mut self.pending_updates);
+        let buffered = updates.len();
+        updates.extend(self.backend.take_world_updates());
         if self.dbg && !updates.is_empty() {
             log(&format!("DBG frame: {} chunks to mesh", updates.len()));
         }
@@ -1145,6 +1175,12 @@ impl App {
         self.update_name_tags(&agents, cam, player.yaw, player.pitch, w, h);
 
         if let Some(r) = &mut self.renderer {
+            if buffered > 0 {
+                log(&format!(
+                    "Qwencraft: applying {} chunks buffered during renderer init",
+                    buffered
+                ));
+            }
             r.apply_updates(updates);
             // Report every chunk the pool evicted (visible or fog-bound).
             // The streamer forgets them and re-sends the ones that are
@@ -1192,7 +1228,12 @@ impl App {
                 self.run_gl_verify();
             }
         } else {
-            drop(updates);
+            // No renderer yet (device still initialising): hold the
+            // updates for the first rendered frame. Dropping them was the
+            // "invisible spawn" bug — the streamer has already marked them
+            // sent (built-in) and they are already in `have` (remote), so
+            // they would never be re-sent.
+            self.pending_updates.extend(updates);
             drop(agents);
         }
 
@@ -1284,17 +1325,22 @@ impl App {
                     let missing = r.missing_visible(6).len();
                     // `sent` is the server-side per-viewer count (remote) or
                     // the local streamer's count (built-in). `sent - chunks`
-                    // beyond a few in-flight regions means chunks were sent
-                    // but never landed in the pool (lost in transit or
-                    // dropped on ingest) — the signature of the
-                    // "floating in space" spawn bug.
+                    // is NOT a loss metric: fully-air/buried chunks are sent
+                    // but have no mesh, so the gap is normally large (tens
+                    // of chunks). The "invisible spawn" signature is
+                    // `spawn_near=0` while `sent` grows — the nearest-first
+                    // initial burst (the spawn area) never reached the pool.
                     log(&format!(
-                        "POOL chunks={} missing={} sent={} agents={} free={}",
+                        "POOL chunks={} missing={} sent={} agents={} free={} spawn_near={}",
                         r.chunk_count(),
                         missing,
                         stats.chunks_sent,
                         stats.agents,
-                        r.free_slots()
+                        r.free_slots(),
+                        self
+                            .spawn_xz
+                            .map(|s| r.spawn_near_count(s))
+                            .unwrap_or(0)
                     ));
                 }
             }
@@ -1331,6 +1377,9 @@ fn connect_remote(app: &Rc<RefCell<App>>, raw_url: &str) {
         let id = a.next_link_id;
         a.next_link_id += 1;
         a.future_reloading = false;
+        // The new world's spawn is unknown until its first PlayerState
+        // arrives (it anchors the POOL line's spawn_near telemetry).
+        a.spawn_xz = None;
         a.backend = Backend::Remote(RemoteLink {
             id,
             ws: ws.clone(),

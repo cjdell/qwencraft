@@ -100,7 +100,7 @@ check "return leg ran"                  grep -q "turn around" "$LOG"
 # visible chunks missing. Assert the MAX over the whole run, not just the
 # final sample: a pool that thrashes (visible chunks evicted and re-queued)
 # can show holes at intermediate moments even if the final view recovered.
-POOL_LINES=$(grep -o "POOL chunks=[0-9]* missing=[0-9]*" "$LOG")
+POOL_LINES=$(grep -o "POOL .*spawn_near=[0-9]*" "$LOG")
 if [ -z "$POOL_LINES" ]; then
   echo "FAIL: no POOL telemetry in log"
   fail=1
@@ -123,6 +123,16 @@ vals = [int(v) for v in sys.argv[1:]]
 sustained = any(all(v > 15 for v in vals[i:i + 3]) for i in range(len(vals) - 2))
 sys.exit(1 if (sustained or vals[-1] > 15) else 0)
 PY
+  # The spawn area must be in the pool (first POOL sample, ~10s in: the
+  # walker is still within ~3 chunks of spawn, so the spawn box can't be
+  # fog-evicted yet). The streamer sends nearest-first, so the spawn area
+  # is exactly the initial burst — if it was dropped while the renderer
+  # was still initialising it is never re-sent and spawn_near stays 0
+  # (the "invisible spawn" bug). Later samples are not checked: by the
+  # fly phase the player is >8 chunks from spawn and the fog-bound spawn
+  # chunks may be evicted by pool pressure (correct behaviour).
+  SPAWN_NEAR=$(echo "$POOL_LINES" | head -1 | grep -o 'spawn_near=[0-9]*' | cut -d= -f2)
+  check "spawn area is in the pool (spawn_near=$SPAWN_NEAR)" test "$SPAWN_NEAR" -ge 3
 fi
 
 # Frames kept being rendered for the whole run (PERF is logged every 20 HUD

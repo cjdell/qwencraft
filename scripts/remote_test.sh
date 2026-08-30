@@ -180,6 +180,29 @@ check "server saw the client"          grep -q "joined (shared world seed ${SEED
 check "second browser connected"       grep -q "Qwencraft: remote server connected (seed ${SEED}, player" "$LOG2"
 check "shared world saw two players"   grep -q ", 2 online)" "$WS_LOG"
 check "first browser rendered 2 players" grep -q "POOL chunks=[0-9]* missing=[0-9]* sent=[0-9]* agents=2" "$LOG"
+# The client pool must hold the SPAWN AREA. On an unthrottled LAN the
+# initial burst (sent nearest-first, i.e. the spawn area first) arrives
+# within moments of connecting — if it lands before the WebGPU device is
+# ready and chunk updates are dropped while the renderer is still
+# initialising, it is never re-sent (the client's `have` set already
+# matches `sent`, so resync can't see the loss) and the spawn area stays
+# invisible for the whole session: spawn_near stays 0. (spawn_near = pool
+# chunks in the 3x3 chunk box at the spawn point; the pool legitimately
+# holds fewer chunks than `sent` — fully-air/buried chunks have no mesh —
+# so `sent - chunks` is not the metric.)
+POOL_LAST=$(grep -o "POOL .*spawn_near=[0-9]*" "$LOG" | tail -1)
+if [ -z "$POOL_LAST" ]; then
+  echo "FAIL: no POOL telemetry in first browser log"
+  fail=1
+else
+  python3 - "$POOL_LAST" <<'PY' && echo "PASS: spawn area is in the client pool ($POOL_LAST)" || { echo "FAIL: spawn area missing from the client pool ($POOL_LAST) — the initial burst was dropped before the pool existed"; fail=1; }
+import sys
+t = dict(p.split("=") for p in sys.argv[1].split()[1:])
+chunks, sent, near = int(t["chunks"]), int(t["sent"]), int(t["spawn_near"])
+assert chunks > 0 and sent > 0, "nothing was streamed/meshed"
+assert near >= 3, f"spawn area not in the pool (spawn_near={near}, sent={sent}): the initial burst never reached the pool"
+PY
+fi
 # Name tags: each browser must create a tag for the OTHER player (the shared
 # world streams the full agent list to both) and position it on screen
 # (TAGS telemetry, ?taglog=1 — the position must be finite CSS pixels).

@@ -466,6 +466,29 @@ is visible on the map within one tick.
 - **Frame pacing**: an 8ms min-frame guard + rAF *and* 16ms `setInterval`
   drive the loop. Headless Chromium never fires rAF — the interval is what
   keeps the app alive there. Don't "clean up" the interval.
+- **Updates while the renderer is initialising must be buffered, not
+  dropped**: `frame()` applies world updates to the terrain pool, but
+  WebGPU device creation is async (`Renderer::new` awaits adapter/device
+  requests) and on a slow GPU (an Intel Xe iGPU on Linux, a SwiftShader
+  fallback) it can outlast the first streaming pass (the streamer sends
+  nearest-first from ~0.15s in). Chunks produced/received while
+  `renderer == None` are held in `App::pending_updates` and applied in
+  order on the first rendered frame. Don't "simplify" this to a drop:
+  the streamer marks a chunk sent when it queues it (built-in) and the
+  client has already recorded it in `have` (remote), so a dropped chunk
+  is NEVER re-sent → a permanent hole at spawn. Field symptom: "the
+  immediate landscape in front of my spawn point doesn't load, the rest
+  loads as I move, the spawn area stays invisible, and throttling the
+  network in dev tools 'fixes' it" (the throttle just delays the burst
+  until after device init). Regression guard: the POOL line's
+  `spawn_near=` field (pool chunks in the 3×3 chunk box at the spawn
+  point — must be ≥3; verify.sh / walk_test.sh / remote_test.sh assert
+  on it). Note: `sent - chunks` is NOT the loss metric — fully-air and
+  buried chunks are sent but have no mesh, so that gap is normally tens
+  of chunks (a healthy run shows `sent=411 chunks=328` here).
+  verify.sh's pixel checks can't catch this either (they read the WebGL2
+  shadow renderer, which is fed straight from the streamed data — the
+  WebGPU pool can be 100% empty and verify.sh's pixels still pass).
 - **WebSocket binaryType**: this headless Chromium reports the socket
   default as `"blob"` (spec says `"arraybuffer"`), so incoming frames
   arrive as Blobs and `Uint8Array(blob)` throws — the connection silently
@@ -476,11 +499,13 @@ is visible on the map within one tick.
 - **Virtual time vs cold SwiftShader**: under `--virtual-time-budget`, a
   *cold* WebGPU device init can consume ~20s of virtual time while the
   16ms interval fast-forwards (frames run before the renderer exists); a
-  warm init costs ~1s. verify.sh's budget is 40s for exactly this reason —
-  don't lower it. Remote mode can't use virtual time at all (a live 60 Hz
-  WebSocket never quiesces, so virtual time stalls): `remote_test.sh` runs
-  in real time with a wall-clock timeout instead. (The dashboard has no
-  live WebSocket — plain fetch polling — so it *can* use virtual time.)
+  warm init costs ~1s (a ~33s cold init has been observed under load).
+  verify.sh's budget is 50s for exactly this reason — don't lower it
+  (a 40s budget was eaten entirely by a cold init, leaving no POOL
+  telemetry sample). Remote mode can't use virtual time at all (a live 60
+  Hz WebSocket never quiesces, so virtual time stalls): `remote_test.sh`
+  runs in real time with a wall-clock timeout instead. (The dashboard has
+  no live WebSocket — plain fetch polling — so it *can* use virtual time.)
 - **The dashboard dist is embedded and committed**: `qwencraft-net` compiles
   `dashboard/dist` into the binary via `include_dir!` — the server has no
   filesystem dependencies at runtime. After changing anything under

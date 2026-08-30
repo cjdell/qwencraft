@@ -21,10 +21,12 @@ PORT="${PORT:-$((20000 + RANDOM % 20000))}"
 SHOT="${SHOT:-${TMPDIR:-/tmp}/qwencraft-shot.png}"
 LOG="${LOG:-${TMPDIR:-/tmp}/qwencraft-chrome.log}"
 DOM="${DOM:-${TMPDIR:-/tmp}/qwencraft-dom.html}"
-# 40s virtual budget: a COLD SwiftShader device init can consume ~20s of
+# 50s virtual budget: a COLD SwiftShader device init can consume ~20s of
 # virtual time while the 16ms interval fast-forwards (the first run after a
-# while); 25s left no budget for the frame-410 pixel readback.
-BUDGET="${BUDGET:-40000}"
+# while) — and has been observed at ~33s under load, which ate a 40s budget
+# before the first POOL telemetry sample (t=40s) could be taken. 25s left
+# no budget for the frame-410 pixel readback.
+BUDGET="${BUDGET:-50000}"
 # The app streams the WebGL2 shadow-rendered scene as base64 VERIFY_PNG
 # chunks; we reconstruct a real PNG screenshot of the 3D view here.
 SCENE_PNG="${SCENE_PNG:-${TMPDIR:-/tmp}/qwencraft-scene.png}"
@@ -104,6 +106,32 @@ check "app started"                grep -q "Qwencraft: app started" "$LOG"
 check "renderer ready (WebGPU)"    grep -q "Qwencraft: renderer ready" "$LOG"
 check "first frame rendered"       grep -q "Qwencraft: first frame rendered" "$LOG"
 check "no uncaught JS errors"      bash -c "! grep -E 'Uncaught|TypeError|ReferenceError' '$LOG' | grep -v 'favicon' | grep -q ."
+
+# The WebGPU terrain pool must actually hold the SPAWN AREA. The pixel
+# checks above read the WebGL2 shadow renderer, which is fed directly from
+# the streamed chunk data — they stay green even if the WebGPU pool never
+# got the initial burst. The streamer sends nearest-first, so the spawn
+# area is exactly the first chunks sent; if chunk updates are dropped
+# while the renderer is still initialising, those chunks are never re-sent
+# (the streamer marks them sent when it queues them) and spawn_near stays
+# 0 for the whole run. Under virtual time a COLD device init (~20s) 
+# outlasts the whole initial view stream (~2s), so this is deterministic.
+# (spawn_near = pool chunks in the 3x3 chunk box at the spawn point; the
+# pool legitimately holds FEWER chunks than `sent` because fully-air and
+# buried chunks have no mesh — so `sent - chunks` is not the metric.)
+POOL_LINE=$(grep -o "POOL .*spawn_near=[0-9]*" "$LOG" | tail -1)
+if [ -z "$POOL_LINE" ]; then
+  echo "FAIL: no POOL telemetry in log"
+  fail=1
+else
+  python3 - "$POOL_LINE" <<'PY' && echo "PASS: spawn area is in the WebGPU pool ($POOL_LINE)" || { echo "FAIL: spawn area missing from the WebGPU pool ($POOL_LINE)"; fail=1; }
+import sys
+t = dict(p.split("=") for p in sys.argv[1].split()[1:])
+chunks, sent, near = int(t["chunks"]), int(t["sent"]), int(t["spawn_near"])
+assert chunks > 0 and sent > 0, "nothing was streamed/meshed"
+assert near >= 3, f"spawn area not in the pool (spawn_near={near}, sent={sent}): the initial nearest-first burst never reached the pool"
+PY
+fi
 
 # Screenshot exists and is not a single-colour screen.
 check "screenshot created" test -s "$SHOT"

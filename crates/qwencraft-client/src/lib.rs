@@ -417,6 +417,22 @@ impl Renderer {
         self.terrain.len()
     }
 
+    /// Number of pool chunks in the 3x3 chunk box (xz) centred on the chunk
+    /// containing `spawn` — the immediate spawn area. Telemetry for the
+    /// "invisible spawn" regression: the streamer sends nearest-first, so
+    /// the spawn area is exactly the initial burst. If that burst never
+    /// reaches the pool (e.g. dropped while the renderer is still
+    /// initialising), this stays 0 while `sent` grows — and nothing re-sends
+    /// it, so the hole is permanent.
+    pub fn spawn_near_count(&self, spawn: [f32; 2]) -> usize {
+        let pcx = (spawn[0] / 16.0).floor() as i32;
+        let pcz = (spawn[1] / 16.0).floor() as i32;
+        self.terrain
+            .iter()
+            .filter(|t| (t.pos.x - pcx).abs() <= 1 && (t.pos.z - pcz).abs() <= 1)
+            .count()
+    }
+
     /// Number of released slots sitting in the pool's free list (telemetry:
     /// a healthy pool reuses them quickly, so this stays small; a steadily
     /// growing count means fragmentation is outpacing reuse).
