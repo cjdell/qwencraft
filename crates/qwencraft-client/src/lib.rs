@@ -113,6 +113,14 @@ pub struct Renderer {
     queue: Queue,
     surface: Surface<'static>,
     surface_format: TextureFormat,
+    /// Full-screen depth target, sized to the surface. Created ONCE in
+    /// `new()` and re-created in `resize()` only — allocating a fresh one
+    /// per frame churned ~8 MB of GPU memory per frame (at 1080p) and
+    /// exhausted device memory on Intel Xe iGPUs within minutes
+    /// (`vkAllocateMemory … OUT_OF_DEVICE_MEMORY` on the "depth" texture,
+    /// then a permanently invalid render pass = black screen).
+    depth: wgpu::Texture,
+    depth_view: wgpu::TextureView,
     pipeline: RenderPipeline,
     /// Translucent pipeline (water + glass; src-alpha blend, per-texture
     /// alpha, no depth writes); drawn after all opaque geometry.
@@ -222,6 +230,7 @@ impl Renderer {
 
         let (width, height, css_width, css_height) = canvas_size(canvas);
         configure_surface(&surface, &device, surface_format, width, height);
+        let (depth, depth_view) = make_depth_texture(&device, width, height);
 
         // Pipeline: the module is the core shader + the procedural block
         // textures (one WGSL function per block, see textures.rs); WGSL
@@ -385,6 +394,8 @@ impl Renderer {
             queue,
             surface,
             surface_format,
+            depth,
+            depth_view,
             pipeline,
             water_pipeline,
             line_pipeline,
@@ -472,6 +483,9 @@ impl Renderer {
         self.css_width = cw;
         self.css_height = ch;
         configure_surface(&self.surface, &self.device, self.surface_format, w, h);
+        // Re-create the depth target for the new size (the reassignment
+        // drops the old texture + view, freeing the GPU memory).
+        (self.depth, self.depth_view) = make_depth_texture(&self.device, w, h);
     }
 
     /// Drop all terrain (and its pool occupancy) — used when switching to a
@@ -777,32 +791,12 @@ impl Renderer {
                 format: Some(self.surface_format),
                 ..Default::default()
             });
-        let depth_view = self.create_depth(self.width, self.height);
-
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        self.render_pass_into(&mut encoder, &view, &depth_view, self.width, self.height, time);
+        self.render_pass_into(&mut encoder, &view, &self.depth_view, self.width, self.height, time);
         self.queue.submit([encoder.finish()]);
         frame.present();
-    }
-
-    fn create_depth(&self, w: u32, h: u32) -> wgpu::TextureView {
-        let depth = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("depth"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        depth.create_view(&TextureViewDescriptor::default())
     }
 
     /// Encode the full scene (chunks + agents) into `encoder`, drawing into
@@ -1001,6 +995,27 @@ fn canvas_size(canvas: &web_sys::HtmlCanvasElement) -> (u32, u32, u32, u32) {
     canvas.set_width(w);
     canvas.set_height(h);
     (w, h, cw, ch)
+}
+
+/// The full-screen depth target (created once per surface size — see the
+/// `Renderer::depth` field docs for why it must not be per-frame).
+fn make_depth_texture(device: &Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let depth = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("depth"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth.create_view(&TextureViewDescriptor::default());
+    (depth, depth_view)
 }
 
 fn configure_surface(
