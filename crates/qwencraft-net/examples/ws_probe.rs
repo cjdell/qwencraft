@@ -4,8 +4,14 @@
 use std::time::Duration;
 
 fn main() {
+    use qwencraft_server::protocol::ClientMsg;
     let url = std::env::args().nth(1).expect("usage: ws-probe <ws-url>");
     let (mut sock, _resp) = expect_or_print(tungstenite::connect(&url));
+    // v8 handshake: the identity claim goes out before the server's Hello
+    // (all-zero token = fresh identity).
+    let _ = sock.send(tungstenite::Message::Binary(
+        ClientMsg::Rejoin { token: [0u8; 16] }.encode().into(),
+    ));
     match sock.read() {
         Ok(msg) => {
             println!("first frame: {msg:?}");

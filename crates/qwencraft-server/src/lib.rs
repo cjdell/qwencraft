@@ -580,6 +580,66 @@ impl Server {
         Ok(())
     }
 
+    /// Restore a returning player (protocol v8 `Rejoin`): move player
+    /// `id`'s feet to `pos` with the given view orientation. Like
+    /// [`Self::console_teleport`] (Y clamped into the world, velocity
+    /// zeroed, the next tick settles the agent), but if the recorded cell
+    /// is now blocked (a solid at the feet or the head — someone built
+    /// over the player) the player is lifted to the top of that column
+    /// (terrain + recorded edits); a column packed solid to the top falls
+    /// back to the nearest spawnable column. Returns the final feet
+    /// position.
+    pub fn restore_agent(&mut self, id: u32, pos: Vec3, yaw: f32, pitch: f32) -> Result<Vec3, String> {
+        if !pos.x.is_finite() || !pos.y.is_finite() || !pos.z.is_finite()
+            || !yaw.is_finite()
+            || !pitch.is_finite()
+        {
+            return Err("restored state must be finite numbers".to_string());
+        }
+        let idx = self.agent_index(id);
+        let (fx, fy, fz) = (pos.x as i32, pos.y as i32, pos.z as i32);
+        // The player occupies the feet cell and the one above (height 1.8
+        // < 2). If either is solid, the recorded spot is gone.
+        let blocked = (0..2).any(|dy| {
+            fy + dy < WORLD_HEIGHT
+                && self
+                    .world
+                    .block_at(BlockPos::new(fx, fy + dy, fz))
+                    .is_solid()
+        });
+        let mut p = pos;
+        if blocked {
+            p = match (0..WORLD_HEIGHT)
+                .rev()
+                .find(|&y| self.world.block_at(BlockPos::new(fx, y, fz)).is_solid())
+            {
+                // Same convention as `add_player`: two above the surface,
+                // column-centred — the agent drops the last bit.
+                Some(y) if y + 1 < WORLD_HEIGHT => {
+                    Vec3::new(fx as f32 + 0.5, (y + 2) as f32, fz as f32 + 0.5)
+                }
+                // Packed to the top: the nearest spawnable column.
+                _ => {
+                    let (sx, sz) = Self::find_spawn(&self.world, fx, fz, 16);
+                    let surface = self.world.height_at(sx, sz);
+                    Vec3::new(sx as f32 + 0.5, (surface + 2) as f32, sz as f32 + 0.5)
+                }
+            };
+        }
+        let y = p.y.clamp(0.0, (WORLD_HEIGHT - 1) as f32);
+        let final_pos = Vec3::new(p.x, y, p.z);
+        self.agents[idx].pos = final_pos;
+        self.agents[idx].vel = Vec3::default();
+        self.agents[idx].on_ground = false;
+        self.agents[idx].yaw = yaw;
+        self.agents[idx].pitch = pitch;
+        self.emit(format!(
+            "player {id} restored to ({:.0}, {:.0}, {:.0})",
+            final_pos.x, final_pos.y, final_pos.z
+        ));
+        Ok(final_pos)
+    }
+
     /// The configured NPC load (count, spacing in blocks).
     pub fn npc_load_config(&self) -> (u32, f32) {
         (self.npc_count, self.npc_spacing)
@@ -1986,6 +2046,51 @@ mod tests {
 
         // Teleport: NaN is rejected.
         assert!(s.console_teleport(0, Vec3::new(f32::NAN, 10.0, 10.0)).is_err());
+    }
+
+    /// Rejoin restore: a clear cell restores exactly (position AND view),
+    /// a blocked cell lifts the player to the top of the column, and
+    /// non-finite state is rejected.
+    #[test]
+    fn restore_agent_places_and_lifts() {
+        let mut s = Server::new(1337);
+        let p0 = s.player_state().pos;
+
+        // Clear cell: restored exactly, view included.
+        let dest = Vec3::new(p0.x + 20.0, p0.y, p0.z);
+        let final_pos = s.restore_agent(0, dest, 0.7, -0.4).unwrap();
+        assert_eq!(final_pos, dest);
+        let st = s.player_state();
+        assert_eq!(st.pos, dest);
+        assert!((st.yaw - 0.7).abs() < 1e-6);
+        assert!((st.pitch - (-0.4)).abs() < 1e-6);
+
+        // Blocked cell: a solid at the feet lifts the player to the top of
+        // that column (well above the recorded cell).
+        let cell = BlockPos::new(dest.x as i32, dest.y as i32, dest.z as i32);
+        s.console_edit_block(0, cell, Block::Stone).unwrap();
+        s.drain_dirty();
+        let lifted = s.restore_agent(0, dest, 0.0, 0.0).unwrap();
+        assert!(
+            lifted.y > dest.y + 1.0,
+            "blocked restore must lift (dest {dest:?}, lifted {lifted:?})"
+        );
+        // The lift is onto air: the cell at the lifted feet is not solid.
+        let feet = BlockPos::new(lifted.x as i32, lifted.y as i32, lifted.z as i32);
+        assert!(!s.block_at(feet).is_solid());
+        // And the next tick keeps them alive where they landed.
+        tick_n(&mut s, 60);
+        let p1 = s.player_state().pos;
+        assert!((p1.x - lifted.x).abs() < 3.0);
+        assert!(p1.y >= 0.0);
+
+        // Non-finite state is rejected (nothing moves).
+        let before = s.player_state().pos;
+        assert!(s.restore_agent(0, Vec3::new(f32::NAN, 10.0, 10.0), 0.0, 0.0).is_err());
+        assert!(s
+            .restore_agent(0, Vec3::new(10.0, 10.0, 10.0), f32::INFINITY, 0.0)
+            .is_err());
+        assert_eq!(s.player_state().pos, before);
     }
 
     /// Console edits must reach every viewer holding the chunk (the shared

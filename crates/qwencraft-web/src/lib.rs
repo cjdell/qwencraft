@@ -276,6 +276,11 @@ struct RemoteLink {
     /// This page's player id in the shared world (from Hello); u32::MAX
     /// until it arrives.
     player_id: u32,
+    /// The rejoin token presented in this link's first frame (all-zero =
+    /// fresh identity). Hello answers with the same token (reclaim
+    /// succeeded) or a fresh mint (new identity) — the answer is what gets
+    /// persisted for the next visit.
+    rejoin_token: [u8; 16],
     seed: Option<u64>,
     /// Every chunk position received from this server (de-duplicated).
     /// Transit-loss detection: the server's per-viewer `chunks_sent`
@@ -630,6 +635,16 @@ impl App {
             .set_profile(self.player_name.clone(), self.player_color);
     }
 
+    /// Send the first-frame identity claim for remote link `id` (the rejoin
+    /// token captured when the socket opened; all-zero = fresh identity).
+    fn send_rejoin(&mut self, id: u32) {
+        if let Backend::Remote(r) = &mut self.backend {
+            if r.id == id {
+                r.send(ClientMsg::Rejoin { token: r.rejoin_token });
+            }
+        }
+    }
+
     /// Create (once per remote player) a name-tag element in the container.
     fn make_tag(&mut self) -> HtmlDivElement {
         let doc = web_sys::window().expect("window").document().expect("document");
@@ -779,6 +794,9 @@ impl App {
             r.clear_terrain();
         }
         self.keys = KeySet::default();
+        // The fresh world's agent is "Player" by default — apply the
+        // player's (restored) identity to it.
+        self.apply_profile();
     }
 
     /// Apply decoded server messages to the remote link `id`.
@@ -794,7 +812,7 @@ impl App {
             }
             for m in msgs {
                 match m {
-                    ServerMsg::Hello { version, seed, player_id } => {
+                    ServerMsg::Hello { version, seed, player_id, token } => {
                         if version != PROTOCOL_VERSION {
                             let future = version > PROTOCOL_VERSION;
                             let _ = r.ws.close();
@@ -835,6 +853,22 @@ impl App {
                         r.seed = Some(seed);
                         r.player_id = player_id;
                         hello_seed = Some(seed);
+                        // Identity: the server re-issues the token — the
+                        // same one we claimed (reclaim succeeded) or a
+                        // fresh mint (new world / unknown token / live
+                        // duplicate). Persist it for the next visit.
+                        if r.rejoin_token != [0u8; 16] {
+                            if r.rejoin_token == token {
+                                log(&format!(
+                                    "Qwencraft: rejoined as player {player_id} — previous instance restored"
+                                ));
+                            } else {
+                                log(&format!(
+                                    "Qwencraft: stored identity not recognised here (new world?) — fresh identity as player {player_id}"
+                                ));
+                            }
+                        }
+                        store_identity_fields(Some(token), Some(seed), None, None);
                         // Announce our identity right away: the shared
                         // world broadcasts it so other clients can render
                         // us (sphere + name tag) from the first tick.
@@ -1369,6 +1403,12 @@ fn connect_remote(app: &Rc<RefCell<App>>, raw_url: &str) {
             .set_server_status(&format!("invalid URL: {raw_url:?} — use ws://host:port"));
         return;
     };
+    // The stored identity for THIS origin (rejoin feature): the token to
+    // present in the first frame. None on a first visit (or when storage is
+    // unavailable) → all-zero token = fresh identity.
+    let stored_token = read_stored_identity()
+        .map(|(token, _, _, _)| token)
+        .unwrap_or([0u8; 16]);
     // Some browser builds default the binary type to "blob"; the codec
     // wants raw ArrayBuffer bytes.
     ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
@@ -1386,6 +1426,7 @@ fn connect_remote(app: &Rc<RefCell<App>>, raw_url: &str) {
             url: url.clone(),
             connected: false,
             player_id: u32::MAX,
+            rejoin_token: stored_token,
             seed: None,
             have: std::collections::HashSet::new(),
             last_chunk_ms: 0.0,
@@ -1417,6 +1458,12 @@ fn connect_remote(app: &Rc<RefCell<App>>, raw_url: &str) {
                 return;
             }
             log(&format!("Qwencraft: remote socket open: {url_cb}"));
+            // First frame: the identity claim (protocol v8). The server
+            // reads it BEFORE allocating a player — a stored token reclaims
+            // the previous instance (same spot / name / colour; same world
+            // only, the registry is bound to the world's seed), an
+            // all-zero token starts a fresh identity.
+            app_cb.borrow_mut().send_rejoin(id);
         });
         ws.set_onopen(Some(cb.as_ref().unchecked_ref()));
         app.borrow_mut()
@@ -1748,6 +1795,145 @@ fn parse_color_triple(s: &str) -> Option<[u8; 3]> {
         return None;
     }
     Some([parts[0], parts[1], parts[2]])
+}
+
+// ---- Per-origin identity storage (rejoin) --------------------------------
+//
+// The player's identity — rejoin token, world seed, display name and
+// sphere colour — is persisted in localStorage, KEYED BY ORIGIN, so two
+// servers on different hosts/ports never share an identity (and the token
+// only ever goes to the server it was minted by). The server is
+// authoritative about the token (it re-issues it in Hello); this storage
+// is the client's copy, presented via the first-frame `ClientMsg::Rejoin`.
+//
+// Format (one string, pipe-separated): `<hex token>|<seed decimal>|<r,g,b>`
+// `|<percent-encoded name>`. Hand-rolled (no JSON dep in the wasm build):
+// the name is the only free-text field and percent-encoding makes it safe
+// against every character.
+
+/// The localStorage key for this origin's stored identity (None when the
+/// page has no location — e.g. the headless shadow-renderer paths).
+fn identity_key() -> Option<String> {
+    let loc = web_sys::window()?.location();
+    Some(format!("qwencraft.{}", loc.origin().ok()?))
+}
+
+/// The stored identity for this origin: (token, seed, colour, name), or
+/// None (first visit, corrupted entry, or storage unavailable — e.g. some
+/// private-browsing modes; rejoin simply doesn't apply then).
+fn read_stored_identity() -> Option<([u8; 16], u64, [u8; 3], String)> {
+    let key = identity_key()?;
+    let storage = web_sys::window()?.local_storage().ok()??;
+    let raw = storage.get_item(&key).ok()??;
+    let parts: Vec<&str> = raw.split('|').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let token = token_from_hex(parts[0])?;
+    let seed = parts[1].parse().ok()?;
+    let color = parse_color_triple(parts[2])?;
+    let name = percent_decode(parts[3]);
+    if name.is_empty() {
+        return None;
+    }
+    Some((token, seed, color, name))
+}
+
+/// Merge-update the stored identity for this origin (None fields are left
+/// as-is). A fresh entry starts from (zero token, seed 0, white, "Player")
+/// — the zero token is the "no identity yet" wire value.
+fn store_identity_fields(
+    token: Option<[u8; 16]>,
+    seed: Option<u64>,
+    color: Option<[u8; 3]>,
+    name: Option<String>,
+) {
+    let Some(key) = identity_key() else {
+        return;
+    };
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(storage) = window.local_storage().ok().flatten() else {
+        return; // storage unavailable: rejoin simply won't work here
+    };
+    let (stored_token, stored_seed, stored_color, stored_name) = read_stored_identity()
+        .unwrap_or(([0u8; 16], 0, [255, 255, 255], "Player".to_string()));
+    let token = token.unwrap_or(stored_token);
+    let seed = seed.unwrap_or(stored_seed);
+    let color = color.unwrap_or(stored_color);
+    let name = name.unwrap_or(stored_name);
+    let value = format!(
+        "{}|{}|{},{},{}|{}",
+        token_hex(token),
+        seed,
+        color[0],
+        color[1],
+        color[2],
+        percent_encode(&name)
+    );
+    let _ = storage.set_item(&key, &value);
+}
+
+/// 16 bytes ↔ 32 lowercase hex chars.
+fn token_hex(t: [u8; 16]) -> String {
+    t.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn token_from_hex(s: &str) -> Option<[u8; 16]> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Percent-encode (RFC 3986 unreserved set passes through):
+/// identity-safe for any name character, no dependency.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        // A '%' escape: two hex digits must follow.
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(hi), Some(lo)) = (hex_digit(b[i + 1]), hex_digit(b[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 0..=15 for an ASCII hex digit (either case), None otherwise.
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 // ---- Browser console API (window.qwc) ------------------------------------
@@ -2803,6 +2989,9 @@ pub fn start() -> Result<(), JsValue> {
                 let raw = input_el.value().trim().to_string();
                 a.player_name = if raw.is_empty() { "Player".to_string() } else { raw };
                 a.apply_profile();
+                // Keep the stored identity in step (name/colour are the
+                // client's own; the token is untouched).
+                store_identity_fields(None, None, None, Some(a.player_name.clone()));
             }
         });
         name_input
@@ -2835,6 +3024,24 @@ pub fn start() -> Result<(), JsValue> {
                     let _ = s.class_list().add_1("selected"); // default white
                 }
             }
+            // Restore the stored identity (name + colour) into the options
+            // UI and the active backend — a refresh keeps the player's
+            // chosen identity (the rejoin token itself is re-read at
+            // connect time, per origin).
+            if let Some((_, _, color, name)) = read_stored_identity() {
+                let _ = name_input.set_value(&name);
+                let want = format!("{},{},{}", color[0], color[1], color[2]);
+                for s in &swatches {
+                    let _ = s.class_list().remove_1("selected");
+                    if s.get_attribute("data-color").as_deref() == Some(want.as_str()) {
+                        let _ = s.class_list().add_1("selected");
+                    }
+                }
+                let mut a = app.borrow_mut();
+                a.player_name = name;
+                a.player_color = color;
+                a.apply_profile();
+            }
             let cb = Closure::<dyn FnMut(MouseEvent)>::new({
                 let app = app.clone();
                 let swatches = swatches.clone();
@@ -2859,6 +3066,7 @@ pub fn start() -> Result<(), JsValue> {
                     let mut a = app.borrow_mut();
                     a.player_color = color;
                     a.apply_profile();
+                    store_identity_fields(None, None, Some(color), None);
                 }
             });
             palette

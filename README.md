@@ -95,6 +95,18 @@ and an **Options** button that opens the identity/connection panel:
 - **Server** — the headless-server URL + **Connect**; **Disconnect** drops
   the remote server and falls back to the embedded in-browser one.
 
+Your identity (name, colour, and the server-issued rejoin token) is kept
+**per server URL in the browser's localStorage**. Against a headless
+server that persists its world (see below), leaving and coming back —
+refresh, dropped connection, even a server restart — reclaims your
+previous player: you spawn where you last were, with your name and
+colour. The token only works against the *same world* it was issued for
+(the identities are stored in the seed-bound world save), so pointing a
+browser at a different world starts you fresh. No accounts, no login —
+it's a capability the server hands out in the `Hello` message, and the
+server decides (a second tab with the same browser profile gets its own
+fresh player rather than taking over a live one).
+
 The panel is inert until you're in a game (it needs a live backend), and
 clicking inside it never starts pointer lock.
 
@@ -274,20 +286,26 @@ WebSocket upgrade.
   one tick, which reads as smooth).
 - **The world persists across restarts.** Terrain is a pure function of
   the seed, so the world's entire persistent state is the sparse set of
-  blocks players have edited (the *override layer* in `World`). The server
-  snapshots that (seed + overrides, one small record per edited block —
-  see `qwencraft-server/src/save.rs`) to `world.save` in `--data-dir`
-  (default `./data`) every few seconds / 64 edits and on a clean stop
-  (Ctrl-C), atomically (temp file + rename — a crash never leaves a torn
-  save). On start, an existing save is replayed onto fresh terrain, so
-  players' builds survive a restart. The save is bound to its seed: a
-  mismatched `--seed` fails fast at startup. (Agents are not yet
-  persisted — players re-join at spawn.)
+  blocks players have edited (the *override layer* in `World`) plus each
+  player's rejoin identity (last position/view, name, colour — see the
+  v2 format in `qwencraft-server/src/save.rs`). The server snapshots that
+  to `world.save` in `--data-dir` (default `./data`) every few seconds /
+  64 edits and on a clean stop (Ctrl-C), atomically (temp file + rename —
+  a crash never leaves a torn save). On start, an existing save is
+  replayed onto fresh terrain, so players' builds — and where each player
+  last was — survive a restart. The save is bound to its seed: a
+  mismatched `--seed` fails fast at startup. A player who leaves (or
+  whose server stops) is remembered under their token; on their next
+  visit the server restores them to their last spot instead of spawning
+  them at the origin.
 - **Wire protocol** (`qwencraft-server/src/protocol.rs`): little-endian
-  binary frames, versioned (currently 6). Server → client: `Hello` (seed +
-  your player id), player/agent state (agents carry name + colour), chunk
-  regions, world stats, NPC load echo, and `BlockAt` (the answer to a
-  console `getBlock`). Client → server: the player profile
+  binary frames, versioned (currently 8). Server → client: `Hello` (seed +
+  your player id + your rejoin token), player/agent state (agents carry
+  name + colour), chunk regions, world stats, NPC load echo, and `BlockAt`
+  (the answer to a console `getBlock`). Client → server: `Rejoin` (the
+  token from a previous visit's `Hello`, or all-zero for a new identity —
+  sent as the very first frame, before `Hello`, which is how the server
+  restores a returning player in place), the player profile
   (name + colour, sent right after connect), input snapshots, actions
   (break; place with stamped aim **plus the selected block id**, validated
   against the block registry on the server), chunk re-send requests

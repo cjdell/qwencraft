@@ -118,19 +118,46 @@ fn test_data_dir(tag: &str) -> PathBuf {
 
 
 /// First frame must be the binary Hello; return the player id it carries
-/// (the client uses it to skip rendering its own sphere).
-fn expect_hello(sock: &mut Sock, name: &str) -> u32 {
+/// (the client uses it to skip rendering its own sphere) and the
+/// connection's rejoin token (minted for fresh identities, re-issued for
+/// recognised rejoiners).
+fn expect_hello(sock: &mut Sock, name: &str) -> (u32, [u8; 16]) {
     let hello = match sock.read().expect("read") {
         Message::Binary(data) => ServerMsg::decode_stream(&data).0,
         other => panic!("first frame must be binary, got {other:?}"),
     };
     match hello.into_iter().next().expect("hello present") {
-        ServerMsg::Hello { version, seed, player_id } => {
+        ServerMsg::Hello { version, seed, player_id, token } => {
             assert_eq!(version, PROTOCOL_VERSION, "protocol version on {name}");
             assert_eq!(seed, SEED, "seed on {name}");
-            player_id
+            (player_id, token)
         }
         other => panic!("first message must be Hello, got {other:?}"),
+    }
+}
+
+/// Join the shared world the way the v8 client does: send the first-frame
+/// identity claim (all-zero token = fresh identity), then read the Hello.
+fn join(sock: &mut Sock, name: &str) -> (u32, [u8; 16]) {
+    send(sock, &ClientMsg::Rejoin { token: [0u8; 16] });
+    expect_hello(sock, name)
+}
+
+/// Poll the dashboard event log until `needle` appears (5 s deadline): a
+/// deterministic sync point after a disconnect (the session cleanup — and
+/// the rejoin record it writes — have run).
+async fn wait_for_event(addr: &SocketAddr, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, _, _, body) = http_get(addr, "/api/status").await;
+        if String::from_utf8_lossy(&body).contains(needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "event {needle:?} never appeared in the log"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -177,7 +204,8 @@ async fn end_to_end_single_player() {
     let (mut sock, _) = connect(&format!("ws://{addr}/ws")).expect("connect");
 
     // 1) Hello with our protocol version and seed.
-    let player_id = expect_hello(&mut sock, "conn");
+    let (player_id, token) = join(&mut sock, "conn");
+    assert_ne!(token, [0u8; 16], "a fresh identity must be issued a token");
     assert_eq!(player_id, 0, "first connection is player 0");
 
     // 2) The world streams in: at least one chunk and a live player state.
@@ -309,7 +337,7 @@ async fn resync_resends_lost_chunks() {
     .expect("serve");
     let addr = ep.addr;
     let (mut sock, _) = connect(&format!("ws://{addr}/ws")).expect("connect");
-    expect_hello(&mut sock, "resync");
+    let _ = join(&mut sock, "resync");
 
     // Let the initial stream settle (the spawn view streams in ~2 s).
     let s = sample(&mut sock, 4.0);
@@ -374,7 +402,7 @@ async fn console_get_set_block_and_teleport() {
     .expect("serve");
     let addr = ep.addr;
     let (mut sock, _) = connect(&format!("ws://{addr}/ws")).expect("connect");
-    let player_id = expect_hello(&mut sock, "console");
+    let (player_id, _token) = join(&mut sock, "console");
     assert_eq!(player_id, 0);
 
     // Let the spawn view settle; the player is standing (no input sent).
@@ -458,8 +486,8 @@ async fn two_connections_share_one_world() {
     let (mut a, _) = connect(&url).expect("connect A");
     let (mut b, _) = connect(&url).expect("connect B");
 
-    let pid_a = expect_hello(&mut a, "A");
-    let pid_b = expect_hello(&mut b, "B");
+    let (pid_a, _tok_a) = join(&mut a, "A");
+    let (pid_b, _tok_b) = join(&mut b, "B");
     assert_ne!(pid_a, pid_b, "each connection gets its own player id");
 
     // Let both players' views stream in.
@@ -588,15 +616,24 @@ async fn wss_serves_encrypted_sessions() {
     .await
     .expect("wss handshake");
 
+    // Identity handshake first (zero token = fresh identity).
+    use futures_util::SinkExt;
+    ws.send(Message::Binary(
+        ClientMsg::Rejoin { token: [0u8; 16] }.encode().into(),
+    ))
+    .await
+    .expect("send rejoin");
+
     let hello = match ws.next().await.unwrap().expect("message") {
         Message::Binary(data) => ServerMsg::decode_stream(&data).0,
         other => panic!("first frame must be binary, got {other:?}"),
     };
     match hello.into_iter().next().expect("hello present") {
-        ServerMsg::Hello { version, seed, player_id } => {
+        ServerMsg::Hello { version, seed, player_id, token } => {
             assert_eq!(version, PROTOCOL_VERSION);
             assert_eq!(seed, SEED);
             assert_eq!(player_id, 0);
+            assert_ne!(token, [0u8; 16], "a fresh identity must get a token");
         }
         other => panic!("first message must be Hello, got {other:?}"),
     }
@@ -717,7 +754,7 @@ async fn dashboard_http_serves_status_map_and_assets() {
 
     // A player joins over ws: the status must reflect it (agent + event).
     let (mut sock, _) = connect(&format!("ws://{addr}/ws")).expect("connect");
-    let pid = expect_hello(&mut sock, "conn");
+    let (pid, _token) = join(&mut sock, "conn");
     // Announce a profile: the status JSON must carry the player's name.
     send(&mut sock, &ClientMsg::Profile {
         name: "MapReader".to_string(),
@@ -789,7 +826,7 @@ async fn world_edits_survive_restart() {
     .await
     .expect("serve session 1");
     let (mut sock, _) = connect(&format!("ws://{}/ws", ep.addr)).expect("connect 1");
-    expect_hello(&mut sock, "session 1");
+    let _ = join(&mut sock, "session 1");
     let _ = sample(&mut sock, 0.5);
     send(&mut sock, &ClientMsg::SetBlock { pos: edit_a, block: 13 }); // brick
     send(&mut sock, &ClientMsg::SetBlock { pos: edit_b, block: 6 }); // log
@@ -809,14 +846,22 @@ async fn world_edits_survive_restart() {
         s.block_ats
     );
     drop(sock);
-    // Clean stop: the tick loop takes a final save before returning. (The
-    // periodic save may not have fired in this short session — the final
-    // save is what makes restarts lossless.)
+    // Wait for the session cleanup (it writes the rejoin record into the
+    // registry that the final save snapshots), then a clean stop: the tick
+    // loop takes a final save before returning. (The periodic save may not
+    // have fired in this short session — the final save is what makes
+    // restarts lossless.)
+    wait_for_event(&ep.addr, "left (").await;
     ep.shutdown.stop().await;
     assert!(save_path.exists(), "clean stop must write the save file");
-    let (saved_seed, saved_edits) =
+    let (saved_seed, saved_edits, saved_players) =
         save::decode(&std::fs::read(&save_path).expect("read save")).expect("decode save");
     assert_eq!(saved_seed, SEED, "save must carry the world's seed");
+    assert!(
+        saved_players.iter().any(|(_, r)| r.name == "Player"),
+        "the v2 save must carry the disconnected player's identity (got {:?})",
+        saved_players
+    );
     assert!(
         saved_edits.iter().any(|e| e.pos == edit_a && e.block.as_u8() == 13)
             && saved_edits.iter().any(|e| e.pos == edit_b && e.block.as_u8() == 6),
@@ -837,7 +882,7 @@ async fn world_edits_survive_restart() {
     .await
     .expect("serve session 2");
     let (mut sock2, _) = connect(&format!("ws://{}/ws", ep2.addr)).expect("connect 2");
-    expect_hello(&mut sock2, "session 2");
+    let _ = join(&mut sock2, "session 2");
     let _ = sample(&mut sock2, 0.5);
     send(&mut sock2, &ClientMsg::GetBlock { pos: edit_a });
     send(&mut sock2, &ClientMsg::GetBlock { pos: edit_b });
@@ -880,10 +925,14 @@ async fn save_seed_mismatch_fails_fast() {
     // Write a save bound to SEED directly (no session needed).
     std::fs::write(
         &save_path,
-        save::encode(SEED, &[qwencraft_server::Edit {
-            pos: BlockPos::new(5, 30, 5),
-            block: qwencraft_world::Block::Stone,
-        }]),
+        save::encode(
+            SEED,
+            &[qwencraft_server::Edit {
+                pos: BlockPos::new(5, 30, 5),
+                block: qwencraft_world::Block::Stone,
+            }],
+            &[],
+        ),
     )
     .expect("write save");
 
@@ -911,4 +960,206 @@ async fn save_seed_mismatch_fails_fast() {
         err.contains("seed"),
         "the error should mention the seed mismatch (got: {err})"
     );
+}
+
+/// A full rejoin cycle within one server run: the player claims a fresh
+/// identity, picks a name/colour, moves far from spawn, and leaves. A new
+/// connection presenting the stored token must be restored to the same
+/// spot with the same name/colour — and get the SAME token back. Unknown
+/// and all-zero tokens must get fresh identities at the fresh spawn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejoin_reclaims_identity() {
+    let ep = serve(ServerOptions {
+        seed: SEED,
+        port: 0,
+        data_dir: test_data_dir("rejoin"),
+        ..Default::default()
+    })
+    .await
+    .expect("serve");
+
+    // Connection 1: fresh identity, profile, move, leave.
+    let (mut a, _) = connect(&format!("ws://{}/ws", ep.addr)).expect("connect A");
+    let (_pid_a, token_a) = join(&mut a, "A");
+    send(&mut a, &ClientMsg::Profile { name: "Alice".into(), color: [10, 200, 255] });
+    let s0 = sample(&mut a, 1.0);
+    let p0 = s0.player.expect("player state");
+    let dest = Vec3::new(p0.pos.x + 40.5, p0.pos.y, p0.pos.z - 25.5);
+    send(&mut a, &ClientMsg::Teleport { pos: dest });
+    let s1 = sample(&mut a, 1.5);
+    let last = s1.player.expect("player state after teleport");
+    assert!((last.pos.x - dest.x).abs() < 3.0, "the teleport must land (got {:?})", last.pos);
+    assert!(
+        s1.player_names.contains(&"Alice".to_string()),
+        "the profile must be live before the leave (names: {:?})",
+        s1.player_names
+    );
+    drop(a);
+    wait_for_event(&ep.addr, "left (").await;
+
+    // Connection 2: present the token → the previous instance comes back.
+    let (mut b, _) = connect(&format!("ws://{}/ws", ep.addr)).expect("connect B");
+    send(&mut b, &ClientMsg::Rejoin { token: token_a });
+    let (_pid_b, token_b) = expect_hello(&mut b, "B");
+    assert_eq!(token_b, token_a, "a recognised rejoin must keep the token");
+    let s2 = sample(&mut b, 1.5);
+    let p2 = s2.player.expect("player state after rejoin");
+    assert!(
+        dist(p2.pos, last.pos) < 1.5,
+        "rejoin must restore the pre-leave position (was {:?}, now {:?})",
+        last.pos,
+        p2.pos
+    );
+    assert!(
+        s2.player_names.contains(&"Alice".to_string()),
+        "rejoin must keep the name (names: {:?})",
+        s2.player_names
+    );
+    assert_eq!(p2.color, [10, 200, 255], "rejoin must keep the sphere colour");
+
+    // Connection 3: a token this world never minted → fresh identity, fresh
+    // spawn (far from Alice's spot), a NEW token.
+    drop(b);
+    wait_for_event(&ep.addr, "left (").await;
+    let (mut c, _) = connect(&format!("ws://{}/ws", ep.addr)).expect("connect C");
+    send(&mut c, &ClientMsg::Rejoin { token: [0x42; 16] });
+    let (_pid_c, token_c) = expect_hello(&mut c, "C");
+    assert_ne!(token_c, [0x42; 16], "an unknown token must not be honoured");
+    assert_ne!(token_c, [0u8; 16], "a fresh identity must get a token");
+    let s3 = sample(&mut c, 1.0);
+    let p3 = s3.player.expect("player state");
+    assert!(
+        dist(p3.pos, last.pos) > 20.0,
+        "an unknown token must spawn fresh, not at the recorded spot (got {:?})",
+        p3.pos
+    );
+    drop(c);
+    ep.shutdown.stop().await;
+}
+
+/// A second connection presenting a token that is ALREADY connected (a
+/// second tab with the same browser profile) must not hijack the live
+/// player: it gets a fresh identity, the original connection is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_live_token_gets_fresh_identity() {
+    let ep = serve(ServerOptions {
+        seed: SEED,
+        port: 0,
+        data_dir: test_data_dir("duplive"),
+        ..Default::default()
+    })
+    .await
+    .expect("serve");
+
+    let (mut a, _) = connect(&format!("ws://{}/ws", ep.addr)).expect("connect A");
+    let (_pid_a, token_a) = join(&mut a, "A");
+
+    // B claims A's LIVE token: rejected → fresh identity.
+    let (mut b, _) = connect(&format!("ws://{}/ws", ep.addr)).expect("connect B");
+    send(&mut b, &ClientMsg::Rejoin { token: token_a });
+    let (_pid_b, token_b) = expect_hello(&mut b, "B");
+    assert_ne!(token_b, token_a, "a live identity must not be hijacked");
+    assert_ne!(token_b, [0u8; 16], "the fresh identity must get its own token");
+
+    // A is still fully alive and streaming its own state.
+    let sa = sample(&mut a, 0.5);
+    assert!(sa.player.is_some(), "A must be unaffected by B's rejected claim");
+    drop(b);
+    wait_for_event(&ep.addr, "left (").await;
+    drop(a);
+    wait_for_event(&ep.addr, "left (0 online)").await;
+    ep.shutdown.stop().await;
+}
+
+/// Rejoin across a server RESTART: the identity is persisted in the
+/// seed-bound world save, so a fresh server on the same data dir restores
+/// the pre-restart position and name (the token travels only through the
+/// client — here, a variable).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejoin_survives_restart() {
+    let data_dir = test_data_dir("rejoinrestart");
+
+    // Session 1: identity, profile, move, clean stop.
+    let ep = serve(ServerOptions {
+        seed: SEED,
+        port: 0,
+        data_dir: data_dir.clone(),
+        ..Default::default()
+    })
+    .await
+    .expect("serve 1");
+    let (mut sock, _) = connect(&format!("ws://{}/ws", ep.addr)).expect("connect 1");
+    let (_pid, token) = join(&mut sock, "session 1");
+    send(&mut sock, &ClientMsg::Profile { name: "Alice".into(), color: [10, 200, 255] });
+    let s0 = sample(&mut sock, 1.0);
+    let p0 = s0.player.expect("player state");
+    let dest = Vec3::new(p0.pos.x + 40.5, p0.pos.y, p0.pos.z - 25.5);
+    send(&mut sock, &ClientMsg::Teleport { pos: dest });
+    let s1 = sample(&mut sock, 1.5);
+    let last = s1.player.expect("player state after teleport");
+    drop(sock);
+    wait_for_event(&ep.addr, "left (").await;
+    ep.shutdown.stop().await;
+
+    // Session 2: fresh server, same data dir. Present the token.
+    let ep2 = serve(ServerOptions {
+        seed: SEED,
+        port: 0,
+        data_dir: data_dir.clone(),
+        ..Default::default()
+    })
+    .await
+    .expect("serve 2");
+    let (mut sock2, _) = connect(&format!("ws://{}/ws", ep2.addr)).expect("connect 2");
+    send(&mut sock2, &ClientMsg::Rejoin { token });
+    let (_pid2, token2) = expect_hello(&mut sock2, "session 2");
+    assert_eq!(token2, token, "the restart must keep the identity's token");
+    let s2 = sample(&mut sock2, 1.5);
+    let p2 = s2.player.expect("player state");
+    assert!(
+        dist(p2.pos, last.pos) < 1.5,
+        "rejoin after restart must restore the pre-restart position (was {:?}, now {:?})",
+        last.pos,
+        p2.pos
+    );
+    assert!(
+        s2.player_names.contains(&"Alice".to_string()),
+        "rejoin after restart must keep the name (names: {:?})",
+        s2.player_names
+    );
+    assert_eq!(p2.color, [10, 200, 255], "rejoin after restart must keep the colour");
+
+    // And the stop-while-connected case: restart with the player STILL
+    // connected (no leave event ever ran) — the clean stop must fold their
+    // state into the save, and the token must still work.
+    let p_before = p2.pos;
+    ep2.shutdown.stop().await;
+    drop(sock2);
+    let ep3 = serve(ServerOptions {
+        seed: SEED,
+        port: 0,
+        data_dir: data_dir.clone(),
+        ..Default::default()
+    })
+    .await
+    .expect("serve 3");
+    let (mut sock3, _) = connect(&format!("ws://{}/ws", ep3.addr)).expect("connect 3");
+    send(&mut sock3, &ClientMsg::Rejoin { token });
+    let (_pid3, token3) = expect_hello(&mut sock3, "session 3");
+    assert_eq!(token3, token, "the stop-while-connected restart must keep the token");
+    let s3 = sample(&mut sock3, 1.5);
+    let p3 = s3.player.expect("player state");
+    assert!(
+        dist(p3.pos, p_before) < 1.5,
+        "rejoin after a stop-while-connected must restore the position (was {:?}, now {:?})",
+        p_before,
+        p3.pos
+    );
+    assert!(
+        s3.player_names.contains(&"Alice".to_string()),
+        "the name must survive the stop-while-connected restart (names: {:?})",
+        s3.player_names
+    );
+    drop(sock3);
+    ep3.shutdown.stop().await;
 }

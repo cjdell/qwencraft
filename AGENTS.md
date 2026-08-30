@@ -67,7 +67,7 @@ writes temp files):
 
 | Command | What it does |
 |---|---|
-| `cargo test` | All host unit tests (118: world 45 incl. the terrain-pool allocator tests and the face-UV-span test, client 2 — naga validation of the WGSL shader module + texture-function census, server 59 incl. the resync repair test, the analog-stick (touch joystick) input tests, the save-file codec tests, and the save/reload world-equivalence test, net e2e 8 incl. a wss TLS round-trip, a two-client shared-world test, a dashboard HTTP test, a resync-over-a-real-socket test, and the world-save restart + seed-mismatch tests, net lib 4 — the map). The only place Rust tests run — **wasm tests can't execute here** (but the WGSL *is* checked here, see the client tests). |
+| `cargo test` | All host unit tests (130: world 45 incl. the terrain-pool allocator tests and the face-UV-span test, client 2 — naga validation of the WGSL shader module + texture-function census, server 63 incl. the resync repair test, the analog-stick (touch joystick) input tests, the save-file codec tests (incl. the v2 player-identity section + v1 compat), the save/reload world-equivalence test, and the rejoin-restore test, net e2e 11 incl. a wss TLS round-trip, a two-client shared-world test, a dashboard HTTP test, a resync-over-a-real-socket test, the world-save restart + seed-mismatch tests, and the rejoin tests (same-run reclaim, unknown/live-token rejection, restart + stop-while-connected), net lib 9 — the map + the rejoin registry). The only place Rust tests run — **wasm tests can't execute here** (but the WGSL *is* checked here, see the client tests). |
 | `./scripts/build.sh` | Release build → `web/dist` (wasm-bindgen 0.2.100). |
 | `./scripts/serve.sh` | Serve `web/dist` at `http://localhost:8080` (python3). |
 | `./scripts/serve.sh --https` | Same over TLS with a self-signed cert (`.certs/`, generated once via openssl). **Required for LAN play** — WebGPU needs a secure context. |
@@ -125,7 +125,13 @@ crates/
                       falls back to the WASD bits otherwise). protocol.rs
                       = versioned little-endian binary wire codec
                       (ClientMsg/ServerMsg, encode/decode/decode_stream,
-                      currently v7: Hello carries the player id, agents
+                      currently v8: Hello carries the player id and the
+                      connection's 16-byte REJOIN TOKEN, clients send
+                      ClientMsg::Rejoin { token } as their FIRST frame
+                      (all-zero token = fresh identity; a stored token
+                      claims the previous instance — the server reads it
+                      BEFORE allocating a player, see the qwencraft-net
+                      rejoin registry), agents
                       carry name + colour, ClientMsg::Profile sends the
                       player's name/colour, Action::Place carries the
                       selected block id (u8 — the server validates it via
@@ -159,11 +165,15 @@ crates/
                       the last-wins override set IS the world's entire
                       persistent state. save.rs = the pure save-file codec
                       for exactly that (magic `QWCS` + version + seed +
-                      count + one 13-byte record per override — a
+                      edits count + one 13-byte record per override — a
                       last-wins SET: no order, no replay semantics, no
-                      history; decode rejects anything malformed — a
-                      corrupt save must fail loudly, never silently start
-                      fresh). World::load/apply_saved replays a save into
+                      history; v2 appends the REJOIN section: players
+                      count + one record per identity (token 16 B + feet
+                      f32×3 + yaw/pitch f32 + name u16-len UTF-8 + color
+                      3 B + last_seen u64 — a set keyed by token; v1
+                      files decode as "no identities"); decode rejects
+                      anything malformed — a corrupt save must fail
+                      loudly, never silently start fresh). World::load/apply_saved replays a save into
                       a fresh world (override layer + edit history, so the
                       map picks it up via the normal watermark sync);
                       Server::new_world_loaded wraps that. save.rs is
@@ -189,7 +199,32 @@ crates/
                       Server (Arc<Mutex<WorldState>>) for all
                       connections; each connection registers a player
                       (add_player) and gets its own Streamer (per-viewer
-                      chunks). A single 60Hz tick loop ticks the world
+                      chunks). REJOIN (protocol v8): the session reads
+                      the client's FIRST frame before registering (2 s
+                      deadline → fresh identity + Hello; that Hello's
+                      version bump is what makes a pre-v8 page do its
+                      existing cache-busting reload): Rejoin { token }
+                      with zero/unknown token → fresh identity (a fresh
+                      16-byte token minted via getrandom); a token that
+                      is already LIVE (a second tab, same browser
+                      profile) → fresh identity (the live player is
+                      never hijacked); a token in the PlayerRegistry →
+                      the previous instance is restored (add_player +
+                      Server::restore_agent — the recorded position with
+                      a blocked-cell lift, the recorded view — +
+                      set_profile). The PlayerRegistry (token → last
+                      pos/view/name/colour/last_seen, under the world
+                      lock, cap 64 evicting the oldest) is persisted IN
+                      THE WORLD SAVE — bound to the seed, so a token
+                      only works against the world that minted it
+                      ("same world only", no auth: the token is a
+                      capability, not a credential). A disconnect
+                      upserts the record + sets players_dirty (the save
+                      trigger folds it in with new edits); a clean stop
+                      folds still-connected players' state into the
+                      final snapshot. A mid-session Rejoin is ignored
+                      (handshake-only message). A single 60Hz tick loop
+                      ticks the world
                       once and streams/updates every player; block edits
                       re-send to every viewer holding the chunk; each
                       client gets the full Agents list (named, coloured)
@@ -213,18 +248,21 @@ crates/
                       generated its terrain) and replays it via
                       Server::new_world_loaded. The tick loop snapshots
                       the world's persistent state (seed + the complete
-                      last-wins override set) to the save file when new
-                      edits land and either 5 s elapsed or 64+ new edits
-                      accumulated — encoded under the world lock, written
-                      off the tick path via spawn_blocking, atomically
-                      (unique tmp + fsync + rename — a crash never leaves
-                      a torn save; a failed save leaves the last good
-                      snapshot and the trigger retries). A clean stop
-                      (main's ctrl_c → ServerEndpoints.shutdown.stop()
-                      → the tick loop's watch channel) awaits any
-                      in-flight save, takes one final snapshot (only when
-                      there are unsaved edits), and returns before the
-                      runtime tears the rest down. `--data-dir` defaults
+                      last-wins override set + the rejoin records) to
+                      the save file when new edits land or a player
+                      record changed, and either 5 s elapsed or 64+ new
+                      edits accumulated — encoded under the world lock,
+                      written off the tick path via spawn_blocking,
+                      atomically (unique tmp + fsync + rename — a crash
+                      never leaves a torn save; a failed save leaves the
+                      last good snapshot and the trigger retries). A
+                      clean stop (main's ctrl_c →
+                      ServerEndpoints.shutdown.stop() → the tick loop's
+                      watch channel) awaits any in-flight save, folds
+                      still-connected players into the registry, takes
+                      one final snapshot (only when there are unsaved
+                      edits or records), and returns before the runtime
+                      tears the rest down. `--data-dir` defaults
                       to ./data (gitignored); the test scripts point it at
                       a fresh scratch dir per run so stale saves never
                       leak into a scenario. examples/ws_probe.rs = tiny
@@ -244,7 +282,14 @@ crates/
                       persistence (edits survive a clean-stop + fresh
                       server on the same data dir, read back via the
                       authoritative GetBlock; a save whose seed doesn't
-                      match the --seed fails fast).
+                      match the --seed fails fast), and rejoin (same-run
+                      reclaim of spot/name/colour via the Hello token;
+                      unknown and live-duplicate tokens get fresh
+                      identities; the identity survives a clean-stop +
+                      restart and a stop-while-connected — the e2e syncs
+                      on the dashboard "left (" event before stopping,
+                      since the record is written by the session
+                      cleanup).
   qwencraft-client/   WebGPU renderer. Terrain buffer POOL (one 2M-vertex
                       vbo/ibo, chunks own index ranges, compaction when
                       full), opaque+water pipelines (translucent water +
@@ -277,7 +322,18 @@ crates/
                       when building the agent list (the local player is
                       the camera; other players are rendered as spheres
                       with floating DOM name tags — #tags container,
-                      projected with the same view-projection). RemoteLink
+                      projected with the same view-projection).
+                      REJOIN: the client persists its identity PER
+                      ORIGIN in localStorage (key `qwencraft.<origin>`:
+                      `<hex token>|<seed>|<r,g,b>|<percent-encoded name>`
+                      — hand-rolled, no JSON dep in the wasm build): on
+                      socket open it ALWAYS sends ClientMsg::Rejoin
+                      first (stored token, or all-zero = fresh); Hello
+                      answers with the same token (rejoin succeeded —
+                      logged) or a fresh mint (new world / unknown /
+                      live-duplicate — storage is overwritten), and the
+                      name/colour are restored into the options UI on
+                      page load (a refresh keeps the identity). RemoteLink
                       keeps `have` (every chunk pos ever received,
                       de-duped, trimmed to view+2 past 8192) and
                       reconciles against the server's per-viewer
@@ -386,6 +442,29 @@ is visible on the map within one tick.
 
 ### Invariants that are easy to break
 
+- **The rejoin handshake order**: the server reads the client's FIRST
+  frame (the `Rejoin` token) BEFORE allocating a player (2 s deadline →
+  fresh identity + Hello). Do not send Hello before reading: the id in
+  Hello must be FINAL (the client skips rendering its own sphere for the
+  id it is told — a provisional id plus a later swap breaks that), and
+  the token the client must persist is chosen at that point. The 2 s
+  deadline is also the compatibility path: a pre-v8 page sends nothing
+  until it sees Hello, and the version bump in that Hello is what makes
+  it do its existing cache-busting reload — lengthen it and stale pages
+  hang on "connecting". A mid-session `Rejoin` is ignored by design
+  (handshake-only message), and a token that is already LIVE must always
+  be refused (second tab, same browser profile) — never hijack a live
+  player.
+- **The rejoin registry lives with the world save.** The records are in
+  `WorldState` under the world lock and snapshotted by the SAME atomic
+  write as the overrides (v2 save section) — that is what makes "same
+  world only" hold (the save is seed-bound) with no extra state to
+  maintain. Don't move the registry to its own file/lock without moving
+  the seed-binding with it. The record is written by the SESSION
+  CLEANUP on disconnect (and folded in from live connections at clean
+  stop) — tests that assert on it after a restart must sync on the
+  dashboard "left (" event (or the stop) first, or they race the
+  cleanup.
 - **Terrain pool capacity** lives in `qwencraft_world` as
   `TERRAIN_POOL_VERTS`/`TERRAIN_POOL_IDX`; the client aliases them as
   `VERT_CAP`/`IDX_CAP`. **Do not fork the numbers in the client** — a stale

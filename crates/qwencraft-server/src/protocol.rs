@@ -62,7 +62,15 @@ use qwencraft_world::{BlockPos, ChunkPos, Vec3};
 /// distance from centre is the throttle — see `Input::move_direction`)
 /// and falls back to the key bits otherwise. Look deltas are reused as-is
 /// (the mobile look pad feeds `dx`/`dy` in screen pixels, like a mouse).
-pub const PROTOCOL_VERSION: u8 = 7;
+///
+/// v8: rejoin — `Hello` carries the connection's 16-byte `token` (the
+/// player's persistent identity, minted by the server), and clients send
+/// `Rejoin { token }` as their FIRST frame (all-zero token = fresh
+/// identity; a stored token claims the previous instance — same spot,
+/// name and colour — when it is recognised by THIS world's registry). The
+/// server reads that frame before allocating a player, so a rejoiner is
+/// restored in place instead of spawning a throwaway to swap out.
+pub const PROTOCOL_VERSION: u8 = 8;
 
 /// How many times a client tab may force a cache-busting reload in the
 /// "server is from the future" case (`future_reload_budget`) before it
@@ -108,6 +116,7 @@ const T_RESYNC: u8 = 0x06;
 const T_GET_BLOCK: u8 = 0x07;
 const T_SET_BLOCK: u8 = 0x08;
 const T_TELEPORT: u8 = 0x09;
+const T_REJOIN: u8 = 0x0A;
 
 // ---- server -> client message types --------------------------------------
 const T_HELLO: u8 = 0x10;
@@ -179,6 +188,14 @@ pub enum ClientMsg {
     /// Console API (`qwc.setPlayerPos`): teleport this player's feet to
     /// `pos` (the server clamps y into the world and zeroes velocity).
     Teleport { pos: Vec3 },
+    /// Identity claim, sent as the FIRST frame on the connection (before
+    /// the server's `Hello`): an all-zero `token` means "fresh identity";
+    /// a stored token claims the previous instance (the server restores
+    /// the recorded position/name/colour when the token is in THIS world's
+    /// rejoin registry — see the save file's player section). A `Rejoin`
+    /// arriving mid-session is ignored (it only has meaning at connect
+    /// time).
+    Rejoin { token: [u8; 16] },
 }
 
 /// Messages the server sends to the client.
@@ -186,8 +203,16 @@ pub enum ClientMsg {
 pub enum ServerMsg {
     /// First message on the connection: protocol version + world seed +
     /// this connection's own player id (the client skips rendering it —
-    /// first person — and renders every other player as a sphere).
-    Hello { version: u8, seed: u64, player_id: u32 },
+    /// first person — and renders every other player as a sphere) + the
+    /// connection's 16-byte rejoin `token` (the client persists it, e.g.
+    /// in localStorage, and presents it via `ClientMsg::Rejoin` on the next
+    /// visit to reclaim the previous instance).
+    Hello {
+        version: u8,
+        seed: u64,
+        player_id: u32,
+        token: [u8; 16],
+    },
     /// The player's state (camera source of truth), every tick.
     PlayerState(AgentState),
     /// All agents (player first), every tick — the client renders them.
@@ -289,6 +314,10 @@ impl ClientMsg {
                 p.f32(pos.y);
                 p.f32(pos.z);
                 T_TELEPORT
+            }
+            ClientMsg::Rejoin { token } => {
+                p.bytes(token);
+                T_REJOIN
             }
         };
         p.frame(ty)
@@ -393,6 +422,10 @@ impl ClientMsg {
             T_TELEPORT => ClientMsg::Teleport {
                 pos: Vec3::new(d.f32()?, d.f32()?, d.f32()?),
             },
+            T_REJOIN => {
+                let token: [u8; 16] = d.bytes(16)?.try_into().unwrap();
+                ClientMsg::Rejoin { token }
+            }
             _ => return None,
         };
         if !d.exhausted() {
@@ -426,10 +459,11 @@ impl ServerMsg {
     pub fn encode(&self) -> Vec<u8> {
         let mut p = Enc::new();
         let ty = match self {
-            ServerMsg::Hello { version, seed, player_id } => {
+            ServerMsg::Hello { version, seed, player_id, token } => {
                 p.u8(*version);
                 p.u64(*seed);
                 p.u32(*player_id);
+                p.bytes(token);
                 T_HELLO
             }
             ServerMsg::PlayerState(s) => {
@@ -489,7 +523,8 @@ impl ServerMsg {
                 let version = d.u8()?;
                 let seed = d.u64()?;
                 let player_id = d.u32()?;
-                ServerMsg::Hello { version, seed, player_id }
+                let token: [u8; 16] = d.bytes(16)?.try_into().unwrap();
+                ServerMsg::Hello { version, seed, player_id, token }
             }
             T_PLAYER => {
                 let s = decode_agent(&mut d)?;
@@ -839,6 +874,12 @@ mod tests {
             ClientMsg::Teleport {
                 pos: crate::Vec3::new(-12.5, 34.25, 99.125),
             },
+            ClientMsg::Rejoin {
+                token: [0u8; 16], // "fresh identity"
+            },
+            ClientMsg::Rejoin {
+                token: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 255],
+            },
         ];
         for m in &msgs {
             let enc = m.encode();
@@ -870,6 +911,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 seed: 0xDEAD_BEEF_CAFE_F00D,
                 player_id: 3,
+                token: [9; 16],
             },
             ServerMsg::PlayerState(agent.clone()),
             ServerMsg::Agents(vec![agent.clone(), AgentState::default()]),
@@ -938,6 +980,7 @@ mod tests {
             version: 1,
             seed: 9,
             player_id: 0,
+            token: [0u8; 16],
         };
         let mut sbuf = s1.encode();
         sbuf.extend_from_slice(&s2.encode());

@@ -18,7 +18,15 @@
 //! shared [`Server`], and each connection owns a [`Streamer`] that streams
 //! the world around its own player and resends edited chunks.
 //! Disconnecting removes that player (the world and the other players
-//! remain).
+//! remain) and records its last state under its rejoin token.
+//!
+//! **Rejoin (protocol v8).** Every identity gets a 16-byte token (in
+//! `Hello`); the client persists it (localStorage) and presents it via the
+//! first-frame `ClientMsg::Rejoin` on its next visit. The token is looked
+//! up in the [`PlayerRegistry`] — persisted in the seed-bound world save,
+//! so a token only works against the world it was minted for — and the
+//! player is restored to their last position/view/name/colour. No auth:
+//! the token is a capability, not a credential.
 //!
 //! Host-only (tokio/mio don't support wasm): the whole crate compiles away
 //! for wasm so the shared workspace's wasm build stays green.
@@ -36,11 +44,12 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use qwencraft_server::protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
+use qwencraft_server::save::PlayerRecord;
 use qwencraft_server::{
     save, Action, Edit, Input, KeySet, Server, Streamer, WorldUpdate, TICK_HZ,
 };
@@ -133,18 +142,118 @@ impl ServerShutdown {
 const SAVE_INTERVAL: Duration = Duration::from_secs(5);
 const SAVE_EVERY_EDITS: usize = 64;
 
+/// How many player identities the rejoin registry keeps (persisted in the
+/// world save). Evicted oldest-first by `last_seen` when exceeded: records
+/// are a convenience, not a promise, and new identities keep arriving from
+/// fresh browser profiles.
+const MAX_PLAYER_RECORDS: usize = 64;
+
+/// A token presented by a client that has no stored identity (the all-zero
+/// "fresh identity" wire value). The server never mints it.
+const NO_TOKEN: [u8; 16] = [0u8; 16];
+
+/// Mint a fresh rejoin token: 16 random bytes from the OS (a capability,
+/// not a credential — see `PlayerRegistry`). The all-zero value is
+/// reserved for "no token", so mask it away (probability 2^-128 anyway).
+fn mint_token() -> [u8; 16] {
+    let mut t = [0u8; 16];
+    getrandom::fill(&mut t).expect("OS entropy source available");
+    if t == NO_TOKEN {
+        t[0] = 1;
+    }
+    t
+}
+
+/// Unix seconds now (record ordering; a pre-epoch clock is clamped to 0).
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The rejoin registry: token → last-known player state (position, view,
+/// name, colour). A player who presents a known token is restored to that
+/// state ("reclaim the previous instance").
+///
+/// It lives inside [`WorldState`] (under the world lock) on purpose: the
+/// periodic/final save snapshot is already taken under that lock, so the
+/// identities ride the existing atomic-write / cadence / final-save
+/// machinery with zero extra synchronisation. They are persisted in the
+/// world save, which is bound to the seed — a token only works against the
+/// world it was minted for ("same world only", with no auth to maintain).
+#[derive(Default)]
+struct PlayerRegistry {
+    records: HashMap<[u8; 16], PlayerRecord>,
+}
+
+impl PlayerRegistry {
+    /// Build from a decoded save (a duplicate token is last-wins — a set,
+    /// like the override entries). The cap is re-enforced: a hand-edited
+    /// file could exceed it.
+    fn new(mut records: Vec<([u8; 16], PlayerRecord)>) -> Self {
+        records.sort_unstable_by_key(|(_, r)| r.last_seen);
+        let drop = records.len().saturating_sub(MAX_PLAYER_RECORDS);
+        records.drain(..drop);
+        let records = records.into_iter().collect();
+        Self { records }
+    }
+
+    fn get(&self, token: &[u8; 16]) -> Option<&PlayerRecord> {
+        self.records.get(token)
+    }
+
+    /// Record a player's final state under `token` (disconnect). Evicts
+    /// the oldest record (min `last_seen`) when at capacity.
+    fn upsert(&mut self, token: [u8; 16], record: PlayerRecord) {
+        if !self.records.contains_key(&token) && self.records.len() >= MAX_PLAYER_RECORDS {
+            // Copy the token out (owned) so the iteration borrow ends
+            // before the removal.
+            if let Some(oldest) = self
+                .records
+                .iter()
+                .min_by_key(|(_, r)| r.last_seen)
+                .map(|(t, _)| *t)
+            {
+                self.records.remove(&oldest);
+            }
+        }
+        self.records.insert(token, record);
+    }
+
+    /// The complete set (save snapshot). Order is irrelevant (a set keyed
+    /// by token); the caller may sort for a deterministic file if wanted.
+    fn snapshot(&self) -> Vec<([u8; 16], PlayerRecord)> {
+        self.records.iter().map(|(t, r)| (*t, r.clone())).collect()
+    }
+
+    fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
 /// Read and validate the world save file at `path` (None when absent).
+///
+/// Returns the block overrides plus the rejoin identities (v2 saves; v1
+/// saves and absent files yield an empty list).
 ///
 /// A save is bound to the seed that generated its terrain: a mismatched
 /// seed means the file belongs to a different world, and loading it would
 /// replay edits onto the wrong terrain. Fail fast with a clear message.
-fn load_save(path: &std::path::Path, seed: u64) -> Result<Option<Vec<Edit>>, String> {
+fn load_save(
+    path: &std::path::Path,
+    seed: u64,
+) -> Result<(Option<Vec<Edit>>, Vec<([u8; 16], PlayerRecord)>), String> {
     if !path.exists() {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     }
     let bytes =
         std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let (saved_seed, edits) = save::decode(&bytes)
+    let (saved_seed, edits, players) = save::decode(&bytes)
         .map_err(|e| format!("corrupt save file {}: {e} — delete it to start a fresh world", path.display()))?;
     if saved_seed != seed {
         return Err(format!(
@@ -152,7 +261,7 @@ fn load_save(path: &std::path::Path, seed: u64) -> Result<Option<Vec<Edit>>, Str
             path.display()
         ));
     }
-    Ok(Some(edits))
+    Ok((Some(edits), players))
 }
 
 /// Atomically replace `path` with `bytes`: write a unique temp file in the
@@ -213,6 +322,17 @@ impl EventLog {
 pub struct WorldState {
     server: Server,
     players: HashMap<u32, Conn>,
+    /// Rejoin registry: token → last-known player state (persisted in the
+    /// world save — see [`PlayerRegistry`]).
+    registry: PlayerRegistry,
+    /// Identities currently connected (token → live player id). A second
+    /// connection presenting a live token gets a FRESH identity instead of
+    /// hijacking the connected player (a second tab with the same browser
+    /// profile).
+    active: HashMap<[u8; 16], u32>,
+    /// A player record changed since the last successful save (the tick
+    /// loop folds this into the save trigger, like new edits).
+    players_dirty: bool,
     /// Dashboard event log (separate lock — see [`EventLog`]).
     events: Arc<EventLog>,
     /// Process start (dashboard uptime).
@@ -242,7 +362,7 @@ pub async fn serve(opts: ServerOptions) -> Result<ServerEndpoints, String> {
     // seed + the world's block overrides — terrain is a pure function of
     // the seed, so that pair is the world's entire persistent state.
     let save_path = opts.data_dir.join(save::SAVE_FILE_NAME);
-    let saved_edits = load_save(&save_path, opts.seed)?;
+    let (saved_edits, saved_players) = load_save(&save_path, opts.seed)?;
 
     let listener = TcpListener::bind((opts.bind, opts.port))
         .await
@@ -270,9 +390,20 @@ pub async fn serve(opts: ServerOptions) -> Result<ServerEndpoints, String> {
         }
         None => Server::new_world(opts.seed),
     };
+    let registry = PlayerRegistry::new(saved_players);
+    if !registry.is_empty() {
+        eprintln!(
+            "[qwencraft-net] loaded {} player identities from {} (rejoin ready)",
+            registry.len(),
+            save_path.display()
+        );
+    }
     let world = Arc::new(Mutex::new(WorldState {
         server,
         players: HashMap::new(),
+        registry,
+        active: HashMap::new(),
+        players_dirty: false,
         events: events.clone(),
         started,
     }));
@@ -599,7 +730,13 @@ async fn tick_loop(
         if let Some((count, h)) = saving.take() {
             if h.is_finished() {
                 match h.await {
-                    Ok(Ok(())) => disk_edits = count,
+                    Ok(Ok(())) => {
+                        disk_edits = count;
+                        // The snapshot covered the player records as encoded
+                        // (a disconnect since then sets the flag again and
+                        // the next trigger saves it).
+                        world.lock().unwrap().players_dirty = false;
+                    }
                     Ok(Err(e)) => eprintln!("[qwencraft-net] world save failed: {e}"),
                     Err(e) => eprintln!("[qwencraft-net] world save task failed: {e}"),
                 }
@@ -612,7 +749,7 @@ async fn tick_loop(
         // Destructure into disjoint field references so the per-connection
         // loop can touch `players` and `server` independently (the MutexGuard
         // itself doesn't field-split through its deref).
-        let WorldState { server, players, .. } = &mut *w;
+        let WorldState { server, players, registry, players_dirty, .. } = &mut *w;
         server.tick(dt);
         let dirty = server.drain_dirty();
         // Dashboard map: sync edits added by this tick (usually zero).
@@ -656,18 +793,21 @@ async fn tick_loop(
             }
         }
 
-        // Periodic world save: snapshot the world's persistent state when
-        // new edits have landed and either the interval elapsed or a big
-        // enough batch accumulated. The snapshot is the COMPLETE override
-        // set (a set, not a journal), so skipping/missing a save costs
-        // nothing beyond the crash window.
+        // Periodic world save: snapshot the world's persistent state (seed
+        // + overrides + rejoin identities) when new edits have landed or a
+        // player record changed, and either the interval elapsed or a big
+        // enough batch accumulated. The snapshot is the COMPLETE set (not a
+        // journal), so skipping/missing a save costs nothing beyond the
+        // crash window.
         let n_edits = server.world().edits().len();
         if saving.is_none()
-            && n_edits > disk_edits
-            && (n_edits - disk_edits >= SAVE_EVERY_EDITS || last_save_try.elapsed() >= SAVE_INTERVAL)
+            && (n_edits > disk_edits || *players_dirty)
+            && (n_edits.saturating_sub(disk_edits) >= SAVE_EVERY_EDITS
+                || last_save_try.elapsed() >= SAVE_INTERVAL)
         {
             let overrides: Vec<Edit> = server.world().overrides().collect();
-            let bytes = save::encode(seed, &overrides);
+            let players = registry.snapshot();
+            let bytes = save::encode(seed, &overrides, &players);
             let path = save_path.clone();
             saving = Some((
                 n_edits,
@@ -702,20 +842,49 @@ async fn tick_loop(
             eprintln!("[qwencraft-net] world save task failed: {e}");
         }
     }
-    let (n_edits, overrides) = {
-        let w = world.lock().unwrap();
+    let (n_edits, overrides, players, players_dirty) = {
+        let mut w = world.lock().unwrap();
+        // A clean stop must not lose the last state of still-connected
+        // players (they will come back with their tokens): fold their
+        // current state into the registry for the final snapshot — the
+        // disconnect path does the same for players who leave first.
+        let now = now_unix_secs();
+        let live: Vec<([u8; 16], u32)> = w.active.iter().map(|(t, id)| (*t, *id)).collect();
+        for (token, id) in live {
+            let st = w.server.agent_state(id);
+            w.registry.upsert(
+                token,
+                PlayerRecord {
+                    pos: st.pos,
+                    yaw: st.yaw,
+                    pitch: st.pitch,
+                    name: st.name,
+                    color: st.color,
+                    last_seen: now,
+                },
+            );
+        }
         let world = w.server.world();
-        (world.edits().len(), world.overrides().collect::<Vec<Edit>>())
+        (
+            world.edits().len(),
+            world.overrides().collect::<Vec<Edit>>(),
+            w.registry.snapshot(),
+            w.players_dirty || !w.active.is_empty(),
+        )
     };
-    if n_edits > disk_edits {
-        let bytes = save::encode(seed, &overrides);
+    // A clean stop always saves when there is anything unsaved — including
+    // a player record that changed after the last edit snapshot (a
+    // disconnect with no new edits since).
+    if n_edits > disk_edits || players_dirty {
+        let bytes = save::encode(seed, &overrides, &players);
         let path = save_path.clone();
         let write_path = path.clone();
         match tokio::task::spawn_blocking(move || atomic_write(&write_path, &bytes)).await {
             Ok(Ok(())) => {
                 eprintln!(
-                    "[qwencraft-net] world saved: {} edits → {}",
+                    "[qwencraft-net] world saved: {} edits, {} identities → {}",
                     n_edits,
+                    players.len(),
                     path.display()
                 );
             }
@@ -793,13 +962,20 @@ fn apply_inbound(world: &Mutex<WorldState>, player_id: u32, m: ClientMsg) {
                 eprintln!("[qwencraft-net] player {player_id}: teleport rejected: {e}");
             }
         }
+        ClientMsg::Rejoin { .. } => {
+            // `Rejoin` only has meaning as the FIRST frame (the identity
+            // handshake, read before registration) — ignore it mid-session.
+            eprintln!("[qwencraft-net] player {player_id}: mid-session Rejoin ignored");
+        }
     }
 }
 
-/// Serve one connection: register a player in the shared world, forward
-/// inbound client messages to it, and stream outbound server messages to the
-/// socket. The world ticks on the shared [`tick_loop`]; this task only moves
-/// data between the socket and the world.
+/// Serve one connection: read the client's identity claim (the first-frame
+/// `Rejoin` token — see the rejoin registry), register a player in the
+/// shared world (restoring the claimed instance when recognised), forward
+/// inbound client messages to it, and stream outbound server messages to
+/// the socket. The world ticks on the shared [`tick_loop`]; this task only
+/// moves data between the socket and the world.
 async fn session<S>(
     ws: WebSocketStream<S>,
     peer: SocketAddr,
@@ -815,31 +991,121 @@ where
     ) = ws.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
 
-    // Register this connection as a new player in the shared world.
-    let player_id = {
+    // Identity handshake BEFORE player registration: the client's first
+    // frame is `Rejoin { token }` (all-zero token = fresh identity; a
+    // stored token claims the previous instance). Reading it first lets a
+    // rejoiner be restored IN PLACE (same spot / name / colour — same
+    // world only, since the registry lives in the seed-bound save) instead
+    // of spawning a throwaway player to swap out.
+    //
+    // A 2 s deadline: v8 clients send the frame within milliseconds of the
+    // socket opening. A pre-v8 page sends nothing until it sees Hello, and
+    // the version bump in that Hello is exactly what triggers its existing
+    // cache-busting reload; silent or broken connections die here quickly.
+    let first_msgs: Vec<ClientMsg> =
+        match tokio::time::timeout(Duration::from_secs(2), rd.next()).await {
+            Ok(Some(Ok(Message::Binary(data)))) => ClientMsg::decode_stream(&data).0,
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
+                return Err("connection closed before the identity handshake".to_string())
+            }
+            Ok(Some(Err(e))) => return Err(format!("handshake read: {e}")),
+            Ok(Some(Ok(_))) => Vec::new(), // a non-binary frame: no identity claim
+            Err(_) => Vec::new(), // timeout: proceed with a fresh identity (see above)
+        };
+    let mut first_iter = first_msgs.into_iter();
+    let first_msg = first_iter.next();
+
+    // Register: reclaim the claimed identity when recognised (restore the
+    // recorded position — with the blocked-cell lift — view, name and
+    // colour), mint a fresh token otherwise. `token` is what this
+    // connection's Hello carries and what its disconnect snapshot is
+    // stored under.
+    let (player_id, token, rejoin_note) = {
         let mut w = world.lock().unwrap();
-        let id = w.server.add_player();
+        let claimed = match first_msg.as_ref() {
+            Some(ClientMsg::Rejoin { token }) if *token != NO_TOKEN => Some(*token),
+            _ => None,
+        };
+        let (id, token, note) = match claimed {
+            // The identity is already connected (a second tab with the same
+            // browser profile): don't hijack the live player — this
+            // connection gets a fresh identity.
+            Some(t) if w.active.contains_key(&t) => {
+                eprintln!(
+                    "[qwencraft-net] {peer}: rejoin denied (identity already connected) — fresh identity"
+                );
+                (w.server.add_player(), mint_token(), None)
+            }
+            Some(t) => match w.registry.get(&t).cloned() {
+                // REJOIN: the recorded instance of this world. (The codec
+                // validates finiteness, so a restore failure is effectively
+                // impossible; the spawn fallback keeps the identity anyway.)
+                Some(rec) => {
+                    let id = w.server.add_player();
+                    let note =
+                        match w.server.restore_agent(id, rec.pos, rec.yaw, rec.pitch) {
+                            Ok(p) => Some(format!(
+                                "restored at ({:.0}, {:.0}, {:.0})",
+                                p.x, p.y, p.z
+                            )),
+                            Err(e) => {
+                                eprintln!(
+                                    "[qwencraft-net] {peer}: rejoin restore failed: {e} — spawn fallback"
+                                );
+                                None
+                            }
+                        };
+                    w.server.set_profile(id, rec.name.clone(), rec.color);
+                    (id, t, note)
+                }
+                // Unknown token (different world, evicted record, or a
+                // forged token): fresh identity. The client overwrites its
+                // stored token when it sees the new one in Hello.
+                None => {
+                    eprintln!(
+                        "[qwencraft-net] {peer}: rejoin: unknown token — fresh identity"
+                    );
+                    (w.server.add_player(), mint_token(), None)
+                }
+            },
+            // No claim: all-zero token, a missing first frame (timeout), or
+            // a pre-v8 client that waits for Hello before speaking.
+            None => (w.server.add_player(), mint_token(), None),
+        };
+        w.active.insert(token, id);
         w.players
             .insert(id, Conn { tx: tx.clone(), streamer: Streamer::new() });
+        let verb = if note.is_some() { "rejoined" } else { "joined" };
         w.events.push(
             w.started.elapsed().as_secs_f64(),
-            format!("player {id} joined (from {peer}, {} online)", w.players.len()),
+            format!("player {id} {verb} (from {peer}, {} online)", w.players.len()),
         );
-        id
+        (id, token, note)
     };
+    let note_suffix = rejoin_note
+        .as_deref()
+        .map(|n| format!(" — {n}"))
+        .unwrap_or_default();
     eprintln!(
-        "[qwencraft-net] {peer}: player {} joined (shared world seed {seed}, {} online)",
-        player_id,
+        "[qwencraft-net] {peer}: player {player_id} {} (shared world seed {seed}, {} online){note_suffix}",
+        if rejoin_note.is_some() { "rejoined" } else { "joined" },
         world.lock().unwrap().players.len()
     );
 
-    // Hello first (carries this connection's own player id so the client
-    // can render the *other* players): the client waits for it before
-    // sending input.
+    // Any extra messages in the first frame (rare — one message per frame
+    // in practice) apply now that the player exists.
+    for m in first_iter {
+        apply_inbound(&world, player_id, m);
+    }
+
+    // Hello (carries this connection's own player id so the client can
+    // render the *other* players, plus its rejoin token to persist): the
+    // client waits for it before sending input.
     let _ = tx.send(ServerMsg::Hello {
         version: PROTOCOL_VERSION,
         seed,
         player_id,
+        token,
     });
 
     // Reader: decode client messages and apply them to the shared world.
@@ -879,10 +1145,25 @@ where
     };
 
     reader.abort();
-    // Deregister: remove this player from the shared world (the world and the
-    // other players remain).
+    // Deregister: persist this identity's final state (the rejoin record —
+    // saved with the world, bound to its seed), then remove the player from
+    // the shared world (the world and the other players remain).
     {
         let mut w = world.lock().unwrap();
+        let st = w.server.agent_state(player_id);
+        w.registry.upsert(
+            token,
+            PlayerRecord {
+                pos: st.pos,
+                yaw: st.yaw,
+                pitch: st.pitch,
+                name: st.name,
+                color: st.color,
+                last_seen: now_unix_secs(),
+            },
+        );
+        w.active.remove(&token);
+        w.players_dirty = true;
         w.players.remove(&player_id);
         w.server.remove_player(player_id);
         w.events.push(
@@ -926,5 +1207,93 @@ fn load_tls(opts: &ServerOptions) -> Result<Option<Arc<tokio_rustls::server::Tls
         }
         (None, None) => Ok(None),
         _ => Err("--cert and --key must be given together".into()),
+    }
+}
+
+/// Unit tests for the rejoin registry (the world-save round-trip of
+/// records is covered in `qwencraft-server::save`'s tests).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qwencraft_world::Vec3;
+
+    fn record(last_seen: u64, x: f32) -> PlayerRecord {
+        PlayerRecord {
+            pos: Vec3::new(x, 20.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            name: format!("p{last_seen}"),
+            color: [1, 2, 3],
+            last_seen,
+        }
+    }
+
+    #[test]
+    fn minted_tokens_are_unique_and_never_zero() {
+        let a = mint_token();
+        let b = mint_token();
+        assert_ne!(a, b);
+        assert_ne!(a, NO_TOKEN);
+        assert_ne!(b, NO_TOKEN);
+    }
+
+    #[test]
+    fn upsert_inserts_and_updates() {
+        let mut r = PlayerRegistry::default();
+        r.upsert([1; 16], record(100, 1.0));
+        assert_eq!(r.get(&[1; 16]).unwrap().last_seen, 100);
+        // Same token: the record is UPDATED (a rejoiner's new final state),
+        // not duplicated.
+        r.upsert([1; 16], record(200, 2.0));
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.get(&[1; 16]).unwrap().last_seen, 200);
+        assert_eq!(r.get(&[1; 16]).unwrap().pos.x, 2.0);
+    }
+
+    #[test]
+    fn upsert_evicts_oldest_at_capacity() {
+        let mut r = PlayerRegistry::default();
+        for i in 0..MAX_PLAYER_RECORDS {
+            r.upsert([i as u8; 16], record(i as u64, 0.0));
+        }
+        assert_eq!(r.len(), MAX_PLAYER_RECORDS);
+        // A new identity evicts the oldest (min last_seen = token 0).
+        r.upsert([0xFF; 16], record(10_000, 0.0));
+        assert_eq!(r.len(), MAX_PLAYER_RECORDS);
+        assert!(r.get(&[0; 16]).is_none(), "oldest must be evicted");
+        assert!(r.get(&[0xFF; 16]).is_some(), "newest must be kept");
+        assert!(r.get(&[1; 16]).is_some());
+    }
+
+    #[test]
+    fn new_from_save_dedups_and_caps() {
+        // Duplicate token: last-wins (a set, like the override entries).
+        let recs = vec![
+            ([5u8; 16], record(10, 0.0)),
+            ([5u8; 16], record(20, 0.0)),
+        ];
+        let r = PlayerRegistry::new(recs);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.get(&[5; 16]).unwrap().last_seen, 20);
+        // Over-capacity input (a hand-edited file): oldest dropped.
+        let recs: Vec<_> = (0..MAX_PLAYER_RECORDS + 10)
+            .map(|i| ([i as u8; 16], record(i as u64, 0.0)))
+            .collect();
+        let r = PlayerRegistry::new(recs);
+        assert_eq!(r.len(), MAX_PLAYER_RECORDS);
+        assert!(r.get(&[0; 16]).is_none(), "10 oldest must be dropped");
+        assert!(r.get(&[(MAX_PLAYER_RECORDS + 9) as u8; 16]).is_some());
+    }
+
+    #[test]
+    fn snapshot_round_trips() {
+        let mut r = PlayerRegistry::default();
+        r.upsert([1; 16], record(1, 1.5));
+        r.upsert([2; 16], record(2, 2.5));
+        let snap = r.snapshot();
+        assert_eq!(snap.len(), 2);
+        let r2 = PlayerRegistry::new(snap);
+        assert_eq!(r2.get(&[1; 16]).unwrap().pos.x, 1.5);
+        assert_eq!(r2.get(&[2; 16]).unwrap().pos.x, 2.5);
     }
 }
